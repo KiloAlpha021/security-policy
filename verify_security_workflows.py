@@ -8,11 +8,15 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
+import yaml
+
 TARGET = "KiloAlpha021/security-workflows"
 POLICY = "KiloAlpha021/security-policy"
 BASE_BRANCH = "main"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-ACTION = re.compile(r"(?m)^\s*-\s*uses:\s*([^\s#]+)")
+REF = re.compile(r"[0-9a-f]{40}\Z")
+SEGMENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
+OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\Z")
 IDENTITY = re.compile(r"([0-9a-f]{40})  (.+)\Z")
 
 
@@ -35,6 +39,77 @@ def repository(root: Path) -> str:
 def require(text: str, fragment: str, message: str) -> None:
     if fragment not in text:
         raise ValueError(message)
+
+
+class RestrictedLoader(yaml.BaseLoader):
+    def compose_node(self, parent: object, index: object) -> yaml.Node:
+        if self.check_event(yaml.AliasEvent):
+            raise ValueError("Workflow aliases are unsupported")
+        event = self.peek_event()
+        if event.anchor is not None or event.tag is not None:
+            raise ValueError("Workflow anchors and explicit tags are unsupported")
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=True)
+            if not isinstance(key, str) or key == "<<" or key in result:
+                raise ValueError("Duplicate, merge, or invalid workflow key")
+            result[key] = self.construct_object(value_node, deep=True)
+        return result
+
+
+def action_references(text: str) -> list[tuple[tuple[object, ...], str]]:
+    try:
+        workflow = yaml.load(text, Loader=RestrictedLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError("Malformed workflow YAML") from exc
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
+        raise ValueError("Unsupported workflow structure")
+    jobs = workflow["jobs"]
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            raise ValueError("Unsupported workflow job")
+        if "steps" in job and (not isinstance(job["steps"], list) or
+                               any(not isinstance(step, dict) for step in job["steps"])):
+            raise ValueError("Unsupported workflow steps")
+
+    found: list[tuple[tuple[object, ...], str]] = []
+
+    def visit(value: object, path: tuple[object, ...]) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = (*path, key)
+                if key == "uses":
+                    job_reference = len(child_path) == 3 and child_path[0] == "jobs"
+                    step_reference = (len(child_path) == 5 and child_path[0] == "jobs"
+                                      and child_path[2] == "steps" and isinstance(child_path[3], int))
+                    if not (job_reference or step_reference) or not isinstance(child, str):
+                        raise ValueError(f"Unsupported workflow uses placement: {child_path!r}")
+                    parts = child.split("@")
+                    if len(parts) != 2 or REF.fullmatch(parts[1]) is None:
+                        raise ValueError("Action reference is not a full commit SHA")
+                    segments = parts[0].split("/")
+                    if len(segments) < 2 or any(SEGMENT.fullmatch(part) is None or part in {".", ".."}
+                                                 for part in segments):
+                        raise ValueError("Unsupported action reference")
+                    if OWNER.fullmatch(segments[0]) is None or not any(char.isascii() and char.isalnum()
+                                                                          for char in segments[1]):
+                        raise ValueError("Unsupported action owner or repository")
+                    if job_reference and (len(segments) != 5 or segments[2:4] != [".github", "workflows"]
+                                          or not segments[4].endswith((".yml", ".yaml"))):
+                        raise ValueError("Unsupported reusable workflow reference")
+                    found.append((child_path, child))
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, (*path, index))
+
+    visit(workflow, ())
+    if not found:
+        raise ValueError("No action references found")
+    return found
 
 
 def verify(
@@ -85,9 +160,7 @@ def validate_workflow(text: str) -> None:
     require(text, "permissions:\n  contents: read", "Workflow permissions are not least privilege")
     if re.search(r"(?mi)^\s*[a-z_-]+:\s*write\s*$", text):
         raise ValueError("Write-capable workflow permission")
-    actions = ACTION.findall(text)
-    if not actions or any(re.search(r"@[0-9a-f]{40}\Z", item) is None for item in actions):
-        raise ValueError("Action reference is not a full commit SHA")
+    action_references(text)
     for fragment, message in (
         ("repository: ${{ github.repository }}", "Event repository candidate checkout removed"),
         ("ref: ${{ github.sha }}", "Exact candidate checkout removed"),
