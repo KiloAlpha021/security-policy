@@ -57,7 +57,9 @@ def action_references(text: str) -> list[str]:
             actions.append(value)
             continue
         uncommented = line.split("#", 1)[0]
-        if re.search(r"\buses\b", uncommented):
+        if (re.search(r"\buses\b", uncommented)
+                or re.search(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@", uncommented)
+                or "docker://" in uncommented):
             raise ValueError("Unrecognized action-use structure")
     return actions
 
