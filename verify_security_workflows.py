@@ -12,7 +12,16 @@ TARGET = "KiloAlpha021/security-workflows"
 POLICY = "KiloAlpha021/security-policy"
 BASE_BRANCH = "main"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-ACTION = re.compile(r"(?m)^[ \t]*(?:-[ \t]*)?uses:[ \t]*([^\r\n]*)")
+ACTION_BLOCK = re.compile(
+    r"^[ \t]*(?:-[ \t]*)?uses[ \t]*:[ \t]*"
+    r"(?P<ref>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^#\s]+)"
+    r"[ \t]*(?:#.*)?$"
+)
+ACTION_FLOW = re.compile(
+    r"^[ \t]*-[ \t]*\{[ \t]*uses[ \t]*:[ \t]*"
+    r"(?P<ref>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^#,}\s]+)"
+    r"[ \t]*\}[ \t]*(?:#.*)?$"
+)
 IDENTITY = re.compile(r"([0-9a-f]{40})  (.+)\Z")
 
 
@@ -35,6 +44,22 @@ def repository(root: Path) -> str:
 def require(text: str, fragment: str, message: str) -> None:
     if fragment not in text:
         raise ValueError(message)
+
+
+def action_references(text: str) -> list[str]:
+    actions: list[str] = []
+    for line in text.splitlines():
+        match = ACTION_BLOCK.fullmatch(line) or ACTION_FLOW.fullmatch(line)
+        if match is not None:
+            value = match.group("ref")
+            if value[:1] in {'"', "'"}:
+                value = value[1:-1]
+            actions.append(value)
+            continue
+        uncommented = line.split("#", 1)[0]
+        if re.search(r"\buses\b", uncommented):
+            raise ValueError("Unrecognized action-use structure")
+    return actions
 
 
 def verify(
@@ -85,7 +110,7 @@ def validate_workflow(text: str) -> None:
     require(text, "permissions:\n  contents: read", "Workflow permissions are not least privilege")
     if re.search(r"(?mi)^\s*[a-z_-]+:\s*write\s*$", text):
         raise ValueError("Write-capable workflow permission")
-    actions = [item.split("#", 1)[0].strip() for item in ACTION.findall(text)]
+    actions = action_references(text)
     if not actions or any(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", item) is None
                           for item in actions):
         raise ValueError("Action reference is not a full commit SHA")
