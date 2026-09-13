@@ -1,0 +1,17 @@
+[
+  "removed_trusted_blob_validation",
+  "unknown_repository_accepted",
+  "floating_action_ref",
+  "write_capable_permissions",
+  "candidate_sha_verification_removed",
+  "candidate_trusted_roots_reversed",
+  "ruff_removed",
+  "mypy_removed",
+  "pytest_coverage_removed",
+  "pip_audit_removed",
+  "security_provenance_removed",
+  "critical_step_conditional",
+  "workflow_identity_replaced",
+  "repository_dispatch_weakened",
+  "malformed_trusted_identity_accepted"
+]

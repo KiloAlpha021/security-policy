@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "policy_id": "SECURITY-WORKFLOWS-ROOT-POLICY-01",
+  "target_repository": "KiloAlpha021/security-workflows",
+  "target_branch": "main",
+  "policy_repository": "KiloAlpha021/security-policy",
+  "workflow": ".github/workflows/security-workflows-policy.yml",
+  "authorization": "NONE",
+  "administrative_root": "KiloAlpha021 organization owner and GitHub organization controls"
+}

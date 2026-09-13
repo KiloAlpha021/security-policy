@@ -1,0 +1,44 @@
+name: security-workflows-policy
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  security-workflows-policy:
+    name: security-workflows-policy
+    runs-on: windows-latest
+    steps:
+      - name: Check out exact security-workflows candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 0
+      - name: Check out independent root policy
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: KiloAlpha021/security-policy
+          ref: main
+          path: policy
+          fetch-depth: 0
+      - name: Set up CPython
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: 3.12.10
+      - name: Apply independent security-workflows policy
+        shell: pwsh
+        env:
+          EVENT_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || github.repository }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref || 'main' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python policy/verify_security_workflows.py --candidate candidate --policy policy --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --base-repository $env:BASE_REPOSITORY --base-branch $env:BASE_BRANCH --event-name $env:EVENT_NAME
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
