@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from verify_security_workflows import verify
+from verify_security_workflows import validate_workflow, verify
 
 
 def git(root: Path, *args: str) -> str:
@@ -47,7 +47,8 @@ jobs:
   trusted-m1-evaluator:
     name: trusted-m1-evaluator
     steps:
-      - uses: actions/checkout@1111111111111111111111111111111111111111
+      - name: Check out candidate
+        uses: actions/checkout@1111111111111111111111111111111111111111
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.sha }}
@@ -129,6 +130,24 @@ def duplicate():
 
     def test_good_candidate(self) -> None:
         self.check()
+
+    def test_named_step_full_sha_is_accepted(self) -> None:
+        workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text()
+        workflow = workflow.replace("actions/checkout@" + "1" * 40,
+                                    "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2", 1)
+        validate_workflow(workflow)
+
+    def test_named_step_invalid_action_refs_are_rejected(self) -> None:
+        workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text()
+        full_ref = "actions/checkout@" + "1" * 40
+        for invalid in ("actions/checkout@main", "actions/checkout@v4",
+                        "actions/checkout@" + "1" * 39,
+                        full_ref + " extra", "actions/checkout@",
+                        "actions/checkout"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "Action reference is not a full commit SHA"
+            ):
+                validate_workflow(workflow.replace(full_ref, invalid, 1))
 
     def test_exact_candidate_identity(self) -> None:
         for kwargs in ({"candidate_sha": "0" * 40}, {"event_repository": "KiloAlpha021/other"},

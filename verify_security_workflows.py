@@ -12,7 +12,7 @@ TARGET = "KiloAlpha021/security-workflows"
 POLICY = "KiloAlpha021/security-policy"
 BASE_BRANCH = "main"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-ACTION = re.compile(r"(?m)^\s*-\s*uses:\s*([^\s#]+)")
+ACTION = re.compile(r"(?m)^[ \t]*(?:-[ \t]*)?uses:[ \t]*([^\r\n]*)")
 IDENTITY = re.compile(r"([0-9a-f]{40})  (.+)\Z")
 
 
@@ -85,8 +85,9 @@ def validate_workflow(text: str) -> None:
     require(text, "permissions:\n  contents: read", "Workflow permissions are not least privilege")
     if re.search(r"(?mi)^\s*[a-z_-]+:\s*write\s*$", text):
         raise ValueError("Write-capable workflow permission")
-    actions = ACTION.findall(text)
-    if not actions or any(re.search(r"@[0-9a-f]{40}\Z", item) is None for item in actions):
+    actions = [item.split("#", 1)[0].strip() for item in ACTION.findall(text)]
+    if not actions or any(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", item) is None
+                          for item in actions):
         raise ValueError("Action reference is not a full commit SHA")
     for fragment, message in (
         ("repository: ${{ github.repository }}", "Event repository candidate checkout removed"),
