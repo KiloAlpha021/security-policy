@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1
+
 jobs:
   security-workflows-policy:
     name: security-workflows-policy
@@ -133,11 +136,37 @@ jobs:
           if ($yamlVersion -ne '6.0.3') { throw 'Unexpected PyYAML version' }
           .\policy-env\Scripts\python.exe -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Test independent root policy
+      - name: Run candidate policy tests as candidate evidence
+        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          .\policy-env\Scripts\python.exe -m unittest discover -s $env:POLICY_SOURCE -p test_verify_security_workflows.py -v
+          .\policy-env\Scripts\python.exe -m unittest discover -s candidate -p test_verify_security_workflows.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Apply protected baseline to candidate target
+        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'
+        shell: pwsh
+        env:
+          POLICY_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
+          POLICY_PROTECTED_ROOT: ${{ github.workspace }}/policy
+          POLICY_EXPECTED_REPOSITORY: ${{ github.repository }}
+          POLICY_EXPECTED_CANDIDATE_SHA: ${{ github.sha }}
+          POLICY_EXPECTED_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          POLICY_EXPECTED_BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          POLICY_EXPECTED_EVENT: ${{ github.event_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $protectedSha = (& git -C policy rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:POLICY_EXPECTED_PROTECTED_SHA = $protectedSha
+          .\policy-env\Scripts\python.exe policy/test_verify_security_workflows.py RootPolicyTests.test_protected_source_and_candidate_target_contract RootPolicyTests.test_stage_a_candidate_invariants -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test independent root policy
+        if: env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\policy-env\Scripts\python.exe -m unittest discover -s policy -p test_verify_security_workflows.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Install isolated hash-locked audit environment
         shell: pwsh
