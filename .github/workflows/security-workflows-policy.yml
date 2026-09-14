@@ -3,6 +3,7 @@ name: security-workflows-policy
 on:
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -37,14 +38,28 @@ jobs:
           BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || github.repository }}
           BASE_BRANCH: ${{ github.event.pull_request.base.ref || 'main' }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           $ErrorActionPreference = 'Stop'
           $selfRepository = 'KiloAlpha021/security-policy'
           $downstreamRepository = 'KiloAlpha021/security-workflows'
-          if ($env:EVENT_NAME -eq 'pull_request' -and
+          # Historical bootstrap transition; remove during the first authorized protected-baseline maintenance.
+          $stageABase = '5adc147258fb7e8aa709d030221c4eec97b75641'
+          $stageAVersion = 'SECURITY-POLICY-BASELINE-1'
+          $protectedWorkflowRef = 'KiloAlpha021/security-policy/.github/workflows/security-workflows-policy.yml@refs/heads/main'
+          if ($env:EVENT_NAME -eq 'workflow_dispatch' -and
               $env:EVENT_REPOSITORY -eq $selfRepository -and
-              $env:BASE_REPOSITORY -eq $selfRepository -and
-              $env:BASE_BRANCH -eq 'main') {
+              $env:EVENT_REF -eq 'refs/heads/main' -and
+              $env:DEFAULT_BRANCH -eq 'main' -and
+              $env:WORKFLOW_REF -eq $protectedWorkflowRef) {
+            $evaluationContext = 'STAGE_A_PROTECTED_PROOF'
+            $policySource = 'policy'
+          } elseif ($env:EVENT_NAME -eq 'pull_request' -and
+                    $env:EVENT_REPOSITORY -eq $selfRepository -and
+                    $env:BASE_REPOSITORY -eq $selfRepository -and
+                    $env:BASE_BRANCH -eq 'main') {
             $evaluationContext = 'SELF_PR_BOOTSTRAP'
             $policySource = 'candidate'
           } elseif ($env:EVENT_NAME -in @('pull_request', 'merge_group') -and
@@ -65,6 +80,7 @@ jobs:
             throw 'Candidate and protected-policy roots must be separate'
           }
           $candidateRemote = (& git -C candidate remote get-url origin).Trim().TrimEnd('/')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $policyRemote = (& git -C policy remote get-url origin).Trim().TrimEnd('/')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($candidateRemote -notin @("https://github.com/$($env:EVENT_REPOSITORY)", "https://github.com/$($env:EVENT_REPOSITORY).git")) {
@@ -74,22 +90,41 @@ jobs:
             throw 'Protected-policy checkout repository mismatch'
           }
           $candidateHead = (& git -C candidate rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $policyHead = (& git -C policy rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $protectedMain = (& git -C policy rev-parse refs/remotes/origin/main).Trim()
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($candidateHead -ne $env:CANDIDATE_SHA) { throw 'Candidate checkout does not match event SHA' }
           if ($policyHead -ne $protectedMain) { throw 'Protected-policy checkout is not protected main' }
+          if ($evaluationContext -eq 'STAGE_A_PROTECTED_PROOF' -and $candidateHead -ne $policyHead) {
+            throw 'Protected proof roots must use the same protected-main SHA'
+          }
           if ($evaluationContext -eq 'SELF_PR_BOOTSTRAP') {
-            $allowed = @(
+            $legacyAllowed = @(
               '.github/workflows/security-workflows-policy.yml',
               'requirements-audit.lock',
               'requirements-policy.lock',
               'test_verify_security_workflows.py',
               'verify_security_workflows.py'
             )
+            $stageAAllowed = @(
+              '.github/workflows/security-workflows-policy.yml',
+              'test_verify_security_workflows.py'
+            )
             $changed = @(& git -C candidate diff --name-only $policyHead $candidateHead)
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            if (@($changed).Count -ne $allowed.Count -or @($changed | Where-Object { $_ -notin $allowed }).Count -ne 0) {
+            $changedStatus = @(& git -C candidate diff --name-status $policyHead $candidateHead)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $baselineText = Get-Content -LiteralPath 'candidate/.github/workflows/security-workflows-policy.yml' -Raw
+            $versionDeclarations = [regex]::Matches($baselineText, '(?m)^[ \t]*POLICY_BASELINE_VERSION[ \t]*:')
+            $exactVersionDeclarations = [regex]::Matches($baselineText, '(?m)^  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\r?$')
+            $baselineExact = $versionDeclarations.Count -eq 1 -and $exactVersionDeclarations.Count -eq 1 -and $env:POLICY_BASELINE_VERSION -eq $stageAVersion
+            $legacyExact = @($changed).Count -eq $legacyAllowed.Count -and @($changed | Where-Object { $_ -cnotin $legacyAllowed }).Count -eq 0
+            $stageAExact = @($changed).Count -eq $stageAAllowed.Count -and @($changed | Where-Object { $_ -cnotin $stageAAllowed }).Count -eq 0
+            $stageAStatusesExact = @($changedStatus).Count -eq 2 -and @($changedStatus | Where-Object { $_ -cnotin @("M`t.github/workflows/security-workflows-policy.yml", "M`ttest_verify_security_workflows.py") }).Count -eq 0
+            $stageATransition = $policyHead -eq $stageABase -and $baselineExact -and $stageAExact -and $stageAStatusesExact
+            if (-not $legacyExact -and -not $stageATransition) {
               throw 'Security-policy self-PR exceeds the bounded five-file scope'
             }
           }
@@ -137,29 +172,29 @@ jobs:
           .\policy-env\Scripts\python.exe -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run candidate policy tests as candidate evidence
-        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'
+        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP' || env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           .\policy-env\Scripts\python.exe -m unittest discover -s candidate -p test_verify_security_workflows.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Apply protected baseline to candidate target
-        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'
+        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP' || env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'
         shell: pwsh
         env:
           POLICY_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
           POLICY_PROTECTED_ROOT: ${{ github.workspace }}/policy
           POLICY_EXPECTED_REPOSITORY: ${{ github.repository }}
           POLICY_EXPECTED_CANDIDATE_SHA: ${{ github.sha }}
-          POLICY_EXPECTED_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
-          POLICY_EXPECTED_BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          POLICY_EXPECTED_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || github.repository }}
+          POLICY_EXPECTED_BASE_BRANCH: ${{ github.event.pull_request.base.ref || 'main' }}
           POLICY_EXPECTED_EVENT: ${{ github.event_name }}
         run: |
           $ErrorActionPreference = 'Stop'
           $protectedSha = (& git -C policy rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:POLICY_EXPECTED_PROTECTED_SHA = $protectedSha
-          .\policy-env\Scripts\python.exe policy/test_verify_security_workflows.py RootPolicyTests.test_protected_source_and_candidate_target_contract RootPolicyTests.test_stage_a_candidate_invariants -v
+          .\policy-env\Scripts\python.exe policy/test_verify_security_workflows.py RootPolicyTests.test_protected_source_and_candidate_target_contract RootPolicyTests.test_stage_a_candidate_invariants RootPolicyTests.test_policy_dependency_workflow_contract RootPolicyTests.test_stage_a_target_binding_executes_in_isolated_git_roots -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test independent root policy
         if: env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'
@@ -196,6 +231,9 @@ jobs:
           BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || github.repository }}
           BASE_BRANCH: ${{ github.event.pull_request.base.ref || 'main' }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           $ErrorActionPreference = 'Stop'
           .\policy-env\Scripts\python.exe policy/verify_security_workflows.py --candidate candidate --policy policy --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --base-repository $env:BASE_REPOSITORY --base-branch $env:BASE_BRANCH --event-name $env:EVENT_NAME
