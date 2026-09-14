@@ -12,6 +12,7 @@ import yaml
 
 TARGET = "KiloAlpha021/security-workflows"
 POLICY = "KiloAlpha021/security-policy"
+TRADING_TARGET = "KiloAlpha021/automated-trading-bot"
 BASE_BRANCH = "main"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REF = re.compile(r"[0-9a-f]{40}\Z")
@@ -161,13 +162,48 @@ def validate_workflow(text: str) -> None:
     if re.search(r"(?mi)^\s*[a-z_-]+:\s*write\s*$", text):
         raise ValueError("Write-capable workflow permission")
     action_references(text)
+    workflow = yaml.load(text, Loader=RestrictedLoader)
+    assert isinstance(workflow, dict)
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    checkout_steps: list[dict[str, object]] = []
+    for job in jobs.values():
+        assert isinstance(job, dict)
+        for step in job.get("steps", []):
+            assert isinstance(step, dict)
+            uses = step.get("uses")
+            if isinstance(uses, str) and uses.startswith("actions/checkout@"):
+                checkout_steps.append(step)
+
+    trading_checkouts = [
+        step for step in checkout_steps
+        if isinstance(step.get("with"), dict)
+        and step["with"].get("repository") == TRADING_TARGET
+    ]
+    if len(trading_checkouts) != 1:
+        raise ValueError("Exact trading candidate checkout removed")
+    trading_with = trading_checkouts[0]["with"]
+    assert isinstance(trading_with, dict)
+    if trading_with.get("ref") != "${{ github.sha }}":
+        raise ValueError("Exact candidate checkout removed")
+    if trading_with.get("path") != "candidate":
+        raise ValueError("Candidate root removed")
+
+    trusted_checkouts = [
+        step for step in checkout_steps
+        if isinstance(step.get("with"), dict)
+        and step["with"].get("repository") == TARGET
+    ]
+    if len(trusted_checkouts) != 1:
+        raise ValueError("Independent trusted checkout removed")
+    trusted_with = trusted_checkouts[0]["with"]
+    assert isinstance(trusted_with, dict)
+    if trusted_with.get("ref") != "main":
+        raise ValueError("Protected trusted ref removed")
+    if trusted_with.get("path") != "trusted":
+        raise ValueError("Trusted root removed")
+
     for fragment, message in (
-        ("repository: ${{ github.repository }}", "Event repository candidate checkout removed"),
-        ("ref: ${{ github.sha }}", "Exact candidate checkout removed"),
-        ("path: candidate", "Candidate root removed"),
-        ("repository: KiloAlpha021/security-workflows", "Independent trusted checkout removed"),
-        ("ref: main", "Protected trusted ref removed"),
-        ("path: trusted", "Trusted root removed"),
         ("EVENT_REPOSITORY: ${{ github.repository }}", "Repository dispatch input removed"),
         ("CANDIDATE_SHA: ${{ github.sha }}", "Candidate SHA input removed"),
         ("python trusted/verify_candidate.py", "Independent validator execution removed"),
@@ -180,6 +216,8 @@ def validate_workflow(text: str) -> None:
         ("python -m pip_audit --local", "Dependency audit removed"),
     ):
         require(text, fragment, message)
+    if "continue-on-error" in text:
+        raise ValueError("Critical workflow steps may not ignore failures")
     if re.search(r"(?m)^\s*if:\s*.*", text):
         raise ValueError("Critical workflow steps may not be conditional")
 

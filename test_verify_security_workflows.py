@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from verify_security_workflows import action_references, verify
+from verify_security_workflows import action_references, validate_workflow, verify
 
 
 def git(root: Path, *args: str) -> str:
@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@1111111111111111111111111111111111111111
         with:
-          repository: ${{ github.repository }}
+          repository: KiloAlpha021/automated-trading-bot
           ref: ${{ github.sha }}
           path: candidate
       - uses: actions/checkout@1111111111111111111111111111111111111111
@@ -133,6 +133,42 @@ def duplicate():
 
     def test_good_candidate(self) -> None:
         self.check()
+
+    def test_exact_trading_candidate_checkout_contract(self) -> None:
+        workflow_path = self.candidate / ".github/workflows/m1-trusted.yml"
+        original = workflow_path.read_text(encoding="utf-8")
+        validate_workflow(original)
+        exact = "repository: KiloAlpha021/automated-trading-bot"
+        mutations = {
+            "event_repository": "repository: ${{ github.repository }}",
+            "security_workflows": "repository: KiloAlpha021/security-workflows",
+            "wrong_owner": "repository: OtherOwner/automated-trading-bot",
+            "fork": "repository: UntrustedFork/automated-trading-bot",
+            "renamed": "repository: KiloAlpha021/renamed-trading-bot",
+            "alternate": "repository: KiloAlpha021/other-trading-bot",
+            "mutable": "repository: ${{ inputs.repository }}",
+            "missing": "",
+            "empty": "repository:",
+            "malformed": "repository: KiloAlpha021//automated-trading-bot",
+            "duplicate": exact + "\n          " + exact,
+        }
+        for label, replacement in mutations.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_workflow(original.replace(exact, replacement, 1))
+        for label, old, replacement in (
+            ("mutable_sha", "ref: ${{ github.sha }}", "ref: main"),
+            ("missing_sha", "ref: ${{ github.sha }}", ""),
+            ("wrong_candidate_path", "path: candidate", "path: other"),
+            ("missing_candidate_path", "path: candidate", ""),
+            ("trusted_checkout_removed", "repository: KiloAlpha021/security-workflows", ""),
+            ("trusted_ref_weakened", "ref: main", "ref: develop"),
+            ("trusted_path_removed", "path: trusted", ""),
+            ("least_privilege_weakened", "contents: read", "contents: write"),
+            ("nonfatal_failure", "    steps:\n", "    continue-on-error: true\n    steps:\n"),
+            ("validator_fallback", "python trusted/verify_candidate.py", "echo ignored"),
+        ):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_workflow(original.replace(old, replacement, 1))
 
     def test_structural_action_references(self) -> None:
         workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text()
