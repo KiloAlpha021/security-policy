@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -10,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from verify_security_workflows import action_references, verify
+from verify_security_workflows import action_references, validate_verifier, verify
 
 
 def git(root: Path, *args: str) -> str:
@@ -19,6 +21,9 @@ def git(root: Path, *args: str) -> str:
 
 
 class RootPolicyTests(unittest.TestCase):
+    BASELINE_VERSION = "SECURITY-POLICY-BASELINE-1"
+    POLICY_REPOSITORY = "KiloAlpha021/security-policy"
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -181,264 +186,583 @@ def duplicate():
         self.assertEqual(len(observed), 3)
         self.assertCountEqual(action_references(workflow), observed)
 
-    def test_policy_dependency_workflow_contract(self) -> None:
-        root = Path(__file__).parent
-        original = (root / ".github/workflows/security-workflows-policy.yml").read_text()
+    def _stage_a_contract(self, root: Path) -> None:
+        workflow_path = root / ".github/workflows/security-workflows-policy.yml"
+        text = workflow_path.read_text(encoding="utf-8")
+        syntax = yaml.compose(text, Loader=yaml.BaseLoader)
+        self.assertIsInstance(syntax, yaml.MappingNode)
+        assert isinstance(syntax, yaml.MappingNode)
+        env_nodes = [value for key, value in syntax.value
+                     if isinstance(key, yaml.ScalarNode) and key.value == "env"]
+        self.assertEqual(len(env_nodes), 1)
+        self.assertIsInstance(env_nodes[0], yaml.MappingNode)
+        versions = [value for key, value in env_nodes[0].value
+                    if isinstance(key, yaml.ScalarNode)
+                    and key.value == "POLICY_BASELINE_VERSION"]
+        self.assertEqual(len(versions), 1)
+        self.assertIsInstance(versions[0], yaml.ScalarNode)
+        self.assertEqual(versions[0].value, self.BASELINE_VERSION)
 
-        def assert_contract(workflow_text: str) -> None:
-            workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
-            self.assertIsInstance(workflow, dict)
-            jobs = workflow["jobs"]
-            self.assertIsInstance(jobs, dict)
-            steps = jobs["security-workflows-policy"]["steps"]
-            names = [step.get("name") for step in steps]
-            expected_order = [
-                "Check out exact candidate",
-                "Check out independent root policy",
-                "Resolve and verify evaluation context",
-                "Normalize and verify committed policy bytes",
-                "Set up CPython",
-                "Assert exact CPython runtime",
-                "Install isolated hash-locked policy environment",
-                "Test independent root policy",
-                "Install isolated hash-locked audit environment",
-                "Audit independent root policy dependencies",
-                "Apply independent security-workflows policy",
-            ]
-            self.assertEqual(names, expected_order)
-            candidate_checkout, policy_checkout, context = steps[:3]
-            self.assertEqual(candidate_checkout["with"]["repository"], "${{ github.repository }}")
-            self.assertEqual(candidate_checkout["with"]["ref"], "${{ github.sha }}")
-            self.assertEqual(candidate_checkout["with"]["path"], "candidate")
-            self.assertEqual(policy_checkout["with"]["repository"],
-                             "KiloAlpha021/security-policy")
-            self.assertEqual(policy_checkout["with"]["ref"], "main")
-            self.assertEqual(policy_checkout["with"]["path"], "policy")
-            dispatch = context["run"]
-            for fragment in (
-                "$env:EVENT_NAME -eq 'pull_request'",
-                "$env:EVENT_REPOSITORY -eq $selfRepository",
-                "$env:BASE_REPOSITORY -eq $selfRepository",
-                "$env:BASE_BRANCH -eq 'main'",
-                "$evaluationContext = 'SELF_PR_BOOTSTRAP'",
-                "$policySource = 'candidate'",
-                "$env:EVENT_NAME -in @('pull_request', 'merge_group')",
-                "$env:EVENT_REPOSITORY -eq $downstreamRepository",
-                "$env:BASE_REPOSITORY -eq $downstreamRepository",
-                "$evaluationContext = 'DOWNSTREAM_SECURITY_WORKFLOWS'",
-                "$policySource = 'policy'",
-                "throw 'Unsupported or ambiguous policy evaluation context'",
-                "^[0-9a-f]{40}$",
-                "Candidate and protected-policy roots must be separate",
-                "Candidate checkout repository mismatch",
-                "Protected-policy checkout repository mismatch",
-                "Candidate checkout does not match event SHA",
-                "Protected-policy checkout is not protected main",
-                "git -C candidate diff --name-only $policyHead $candidateHead",
-                "Security-policy self-PR exceeds the bounded five-file scope",
-                '"EVALUATION_CONTEXT=$evaluationContext" >> $env:GITHUB_ENV',
-                '"POLICY_SOURCE=$policySource" >> $env:GITHUB_ENV',
-            ):
-                self.assertIn(fragment, dispatch)
-            self.assertEqual(dispatch.count("$env:BASE_BRANCH -eq 'main'"), 2)
-            allowed_match = re.search(r"(?s)\$allowed\s*=\s*@\((.*?)\n\s*\)", dispatch)
-            self.assertIsNotNone(allowed_match)
-            assert allowed_match is not None
-            self.assertEqual(
-                re.findall(r"'([^']+)'", allowed_match.group(1)),
-                [
-                    ".github/workflows/security-workflows-policy.yml",
-                    "requirements-audit.lock",
-                    "requirements-policy.lock",
-                    "test_verify_security_workflows.py",
-                    "verify_security_workflows.py",
-                ],
-            )
-
-            normalization = steps[3]["run"]
-            for fragment in (
-                "foreach ($root in @('candidate', 'policy'))",
-                "git -C $root config core.autocrlf false",
-                "git -C $root reset --hard HEAD",
-                "foreach ($lock in @('requirements-policy.lock', 'requirements-audit.lock'))",
-                'git -C $env:POLICY_SOURCE rev-parse "HEAD`:$lock"',
-                "git -C $env:POLICY_SOURCE hash-object --no-filters $lock",
-                "Policy lock bytes differ from committed Git bytes: $lock",
-            ):
-                self.assertIn(fragment, normalization)
-            normalization_lines = [line.strip() for line in normalization.splitlines()
-                                   if line.strip()]
-            normalization_positions = {
-                fragment: next(index for index, line in enumerate(normalization_lines)
-                               if fragment in line)
-                for fragment in (
-                    "config core.autocrlf false",
-                    "reset --hard HEAD",
-                    'rev-parse "HEAD`:$lock"',
-                    "hash-object --no-filters $lock",
-                )
-            }
-            self.assertLess(normalization_positions["config core.autocrlf false"],
-                            normalization_positions["reset --hard HEAD"])
-            self.assertLess(normalization_positions["reset --hard HEAD"],
-                            normalization_positions['rev-parse "HEAD`:$lock"'])
-            self.assertLess(normalization_positions['rev-parse "HEAD`:$lock"'],
-                            normalization_positions["hash-object --no-filters $lock"])
-            for command in ("config core.autocrlf false", "reset --hard HEAD",
-                            'rev-parse "HEAD`:$lock"', "hash-object --no-filters $lock"):
-                command_index = next(index for index, line in enumerate(normalization_lines)
-                                     if command in line)
-                self.assertEqual(normalization_lines[command_index + 1],
-                                 "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
-
-            setup = steps[4]
-            self.assertEqual(setup["with"]["python-version"], "3.12.10")
-            python_assertion = steps[5]["run"]
-            self.assertIn("platform.python_version()", python_assertion)
-
-            def assert_fatal_version_gate(run: str, variable: str, expected: str) -> None:
-                mismatch = re.search(
-                    rf"(?m)^\s*if\s*\(\${variable}\s+-ne\s+'{re.escape(expected)}'\)\s*"
-                    r"\{\s*(?:throw\b|exit\s+[1-9][0-9]*\b)", run
-                )
-                self.assertIsNotNone(mismatch)
-
-            assert_fatal_version_gate(python_assertion, "pythonVersion", "3.12.10")
-            policy_install = steps[6]["run"]
-            for fragment in (
-                '$env:POLICY_SOURCE/requirements-policy.lock', "--require-hashes",
-                "--only-binary=:all:", "$yamlVersion", "print(yaml.__version__)",
-                "policy-env\\Scripts\\python.exe -m pip check",
-            ):
-                self.assertIn(fragment, policy_install)
-            assert_fatal_version_gate(policy_install, "yamlVersion", "6.0.3")
-            policy_test = steps[7]["run"]
-            self.assertIn("-m unittest discover -s $env:POLICY_SOURCE", policy_test)
-            self.assertIn("test_verify_security_workflows.py", policy_test)
-            audit_install = steps[8]["run"]
-            for fragment in (
-                "python -m venv audit-env", '$env:POLICY_SOURCE/requirements-audit.lock',
-                "--require-hashes", "--only-binary=:all:", "$auditVersion",
-                "-m pip_audit --version", "audit-env\\Scripts\\python.exe -m pip check",
-            ):
-                self.assertIn(fragment, audit_install)
-            assert_fatal_version_gate(audit_install, "auditVersion", "pip-audit 2.10.1")
-            audit = steps[9]["run"]
-            self.assertIn(
-                '-m pip_audit --no-deps -r "$env:POLICY_SOURCE/requirements-policy.lock"',
-                audit,
-            )
-            validator_step = steps[10]
-            self.assertEqual(validator_step["if"],
-                             "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
-            validator = validator_step["run"]
-            self.assertIn("policy-env\\Scripts\\python.exe policy/verify_security_workflows.py",
-                          validator)
-            self.assertNotIn("candidate/verify_security_workflows.py --candidate", validator)
-            self.assertNotIn("continue-on-error", workflow_text)
-
-            for run, command in (
-                (policy_install, "-m pip install"),
-                (policy_test, "-m unittest"),
-                (audit_install, "-m pip install"),
-                (audit, "-m pip_audit"),
-                (validator, "verify_security_workflows.py"),
-            ):
-                lines = [line.strip() for line in run.splitlines() if line.strip()]
-                command_index = next(index for index, line in enumerate(lines)
-                                     if command in line)
-                self.assertEqual(lines[command_index + 1],
-                                 "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
-
-        assert_contract(original)
-        mutations = {
-            "self_event_weakened": ("$env:EVENT_NAME -eq 'pull_request'", "$true"),
-            "self_repository_weakened": ("$env:EVENT_REPOSITORY -eq $selfRepository", "$true"),
-            "self_base_weakened": ("$env:BASE_REPOSITORY -eq $selfRepository", "$true"),
-            "base_branch_weakened": ("$env:BASE_BRANCH -eq 'main'", "$true"),
-            "downstream_repository_weakened":
-                ("$env:EVENT_REPOSITORY -eq $downstreamRepository", "$true"),
-            "downstream_base_weakened":
-                ("$env:BASE_REPOSITORY -eq $downstreamRepository", "$true"),
-            "fallthrough_success":
-                ("throw 'Unsupported or ambiguous policy evaluation context'",
-                 "$evaluationContext = 'SELF_PR_BOOTSTRAP'"),
-            "sha_weakened": ("^[0-9a-f]{40}$", ".*"),
-            "root_separation_removed":
-                ("throw 'Candidate and protected-policy roots must be separate'",
-                 "Write-Output 'roots overlap'"),
-            "candidate_remote_removed":
-                ("throw 'Candidate checkout repository mismatch'", "Write-Output 'ignored'"),
-            "policy_remote_removed":
-                ("throw 'Protected-policy checkout repository mismatch'", "Write-Output 'ignored'"),
-            "candidate_head_removed":
-                ("throw 'Candidate checkout does not match event SHA'", "Write-Output 'ignored'"),
-            "protected_head_removed":
-                ("throw 'Protected-policy checkout is not protected main'", "Write-Output 'ignored'"),
-            "comparison_removed":
-                ("git -C candidate diff --name-only $policyHead $candidateHead", "Write-Output ''"),
-            "sixth_file_allowed":
-                ("'verify_security_workflows.py'", "'verify_security_workflows.py',\n              'extra.txt'"),
-            "candidate_lock_replaced":
-                ('$env:POLICY_SOURCE/requirements-policy.lock', "policy/requirements-policy.lock"),
-            "candidate_tests_replaced":
-                ("-s $env:POLICY_SOURCE", "-s policy"),
-            "candidate_audit_lock_replaced":
-                ('$env:POLICY_SOURCE/requirements-audit.lock', "policy/requirements-audit.lock"),
-            "downstream_validator_replaced":
-                ("policy/verify_security_workflows.py", "candidate/verify_security_workflows.py"),
-            "validator_condition_removed":
-                ("if: env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'", "if: always()"),
-            "hash_enforcement_removed": (" --require-hashes", ""),
-            "binary_enforcement_removed": (" --only-binary=:all:", ""),
-            "continue_on_error": ("    steps:\n", "    continue-on-error: true\n    steps:\n"),
-            "normalization_removed":
-                ("      - name: Normalize and verify committed policy bytes\n", "      - name: Missing normalization\n"),
-            "candidate_only_normalization":
-                ("foreach ($root in @('candidate', 'policy'))", "foreach ($root in @('candidate'))"),
-            "protected_only_normalization":
-                ("foreach ($root in @('candidate', 'policy'))", "foreach ($root in @('policy'))"),
-            "hash_install_representation_split":
-                ("git -C $env:POLICY_SOURCE hash-object --no-filters $lock",
-                 "git -C policy hash-object --no-filters $lock"),
-            "downstream_normalization_bypass":
-                ("git -C $env:POLICY_SOURCE rev-parse", "git -C candidate rev-parse"),
-            "normalization_failure_nonfatal":
-                ("& git -C $root config core.autocrlf false\n"
-                 "            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
-                 "& git -C $root config core.autocrlf false\n"
-                 "            if ($LASTEXITCODE -ne 0) { Write-Output 'ignored' }"),
-        }
-        for label, (old, new) in mutations.items():
-            with self.subTest(label=label):
-                mutated = original.replace(old, new, 1)
-                self.assertNotEqual(mutated, original)
-                with self.assertRaises((AssertionError, KeyError, StopIteration)):
-                    assert_contract(mutated)
-        workflow = yaml.load(original, Loader=yaml.BaseLoader)
+        workflow = yaml.load(text, Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group", "workflow_dispatch"})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertNotIn("continue-on-error", text)
         steps = workflow["jobs"]["security-workflows-policy"]["steps"]
-        normalization_step = steps.pop(3)
-        steps.insert(7, normalization_step)
-        with self.subTest(label="normalization_after_install"), self.assertRaises(
-                (AssertionError, KeyError, StopIteration)):
-            assert_contract(yaml.safe_dump(workflow, sort_keys=False))
 
-        workflow = yaml.load(original, Loader=yaml.BaseLoader)
-        normalization = workflow["jobs"]["security-workflows-policy"]["steps"][3]["run"]
-        normalization_lines = normalization.splitlines()
-        reset_index = next(index for index, line in enumerate(normalization_lines)
-                           if "reset --hard HEAD" in line)
-        reset_block = normalization_lines[reset_index:reset_index + 2]
-        del normalization_lines[reset_index:reset_index + 2]
-        hash_index = next(index for index, line in enumerate(normalization_lines)
-                          if "hash-object --no-filters" in line)
-        normalization_lines[hash_index + 2:hash_index + 2] = reset_block
-        workflow["jobs"]["security-workflows-policy"]["steps"][3]["run"] = (
-            "\n".join(normalization_lines) + "\n"
+        def role(label: str, token: str) -> tuple[int, dict[str, object]]:
+            found = [(index, step) for index, step in enumerate(steps)
+                     if token in str(step.get("run", step.get("uses", "")))]
+            self.assertEqual(len(found), 1, label)
+            return found[0]
+
+        candidate_checkout = [(i, s) for i, s in enumerate(steps)
+                              if s.get("with", {}).get("path") == "candidate"]
+        protected_checkout = [(i, s) for i, s in enumerate(steps)
+                              if s.get("with", {}).get("path") == "policy"]
+        self.assertEqual(len(candidate_checkout), 1)
+        self.assertEqual(len(protected_checkout), 1)
+        context = role("context", "Unsupported or ambiguous policy evaluation context")
+        normalization = role("normalization", "Policy lock bytes differ from committed Git bytes")
+        setup = role("Python setup", "actions/setup-python@")
+        python_gate = role("Python gate", "platform.python_version()")
+        policy_install = role("policy install", "-m pip install --require-hashes --only-binary=:all: -r \"$env:POLICY_SOURCE/requirements-policy.lock\"")
+        candidate_tests = role("candidate evidence", "-m unittest discover -s candidate")
+        protected_tests = role("protected Stage A baseline", "test_protected_source_and_candidate_target_contract")
+        policy_discovery = [(index, step) for index, step in enumerate(steps)
+                            if "-m unittest discover -s policy" in step.get("run", "")]
+        self.assertEqual(len(policy_discovery), 2)
+        legacy_matches = [item for item in policy_discovery
+                          if item[1].get("if") == "env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'"]
+        downstream_matches = [item for item in policy_discovery
+                              if item[1].get("if") == "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'"]
+        self.assertEqual(len(legacy_matches), 1)
+        self.assertEqual(len(downstream_matches), 1)
+        legacy_tests = legacy_matches[0]
+        downstream_tests = downstream_matches[0]
+        audit_install_matches = [(index, step) for index, step in enumerate(steps)
+                                 if "requirements-audit.lock" in step.get("run", "")
+                                 and "-m pip install" in step.get("run", "")]
+        self.assertEqual(len(audit_install_matches), 1, "audit install")
+        audit_install = audit_install_matches[0]
+        audit = role("dependency audit", "-m pip_audit --no-deps")
+        validator = role("protected validator", "policy/verify_security_workflows.py --candidate candidate")
+
+        candidate_with = candidate_checkout[0][1]["with"]
+        self.assertEqual(candidate_with["repository"], "${{ github.repository }}")
+        self.assertEqual(candidate_with["ref"], "${{ github.sha }}")
+        self.assertEqual(candidate_with["fetch-depth"], "0")
+        protected_with = protected_checkout[0][1]["with"]
+        self.assertEqual(protected_with["repository"], self.POLICY_REPOSITORY)
+        self.assertEqual(protected_with["ref"], "main")
+        self.assertEqual(protected_with["fetch-depth"], "0")
+
+        dispatch = context[1]["run"]
+        for fragment in (
+            "$env:EVENT_NAME -eq 'workflow_dispatch'", "$env:EVENT_REF -eq 'refs/heads/main'",
+            "$env:WORKFLOW_REF -eq $protectedWorkflowRef", "$evaluationContext = 'STAGE_A_PROTECTED_PROOF'",
+            "$env:EVENT_NAME -eq 'pull_request'", "$env:EVENT_REPOSITORY -eq $selfRepository",
+            "$env:BASE_REPOSITORY -eq $selfRepository", "$env:BASE_BRANCH -eq 'main'",
+            "$evaluationContext = 'SELF_PR_BOOTSTRAP'", "$policySource = 'candidate'",
+            "$env:EVENT_NAME -in @('pull_request', 'merge_group')",
+            "$env:EVENT_REPOSITORY -eq $downstreamRepository",
+            "$evaluationContext = 'DOWNSTREAM_SECURITY_WORKFLOWS'", "$policySource = 'policy'",
+            "throw 'Unsupported or ambiguous policy evaluation context'", "^[0-9a-f]{40}$",
+            "Candidate and protected-policy roots must be separate",
+            "Candidate checkout repository mismatch", "Protected-policy checkout repository mismatch",
+            "Candidate checkout does not match event SHA", "Protected-policy checkout is not protected main",
+            "git -C candidate diff --name-only $policyHead $candidateHead",
+            "$stageABase = '5adc147258fb7e8aa709d030221c4eec97b75641'",
+            "$stageAVersion = 'SECURITY-POLICY-BASELINE-1'", "$stageAAllowed = @(",
+            "$stageAStatusesExact", "$policyHead -eq $stageABase", "$baselineExact",
+            "$stageATransition = $policyHead -eq $stageABase -and $baselineExact -and $stageAExact -and $stageAStatusesExact",
+            "Protected proof roots must use the same protected-main SHA",
+            "Security-policy self-PR exceeds the bounded five-file scope",
+        ):
+            self.assertIn(fragment, dispatch)
+        self.assertNotIn("HashSet", dispatch)
+        self.assertNotIn("Policy lock changes require protected contract tests", dispatch)
+
+        for fragment in ("foreach ($root in @('candidate', 'policy'))",
+                         "config core.autocrlf false", "reset --hard HEAD",
+                         "hash-object --no-filters", "Policy lock bytes differ"):
+            self.assertIn(fragment, normalization[1]["run"])
+        self.assertEqual(setup[1]["with"]["python-version"], "3.12.10")
+        self.assertIn("$pythonVersion -ne '3.12.10'", python_gate[1]["run"])
+        self.assertIn("throw 'Unexpected CPython version'", python_gate[1]["run"])
+        for run, expected in ((policy_install[1]["run"], "6.0.3"),
+                              (audit_install[1]["run"], "pip-audit 2.10.1")):
+            self.assertIn("--require-hashes", run)
+            self.assertIn("--only-binary=:all:", run)
+            self.assertIn("-m pip check", run)
+            self.assertIn(expected, run)
+        proof_condition = "env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP' || env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'"
+        self.assertEqual(candidate_tests[1]["name"], "Run candidate Stage A evidence")
+        self.assertEqual(candidate_tests[1]["if"], proof_condition)
+        self.assertEqual(legacy_tests[1]["name"], "Run legacy protected health")
+        self.assertEqual(legacy_tests[1]["if"], "env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'")
+        self.assertEqual(protected_tests[1]["name"], "Apply protected Stage A baseline to candidate target")
+        self.assertEqual(protected_tests[1]["if"], "env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'")
+        self.assertEqual(protected_tests[1]["env"], {
+            "POLICY_CANDIDATE_ROOT": "${{ github.workspace }}/candidate",
+            "POLICY_PROTECTED_ROOT": "${{ github.workspace }}/policy",
+            "POLICY_EXPECTED_REPOSITORY": "${{ github.repository }}",
+            "POLICY_EXPECTED_CANDIDATE_SHA": "${{ github.sha }}",
+            "POLICY_EXPECTED_BASE_REPOSITORY": "${{ github.event.pull_request.base.repo.full_name || github.repository }}",
+            "POLICY_EXPECTED_BASE_BRANCH": "${{ github.event.pull_request.base.ref || 'main' }}",
+            "POLICY_EXPECTED_EVENT": "${{ github.event_name }}",
+        })
+        self.assertEqual(downstream_tests[1]["if"], "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
+        self.assertEqual(validator[1]["if"], "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
+        for method in (
+            "test_protected_source_and_candidate_target_contract",
+            "test_stage_a_candidate_invariants",
+            "test_stage_a_target_binding_executes_in_isolated_git_roots",
+        ):
+            self.assertNotIn(method, legacy_tests[1]["run"])
+            self.assertIn(method, protected_tests[1]["run"])
+        self.assertNotIn("candidate/test_verify_security_workflows.py", legacy_tests[1]["run"])
+        self.assertNotIn("candidate/test_verify_security_workflows.py", protected_tests[1]["run"])
+        self.assertNotIn("candidate/verify_security_workflows.py", validator[1]["run"])
+        order = [candidate_checkout[0][0], protected_checkout[0][0], context[0], normalization[0],
+                 setup[0], python_gate[0], policy_install[0], candidate_tests[0], legacy_tests[0], protected_tests[0],
+                 downstream_tests[0], audit_install[0], audit[0], validator[0]]
+        self.assertEqual(order, sorted(order))
+        for _, step in (context, normalization, python_gate, policy_install, candidate_tests,
+                        legacy_tests, protected_tests, downstream_tests, audit_install, audit, validator):
+            self.assertIn("$ErrorActionPreference = 'Stop'", step["run"])
+            self.assertIn("$LASTEXITCODE -ne 0", step["run"])
+
+    def test_policy_dependency_workflow_contract(self) -> None:
+        root = Path(os.environ.get("POLICY_CONTRACT_TARGET", Path(__file__).parent))
+        self._stage_a_contract(root)
+        original = (root / ".github/workflows/security-workflows-policy.yml").read_text(encoding="utf-8")
+        mutations = (
+            ("  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n", ""),
+            ("SECURITY-POLICY-BASELINE-1", "SECURITY-POLICY-BASELINE-2"),
+            ("SECURITY-POLICY-BASELINE-1", "security-policy-baseline-1"),
+            ("  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1",
+             "  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1"),
+            ("throw 'Unsupported or ambiguous policy evaluation context'", "$evaluationContext = 'SELF_PR_BOOTSTRAP'"),
+            ("$stageABase = '5adc147258fb7e8aa709d030221c4eec97b75641'", "$stageABase = '0'"),
+            ("$policyHead -eq $stageABase", "$true"),
+            ("-and $stageAStatusesExact", "-and $true"),
+            ("$env:WORKFLOW_REF -eq $protectedWorkflowRef", "$true"),
+            ("Protected proof roots must use the same protected-main SHA", "proof mismatch ignored"),
+            ("^[0-9a-f]{40}$", ".*"),
+            ("throw 'Candidate and protected-policy roots must be separate'", "Write-Output ignored"),
+            ("throw 'Security-policy self-PR exceeds the bounded five-file scope'", "Write-Output ignored"),
+            (" --require-hashes", ""), (" --only-binary=:all:", ""),
+            ("-m unittest discover -s candidate", "-m unittest discover -s policy"),
+            ("Run legacy protected health", "Run candidate Stage A evidence"),
+            ("env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          .\\policy-env\\Scripts\\python.exe -m unittest discover -s policy",
+             "env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          .\\policy-env\\Scripts\\python.exe -m unittest discover -s policy"),
+            ("if: env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'\n        shell: pwsh\n        env:\n          POLICY_CANDIDATE_ROOT",
+             "if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'\n        shell: pwsh\n        env:\n          POLICY_CANDIDATE_ROOT"),
+            ("test_protected_source_and_candidate_target_contract", "test_policy_dependency_workflow_contract"),
+            ("policy/test_verify_security_workflows.py", "candidate/test_verify_security_workflows.py"),
+            ("policy/verify_security_workflows.py", "candidate/verify_security_workflows.py"),
+            ("$ErrorActionPreference = 'Stop'", "$ErrorActionPreference = 'Continue'"),
         )
-        with self.subTest(label="normalization_after_hash"), self.assertRaises(
-                (AssertionError, KeyError, StopIteration)):
-            assert_contract(yaml.safe_dump(workflow, sort_keys=False))
+        for old, new in mutations:
+            with self.subTest(old=old, new=new):
+                changed = original.replace(old, new, 1)
+                self.assertNotEqual(changed, original)
+                with tempfile.TemporaryDirectory() as directory:
+                    target = Path(directory)
+                    shutil.copytree(root / ".github", target / ".github")
+                    (target / ".github/workflows/security-workflows-policy.yml").write_text(changed, encoding="utf-8")
+                    with self.assertRaises((AssertionError, KeyError, TypeError)):
+                        self._stage_a_contract(target)
+
+    def _bound_roots(self) -> tuple[Path, Path]:
+        names = ("POLICY_CANDIDATE_ROOT", "POLICY_PROTECTED_ROOT", "POLICY_EXPECTED_REPOSITORY",
+                 "POLICY_EXPECTED_CANDIDATE_SHA", "POLICY_EXPECTED_BASE_REPOSITORY",
+                 "POLICY_EXPECTED_BASE_BRANCH", "POLICY_EXPECTED_EVENT",
+                 "POLICY_EXPECTED_PROTECTED_SHA")
+        values = {name: os.environ.get(name) for name in names}
+        if not any(values.values()):
+            self.skipTest("protected candidate binding requires explicit inputs")
+        self.assertEqual([name for name, value in values.items() if not value], [])
+        candidate = Path(values["POLICY_CANDIDATE_ROOT"])
+        protected = Path(values["POLICY_PROTECTED_ROOT"])
+        self.assertTrue(candidate.is_absolute())
+        self.assertTrue(protected.is_absolute())
+        self.assertEqual(str(candidate), str(candidate.resolve(strict=True)))
+        self.assertEqual(str(protected), str(protected.resolve(strict=True)))
+        self.assertNotEqual(candidate, protected)
+        self.assertNotIn(candidate, protected.parents)
+        self.assertNotIn(protected, candidate.parents)
+        return candidate, protected
+
+    def test_protected_source_and_candidate_target_contract(self) -> None:
+        candidate, protected = self._bound_roots()
+        expected_repository = os.environ["POLICY_EXPECTED_REPOSITORY"]
+        self.assertEqual(expected_repository, self.POLICY_REPOSITORY)
+        self.assertEqual(os.environ["POLICY_EXPECTED_BASE_REPOSITORY"], self.POLICY_REPOSITORY)
+        self.assertEqual(os.environ["POLICY_EXPECTED_BASE_BRANCH"], "main")
+        expected_event = os.environ["POLICY_EXPECTED_EVENT"]
+        self.assertIn(expected_event, {"pull_request", "workflow_dispatch"})
+        expected_remote = f"https://github.com/{self.POLICY_REPOSITORY}"
+        for root in (candidate, protected):
+            self.assertEqual(git(root, "rev-parse", "--is-inside-work-tree"), "true")
+            self.assertIn(git(root, "remote", "get-url", "origin").rstrip("/"),
+                          (expected_remote, expected_remote + ".git"))
+        self.assertEqual(git(candidate, "rev-parse", "HEAD"),
+                         os.environ["POLICY_EXPECTED_CANDIDATE_SHA"])
+        if expected_event == "workflow_dispatch":
+            self.assertEqual(git(candidate, "rev-parse", "HEAD"),
+                             os.environ["POLICY_EXPECTED_PROTECTED_SHA"])
+        self.assertEqual(git(protected, "rev-parse", "HEAD"),
+                         os.environ["POLICY_EXPECTED_PROTECTED_SHA"])
+        self.assertEqual(git(protected, "rev-parse", "refs/remotes/origin/main"),
+                         os.environ["POLICY_EXPECTED_PROTECTED_SHA"])
+        source = Path(__file__).resolve()
+        self.assertTrue(source.is_relative_to(protected))
+        self.assertFalse(source.is_relative_to(candidate))
+
+    def _assert_candidate_locks_equal_protected(self, candidate: Path,
+                                                  protected: Path) -> None:
+        for name in ("requirements-policy.lock", "requirements-audit.lock"):
+            candidate_lock = candidate / name
+            protected_lock = protected / name
+            self.assertTrue(candidate_lock.is_file() and not candidate_lock.is_symlink(), name)
+            self.assertTrue(protected_lock.is_file() and not protected_lock.is_symlink(), name)
+            candidate_bytes = candidate_lock.read_bytes()
+            protected_bytes = protected_lock.read_bytes()
+            self.assertEqual(candidate_bytes, protected_bytes, name)
+            candidate_blob = git(candidate, "rev-parse", f"HEAD:{name}")
+            protected_blob = git(protected, "rev-parse", f"HEAD:{name}")
+            self.assertEqual(candidate_blob, protected_blob, name)
+            self.assertEqual(git(candidate, "hash-object", "--no-filters", name),
+                             candidate_blob, name)
+            self.assertEqual(git(protected, "hash-object", "--no-filters", name),
+                             protected_blob, name)
+
+    def _assert_candidate_validator_contract(self, candidate: Path) -> None:
+        validator_path = candidate / "verify_security_workflows.py"
+        self.assertTrue(validator_path.is_file() and not validator_path.is_symlink())
+        resolved = validator_path.resolve(strict=True)
+        self.assertTrue(resolved.is_relative_to(candidate))
+        validator = resolved.read_text(encoding="utf-8")
+        self.assertIn('POLICY = "KiloAlpha021/security-policy"', validator)
+        self.assertNotIn("candidate/test_verify_security_workflows.py", validator)
+        self.assertNotIn("POLICY_PROTECTED_ROOT", validator)
+        validate_verifier(validator)
+
+    def test_stage_a_candidate_invariants(self) -> None:
+        candidate, protected = self._bound_roots()
+        protected_test = protected / "test_verify_security_workflows.py"
+        protected_validator = protected / "verify_security_workflows.py"
+        protected_test_bytes = protected_test.read_bytes()
+        protected_validator_bytes = protected_validator.read_bytes()
+        self._stage_a_contract(candidate)
+        self._assert_candidate_locks_equal_protected(candidate, protected)
+        self._assert_candidate_validator_contract(candidate)
+        self.assertEqual(protected_test.read_bytes(), protected_test_bytes)
+        self.assertEqual(protected_validator.read_bytes(), protected_validator_bytes)
+
+    def test_stage_a_target_binding_executes_in_isolated_git_roots(self) -> None:
+        source_root = Path(__file__).parent
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            candidate = base / "candidate"
+            protected = base / "protected"
+            ignored = shutil.ignore_patterns(".git", "__pycache__", "*.pyc")
+            shutil.copytree(source_root, candidate, ignore=ignored)
+            shutil.copytree(source_root, protected, ignore=ignored)
+            for root in (candidate, protected):
+                git(root, "init", "-b", "main")
+                git(root, "config", "core.autocrlf", "false")
+                git(root, "config", "user.name", "Stage A Test")
+                git(root, "config", "user.email", "stage-a@example.invalid")
+                git(root, "remote", "add", "origin",
+                    "https://github.com/KiloAlpha021/security-policy.git")
+                git(root, "add", ".")
+                git(root, "commit", "-m", "fixture")
+            git(protected, "update-ref", "refs/remotes/origin/main",
+                git(protected, "rev-parse", "HEAD"))
+
+            environment = os.environ.copy()
+            environment.update({
+                "POLICY_CANDIDATE_ROOT": str(candidate.resolve()),
+                "POLICY_PROTECTED_ROOT": str(protected.resolve()),
+                "POLICY_EXPECTED_REPOSITORY": self.POLICY_REPOSITORY,
+                "POLICY_EXPECTED_CANDIDATE_SHA": git(candidate, "rev-parse", "HEAD"),
+                "POLICY_EXPECTED_BASE_REPOSITORY": self.POLICY_REPOSITORY,
+                "POLICY_EXPECTED_BASE_BRANCH": "main",
+                "POLICY_EXPECTED_EVENT": "pull_request",
+                "POLICY_EXPECTED_PROTECTED_SHA": git(protected, "rev-parse", "HEAD"),
+                "PYTHONPATH": str(protected.resolve()),
+            })
+
+            def execute(method: str, overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                selected = environment.copy()
+                selected.update(overrides or {})
+                return subprocess.run(
+                    [str(Path(os.sys.executable)), str(protected / "test_verify_security_workflows.py"),
+                     f"RootPolicyTests.{method}", "-v"],
+                    cwd=protected, env=selected, capture_output=True, text=True,
+                )
+
+            for method in ("test_protected_source_and_candidate_target_contract",
+                           "test_stage_a_candidate_invariants"):
+                result = execute(method)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+            failures = (
+                {"POLICY_EXPECTED_REPOSITORY": "KiloAlpha021/other"},
+                {"POLICY_EXPECTED_CANDIDATE_SHA": "0" * 40},
+                {"POLICY_EXPECTED_BASE_REPOSITORY": "KiloAlpha021/other"},
+                {"POLICY_EXPECTED_BASE_BRANCH": "other"},
+                {"POLICY_EXPECTED_EVENT": "push"},
+                {"POLICY_CANDIDATE_ROOT": str(protected.resolve())},
+                {"POLICY_CANDIDATE_ROOT": str((candidate / "missing").resolve())},
+            )
+            for overrides in failures:
+                with self.subTest(overrides=overrides):
+                    self.assertNotEqual(
+                        execute("test_protected_source_and_candidate_target_contract", overrides).returncode,
+                        0,
+                    )
+
+            git(candidate, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/other.git")
+            self.assertNotEqual(
+                execute("test_protected_source_and_candidate_target_contract").returncode, 0
+            )
+            git(candidate, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+
+            protected_lock_bytes = {
+                name: (protected / name).read_bytes()
+                for name in ("requirements-policy.lock", "requirements-audit.lock")
+            }
+            lock_mutations = (
+                ("requirements-policy.lock", lambda value: value + b"# one-byte mutation\n"),
+                ("requirements-policy.lock", lambda value: value.replace(b"\n", b"\r\n")),
+                ("requirements-policy.lock", lambda value: value.replace(b"pyyaml==6.0.3", b"pyyaml==6.0.2")),
+                ("requirements-policy.lock", lambda value: value.replace(b"sha256:", b"sha256:0", 1)),
+                ("requirements-audit.lock", lambda value: b"\n".join(reversed(value.splitlines())) + b"\n"),
+            )
+            for name, mutate in lock_mutations:
+                with self.subTest(lock_mutation=name, mutation=mutate):
+                    lock = candidate / name
+                    original_lock = lock.read_bytes()
+                    changed = mutate(original_lock)
+                    self.assertNotEqual(changed, original_lock)
+                    lock.write_bytes(changed)
+                    self.assertNotEqual(execute("test_stage_a_candidate_invariants").returncode, 0)
+                    lock.write_bytes(original_lock)
+            missing_lock = candidate / "requirements-policy.lock"
+            saved_lock = missing_lock.read_bytes()
+            missing_lock.unlink()
+            self.assertNotEqual(execute("test_stage_a_candidate_invariants").returncode, 0)
+            missing_lock.mkdir()
+            self.assertNotEqual(execute("test_stage_a_candidate_invariants").returncode, 0)
+            missing_lock.rmdir()
+            missing_lock.write_bytes(saved_lock)
+            for name, expected in protected_lock_bytes.items():
+                self.assertEqual((protected / name).read_bytes(), expected)
+
+            validator_path = candidate / "verify_security_workflows.py"
+            validator_original = validator_path.read_text(encoding="utf-8")
+            validator_mutations = (
+                ('POLICY = "KiloAlpha021/security-policy"', 'POLICY = "KiloAlpha021/other"'),
+                ('CANDIDATE_REPOSITORY = "KiloAlpha021/automated-trading-bot"',
+                 'CANDIDATE_REPOSITORY = "KiloAlpha021/other"'),
+                ("if event_repository not in SUPPORTED_REPOSITORIES", "if False"),
+                ("repository(candidate) != event_repository", "False"),
+                ("Candidate checkout does not match event SHA", "candidate accepted"),
+                ("Candidate and trusted roots must be separate", "roots may overlap"),
+                ("Trusted M1 control mismatch", "trusted mismatch ignored"),
+            )
+            protected_validator_bytes = (protected / "verify_security_workflows.py").read_bytes()
+            for old_fragment, new_fragment in validator_mutations:
+                with self.subTest(validator_mutation=old_fragment):
+                    changed = validator_original.replace(old_fragment, new_fragment)
+                    self.assertNotEqual(changed, validator_original)
+                    validator_path.write_text(changed, encoding="utf-8")
+                    self.assertNotEqual(execute("test_stage_a_candidate_invariants").returncode, 0)
+                    validator_path.write_text(validator_original, encoding="utf-8")
+            validator_path.unlink()
+            self.assertNotEqual(execute("test_stage_a_candidate_invariants").returncode, 0)
+            validator_path.mkdir()
+            self.assertNotEqual(execute("test_stage_a_candidate_invariants").returncode, 0)
+            validator_path.rmdir()
+            validator_path.write_text(validator_original, encoding="utf-8")
+            self.assertEqual((protected / "verify_security_workflows.py").read_bytes(),
+                             protected_validator_bytes)
+
+            workflow = candidate / ".github/workflows/security-workflows-policy.yml"
+            original = workflow.read_text(encoding="utf-8")
+            workflow.write_text(original.replace(self.BASELINE_VERSION,
+                                                  "SECURITY-POLICY-BASELINE-2", 1),
+                                encoding="utf-8")
+            git(candidate, "add", ".")
+            git(candidate, "commit", "-m", "candidate mutation")
+            result = execute("test_stage_a_candidate_invariants", {
+                "POLICY_EXPECTED_CANDIDATE_SHA": git(candidate, "rev-parse", "HEAD")
+            })
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((protected / "test_verify_security_workflows.py").read_bytes(),
+                             (source_root / "test_verify_security_workflows.py").read_bytes())
+
+    def test_stage_a_admission_and_proof_context_execute(self) -> None:
+        source_root = Path(__file__).parent
+        workflow = yaml.load(
+            (source_root / ".github/workflows/security-workflows-policy.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        context_steps = [step for step in workflow["jobs"]["security-workflows-policy"]["steps"]
+                         if "Unsupported or ambiguous policy evaluation context" in step.get("run", "")]
+        self.assertEqual(len(context_steps), 1)
+        original_script = context_steps[0]["run"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory)
+            policy = runner / "policy"
+            candidate = runner / "candidate"
+            ignored = shutil.ignore_patterns(".git", "__pycache__", "*.pyc")
+            shutil.copytree(source_root, policy, ignore=ignored)
+            git(policy, "init", "-b", "main")
+            git(policy, "config", "core.autocrlf", "false")
+            git(policy, "config", "user.name", "Stage A Test")
+            git(policy, "config", "user.email", "stage-a@example.invalid")
+            git(policy, "remote", "add", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            git(policy, "add", ".")
+            git(policy, "commit", "-m", "protected fixture")
+            protected_sha = git(policy, "rev-parse", "HEAD")
+            git(policy, "update-ref", "refs/remotes/origin/main", protected_sha)
+            shutil.copytree(policy, candidate)
+
+            def reset_candidate() -> None:
+                git(candidate, "reset", "--hard", protected_sha)
+                git(candidate, "clean", "-fd")
+
+            def commit_paths(paths: tuple[str, ...]) -> str:
+                reset_candidate()
+                for name in paths:
+                    target = candidate / name
+                    target.write_text(target.read_text(encoding="utf-8") + "\n# stage-a-admission-fixture\n",
+                                      encoding="utf-8", newline="\n")
+                git(candidate, "add", ".")
+                git(candidate, "commit", "-m", "candidate fixture")
+                return git(candidate, "rev-parse", "HEAD")
+
+            script = original_script.replace(
+                "5adc147258fb7e8aa709d030221c4eec97b75641", protected_sha
+            )
+
+            def execute(event: str, candidate_sha: str, **overrides: str) -> subprocess.CompletedProcess[str]:
+                output = runner / "github-env.txt"
+                output.write_text("", encoding="utf-8")
+                environment = os.environ.copy()
+                environment.update({
+                    "EVENT_REPOSITORY": self.POLICY_REPOSITORY,
+                    "CANDIDATE_SHA": candidate_sha,
+                    "BASE_REPOSITORY": self.POLICY_REPOSITORY,
+                    "BASE_BRANCH": "main",
+                    "EVENT_NAME": event,
+                    "EVENT_REF": "refs/heads/main" if event == "workflow_dispatch" else "refs/pull/1/merge",
+                    "DEFAULT_BRANCH": "main",
+                    "WORKFLOW_REF": "KiloAlpha021/security-policy/.github/workflows/security-workflows-policy.yml@refs/heads/main",
+                    "POLICY_BASELINE_VERSION": self.BASELINE_VERSION,
+                    "GITHUB_ENV": str(output),
+                })
+                environment.update(overrides)
+                return subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+                    cwd=runner, env=environment, capture_output=True, text=True,
+                )
+
+            transition_sha = commit_paths((
+                ".github/workflows/security-workflows-policy.yml",
+                "test_verify_security_workflows.py",
+            ))
+            positive = execute("pull_request", transition_sha)
+            self.assertEqual(positive.returncode, 0, positive.stderr or positive.stdout)
+            self.assertIn("EVALUATION_CONTEXT=SELF_PR_BOOTSTRAP",
+                          (runner / "github-env.txt").read_text(encoding="utf-8"))
+
+            for label, paths in (
+                ("one_file", ("test_verify_security_workflows.py",)),
+                ("third_file", (".github/workflows/security-workflows-policy.yml",
+                                "test_verify_security_workflows.py", "README.md")),
+                ("policy_lock", (".github/workflows/security-workflows-policy.yml",
+                                 "test_verify_security_workflows.py", "requirements-policy.lock")),
+                ("validator", (".github/workflows/security-workflows-policy.yml",
+                               "test_verify_security_workflows.py", "verify_security_workflows.py")),
+                ("manifest", (".github/workflows/security-workflows-policy.yml",
+                              "test_verify_security_workflows.py", "policy-manifest.json")),
+            ):
+                with self.subTest(label=label):
+                    sha = commit_paths(paths)
+                    self.assertNotEqual(execute("pull_request", sha).returncode, 0)
+
+            reset_candidate()
+            proof = execute("workflow_dispatch", protected_sha)
+            self.assertEqual(proof.returncode, 0, proof.stderr or proof.stdout)
+            proof_env = (runner / "github-env.txt").read_text(encoding="utf-8")
+            self.assertIn("EVALUATION_CONTEXT=STAGE_A_PROTECTED_PROOF", proof_env)
+            self.assertIn("POLICY_SOURCE=policy", proof_env)
+
+            negative_contexts = (
+                {"EVENT_REPOSITORY": "KiloAlpha021/other"},
+                {"EVENT_REF": "refs/heads/other"},
+                {"DEFAULT_BRANCH": "other"},
+                {"WORKFLOW_REF": "KiloAlpha021/security-policy/.github/workflows/security-workflows-policy.yml@refs/heads/other"},
+                {"CANDIDATE_SHA": "0" * 40},
+            )
+            for override in negative_contexts:
+                with self.subTest(proof_override=override):
+                    self.assertNotEqual(execute("workflow_dispatch", protected_sha, **override).returncode, 0)
+
+            moved_script = script.replace(f"$stageABase = '{protected_sha}'", "$stageABase = '0'", 1)
+            output = runner / "github-env.txt"
+            env = os.environ.copy()
+            env.update({
+                "EVENT_REPOSITORY": self.POLICY_REPOSITORY,
+                "CANDIDATE_SHA": transition_sha,
+                "BASE_REPOSITORY": self.POLICY_REPOSITORY,
+                "BASE_BRANCH": "main", "EVENT_NAME": "pull_request",
+                "EVENT_REF": "refs/pull/1/merge", "DEFAULT_BRANCH": "main",
+                "WORKFLOW_REF": "KiloAlpha021/security-policy/.github/workflows/security-workflows-policy.yml@refs/heads/main",
+                "POLICY_BASELINE_VERSION": self.BASELINE_VERSION, "GITHUB_ENV": str(output),
+            })
+            self.assertNotEqual(subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", moved_script],
+                cwd=runner, env=env, capture_output=True, text=True,
+            ).returncode, 0)
+
+    def test_stage_a_transition_removal_is_required_after_bootstrap(self) -> None:
+        text = (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("$stageABase = '5adc147258fb7e8aa709d030221c4eec97b75641'", text)
+        self.assertIn("$policyHead -eq $stageABase", text)
+        self.assertNotIn("$policyHead -ne $stageABase", text)
+        self.assertIn("historical bootstrap", text.lower())
+
+    def test_all_pwsh_blocks_parse_executably(self) -> None:
+        workflow = yaml.load(
+            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        blocks = [step["run"] for step in workflow["jobs"]["security-workflows-policy"]["steps"]
+                  if step.get("shell") == "pwsh"]
+        self.assertGreater(len(blocks), 0)
+        for index, block in enumerate(blocks):
+            with self.subTest(index=index):
+                result = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                     "[void][scriptblock]::Create([Console]::In.ReadToEnd())"],
+                    input=block, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_policy_dependency_lock_identities(self) -> None:
         root = Path(__file__).parent
         policy = root / "requirements-policy.lock"
