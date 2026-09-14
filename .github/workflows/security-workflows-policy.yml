@@ -92,6 +92,23 @@ jobs:
           }
           "EVALUATION_CONTEXT=$evaluationContext" >> $env:GITHUB_ENV
           "POLICY_SOURCE=$policySource" >> $env:GITHUB_ENV
+      - name: Normalize and verify committed policy bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($root in @('candidate', 'policy')) {
+            & git -C $root config core.autocrlf false
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & git -C $root reset --hard HEAD
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          foreach ($lock in @('requirements-policy.lock', 'requirements-audit.lock')) {
+            $committedBlob = (& git -C $env:POLICY_SOURCE rev-parse "HEAD`:$lock").Trim()
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $worktreeBlob = (& git -C $env:POLICY_SOURCE hash-object --no-filters $lock).Trim()
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($worktreeBlob -ne $committedBlob) { throw "Policy lock bytes differ from committed Git bytes: $lock" }
+          }
       - name: Set up CPython
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:

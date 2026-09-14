@@ -196,6 +196,7 @@ def duplicate():
                 "Check out exact candidate",
                 "Check out independent root policy",
                 "Resolve and verify evaluation context",
+                "Normalize and verify committed policy bytes",
                 "Set up CPython",
                 "Assert exact CPython runtime",
                 "Install isolated hash-locked policy environment",
@@ -254,9 +255,45 @@ def duplicate():
                 ],
             )
 
-            setup = steps[3]
+            normalization = steps[3]["run"]
+            for fragment in (
+                "foreach ($root in @('candidate', 'policy'))",
+                "git -C $root config core.autocrlf false",
+                "git -C $root reset --hard HEAD",
+                "foreach ($lock in @('requirements-policy.lock', 'requirements-audit.lock'))",
+                'git -C $env:POLICY_SOURCE rev-parse "HEAD`:$lock"',
+                "git -C $env:POLICY_SOURCE hash-object --no-filters $lock",
+                "Policy lock bytes differ from committed Git bytes: $lock",
+            ):
+                self.assertIn(fragment, normalization)
+            normalization_lines = [line.strip() for line in normalization.splitlines()
+                                   if line.strip()]
+            normalization_positions = {
+                fragment: next(index for index, line in enumerate(normalization_lines)
+                               if fragment in line)
+                for fragment in (
+                    "config core.autocrlf false",
+                    "reset --hard HEAD",
+                    'rev-parse "HEAD`:$lock"',
+                    "hash-object --no-filters $lock",
+                )
+            }
+            self.assertLess(normalization_positions["config core.autocrlf false"],
+                            normalization_positions["reset --hard HEAD"])
+            self.assertLess(normalization_positions["reset --hard HEAD"],
+                            normalization_positions['rev-parse "HEAD`:$lock"'])
+            self.assertLess(normalization_positions['rev-parse "HEAD`:$lock"'],
+                            normalization_positions["hash-object --no-filters $lock"])
+            for command in ("config core.autocrlf false", "reset --hard HEAD",
+                            'rev-parse "HEAD`:$lock"', "hash-object --no-filters $lock"):
+                command_index = next(index for index, line in enumerate(normalization_lines)
+                                     if command in line)
+                self.assertEqual(normalization_lines[command_index + 1],
+                                 "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+
+            setup = steps[4]
             self.assertEqual(setup["with"]["python-version"], "3.12.10")
-            python_assertion = steps[4]["run"]
+            python_assertion = steps[5]["run"]
             self.assertIn("platform.python_version()", python_assertion)
 
             def assert_fatal_version_gate(run: str, variable: str, expected: str) -> None:
@@ -267,7 +304,7 @@ def duplicate():
                 self.assertIsNotNone(mismatch)
 
             assert_fatal_version_gate(python_assertion, "pythonVersion", "3.12.10")
-            policy_install = steps[5]["run"]
+            policy_install = steps[6]["run"]
             for fragment in (
                 '$env:POLICY_SOURCE/requirements-policy.lock', "--require-hashes",
                 "--only-binary=:all:", "$yamlVersion", "print(yaml.__version__)",
@@ -275,10 +312,10 @@ def duplicate():
             ):
                 self.assertIn(fragment, policy_install)
             assert_fatal_version_gate(policy_install, "yamlVersion", "6.0.3")
-            policy_test = steps[6]["run"]
+            policy_test = steps[7]["run"]
             self.assertIn("-m unittest discover -s $env:POLICY_SOURCE", policy_test)
             self.assertIn("test_verify_security_workflows.py", policy_test)
-            audit_install = steps[7]["run"]
+            audit_install = steps[8]["run"]
             for fragment in (
                 "python -m venv audit-env", '$env:POLICY_SOURCE/requirements-audit.lock',
                 "--require-hashes", "--only-binary=:all:", "$auditVersion",
@@ -286,12 +323,12 @@ def duplicate():
             ):
                 self.assertIn(fragment, audit_install)
             assert_fatal_version_gate(audit_install, "auditVersion", "pip-audit 2.10.1")
-            audit = steps[8]["run"]
+            audit = steps[9]["run"]
             self.assertIn(
                 '-m pip_audit --no-deps -r "$env:POLICY_SOURCE/requirements-policy.lock"',
                 audit,
             )
-            validator_step = steps[9]
+            validator_step = steps[10]
             self.assertEqual(validator_step["if"],
                              "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
             validator = validator_step["run"]
@@ -355,6 +392,22 @@ def duplicate():
             "hash_enforcement_removed": (" --require-hashes", ""),
             "binary_enforcement_removed": (" --only-binary=:all:", ""),
             "continue_on_error": ("    steps:\n", "    continue-on-error: true\n    steps:\n"),
+            "normalization_removed":
+                ("      - name: Normalize and verify committed policy bytes\n", "      - name: Missing normalization\n"),
+            "candidate_only_normalization":
+                ("foreach ($root in @('candidate', 'policy'))", "foreach ($root in @('candidate'))"),
+            "protected_only_normalization":
+                ("foreach ($root in @('candidate', 'policy'))", "foreach ($root in @('policy'))"),
+            "hash_install_representation_split":
+                ("git -C $env:POLICY_SOURCE hash-object --no-filters $lock",
+                 "git -C policy hash-object --no-filters $lock"),
+            "downstream_normalization_bypass":
+                ("git -C $env:POLICY_SOURCE rev-parse", "git -C candidate rev-parse"),
+            "normalization_failure_nonfatal":
+                ("& git -C $root config core.autocrlf false\n"
+                 "            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+                 "& git -C $root config core.autocrlf false\n"
+                 "            if ($LASTEXITCODE -ne 0) { Write-Output 'ignored' }"),
         }
         for label, (old, new) in mutations.items():
             with self.subTest(label=label):
@@ -362,6 +415,30 @@ def duplicate():
                 self.assertNotEqual(mutated, original)
                 with self.assertRaises((AssertionError, KeyError, StopIteration)):
                     assert_contract(mutated)
+        workflow = yaml.load(original, Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        normalization_step = steps.pop(3)
+        steps.insert(7, normalization_step)
+        with self.subTest(label="normalization_after_install"), self.assertRaises(
+                (AssertionError, KeyError, StopIteration)):
+            assert_contract(yaml.safe_dump(workflow, sort_keys=False))
+
+        workflow = yaml.load(original, Loader=yaml.BaseLoader)
+        normalization = workflow["jobs"]["security-workflows-policy"]["steps"][3]["run"]
+        normalization_lines = normalization.splitlines()
+        reset_index = next(index for index, line in enumerate(normalization_lines)
+                           if "reset --hard HEAD" in line)
+        reset_block = normalization_lines[reset_index:reset_index + 2]
+        del normalization_lines[reset_index:reset_index + 2]
+        hash_index = next(index for index, line in enumerate(normalization_lines)
+                          if "hash-object --no-filters" in line)
+        normalization_lines[hash_index + 2:hash_index + 2] = reset_block
+        workflow["jobs"]["security-workflows-policy"]["steps"][3]["run"] = (
+            "\n".join(normalization_lines) + "\n"
+        )
+        with self.subTest(label="normalization_after_hash"), self.assertRaises(
+                (AssertionError, KeyError, StopIteration)):
+            assert_contract(yaml.safe_dump(workflow, sort_keys=False))
     def test_policy_dependency_lock_identities(self) -> None:
         root = Path(__file__).parent
         policy = root / "requirements-policy.lock"
