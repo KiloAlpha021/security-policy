@@ -12,7 +12,7 @@ jobs:
     name: security-workflows-policy
     runs-on: windows-latest
     steps:
-      - name: Check out exact security-workflows candidate
+      - name: Check out exact candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: ${{ github.repository }}
@@ -26,11 +26,7 @@ jobs:
           ref: main
           path: policy
           fetch-depth: 0
-      - name: Set up CPython
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
-        with:
-          python-version: 3.12.10
-      - name: Apply independent security-workflows policy
+      - name: Resolve and verify evaluation context
         shell: pwsh
         env:
           EVENT_REPOSITORY: ${{ github.repository }}
@@ -40,5 +36,138 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           $ErrorActionPreference = 'Stop'
-          python policy/verify_security_workflows.py --candidate candidate --policy policy --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --base-repository $env:BASE_REPOSITORY --base-branch $env:BASE_BRANCH --event-name $env:EVENT_NAME
+          $selfRepository = 'KiloAlpha021/security-policy'
+          $downstreamRepository = 'KiloAlpha021/security-workflows'
+          if ($env:EVENT_NAME -eq 'pull_request' -and
+              $env:EVENT_REPOSITORY -eq $selfRepository -and
+              $env:BASE_REPOSITORY -eq $selfRepository -and
+              $env:BASE_BRANCH -eq 'main') {
+            $evaluationContext = 'SELF_PR_BOOTSTRAP'
+            $policySource = 'candidate'
+          } elseif ($env:EVENT_NAME -in @('pull_request', 'merge_group') -and
+                    $env:EVENT_REPOSITORY -eq $downstreamRepository -and
+                    $env:BASE_REPOSITORY -eq $downstreamRepository -and
+                    $env:BASE_BRANCH -eq 'main') {
+            $evaluationContext = 'DOWNSTREAM_SECURITY_WORKFLOWS'
+            $policySource = 'policy'
+          } else {
+            throw 'Unsupported or ambiguous policy evaluation context'
+          }
+          if ($env:CANDIDATE_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Invalid candidate SHA' }
+          $candidateRoot = (Resolve-Path candidate).Path
+          $policyRoot = (Resolve-Path policy).Path
+          if ($candidateRoot -eq $policyRoot -or
+              $candidateRoot.StartsWith($policyRoot + [IO.Path]::DirectorySeparatorChar) -or
+              $policyRoot.StartsWith($candidateRoot + [IO.Path]::DirectorySeparatorChar)) {
+            throw 'Candidate and protected-policy roots must be separate'
+          }
+          $candidateRemote = (& git -C candidate remote get-url origin).Trim().TrimEnd('/')
+          $policyRemote = (& git -C policy remote get-url origin).Trim().TrimEnd('/')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($candidateRemote -notin @("https://github.com/$($env:EVENT_REPOSITORY)", "https://github.com/$($env:EVENT_REPOSITORY).git")) {
+            throw 'Candidate checkout repository mismatch'
+          }
+          if ($policyRemote -notin @('https://github.com/KiloAlpha021/security-policy', 'https://github.com/KiloAlpha021/security-policy.git')) {
+            throw 'Protected-policy checkout repository mismatch'
+          }
+          $candidateHead = (& git -C candidate rev-parse HEAD).Trim()
+          $policyHead = (& git -C policy rev-parse HEAD).Trim()
+          $protectedMain = (& git -C policy rev-parse refs/remotes/origin/main).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($candidateHead -ne $env:CANDIDATE_SHA) { throw 'Candidate checkout does not match event SHA' }
+          if ($policyHead -ne $protectedMain) { throw 'Protected-policy checkout is not protected main' }
+          if ($evaluationContext -eq 'SELF_PR_BOOTSTRAP') {
+            $allowed = @(
+              '.github/workflows/security-workflows-policy.yml',
+              'requirements-audit.lock',
+              'requirements-policy.lock',
+              'test_verify_security_workflows.py',
+              'verify_security_workflows.py'
+            )
+            $changed = @(& git -C candidate diff --name-only $policyHead $candidateHead)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if (@($changed).Count -ne $allowed.Count -or @($changed | Where-Object { $_ -notin $allowed }).Count -ne 0) {
+              throw 'Security-policy self-PR exceeds the bounded five-file scope'
+            }
+          }
+          "EVALUATION_CONTEXT=$evaluationContext" >> $env:GITHUB_ENV
+          "POLICY_SOURCE=$policySource" >> $env:GITHUB_ENV
+      - name: Normalize and verify committed policy bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($root in @('candidate', 'policy')) {
+            & git -C $root config core.autocrlf false
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & git -C $root reset --hard HEAD
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          foreach ($lock in @('requirements-policy.lock', 'requirements-audit.lock')) {
+            $committedBlob = (& git -C $env:POLICY_SOURCE rev-parse "HEAD`:$lock").Trim()
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $worktreeBlob = (& git -C $env:POLICY_SOURCE hash-object --no-filters $lock).Trim()
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($worktreeBlob -ne $committedBlob) { throw "Policy lock bytes differ from committed Git bytes: $lock" }
+          }
+      - name: Set up CPython
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: 3.12.10
+      - name: Assert exact CPython runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pythonVersion = & python -c "import platform; print(platform.python_version())"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($pythonVersion -ne '3.12.10') { throw 'Unexpected CPython version' }
+      - name: Install isolated hash-locked policy environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m venv policy-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\policy-env\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r "$env:POLICY_SOURCE/requirements-policy.lock"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $yamlVersion = & .\policy-env\Scripts\python.exe -c "import yaml; print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($yamlVersion -ne '6.0.3') { throw 'Unexpected PyYAML version' }
+          .\policy-env\Scripts\python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test independent root policy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\policy-env\Scripts\python.exe -m unittest discover -s $env:POLICY_SOURCE -p test_verify_security_workflows.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install isolated hash-locked audit environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m venv audit-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\audit-env\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r "$env:POLICY_SOURCE/requirements-audit.lock"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $auditVersion = & .\audit-env\Scripts\python.exe -m pip_audit --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($auditVersion -ne 'pip-audit 2.10.1') { throw 'Unexpected audit tool version' }
+          .\audit-env\Scripts\python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Audit independent root policy dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\audit-env\Scripts\python.exe -m pip_audit --no-deps -r "$env:POLICY_SOURCE/requirements-policy.lock"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Apply independent security-workflows policy
+        if: env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'
+        shell: pwsh
+        env:
+          EVENT_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || github.repository }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref || 'main' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\policy-env\Scripts\python.exe policy/verify_security_workflows.py --candidate candidate --policy policy --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --base-repository $env:BASE_REPOSITORY --base-branch $env:BASE_BRANCH --event-name $env:EVENT_NAME
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
