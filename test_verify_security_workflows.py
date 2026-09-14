@@ -183,67 +183,185 @@ def duplicate():
 
     def test_policy_dependency_workflow_contract(self) -> None:
         root = Path(__file__).parent
-        workflow_text = (root / ".github/workflows/security-workflows-policy.yml").read_text()
-        workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
-        self.assertIsInstance(workflow, dict)
-        jobs = workflow["jobs"]
-        self.assertIsInstance(jobs, dict)
-        steps = jobs["security-workflows-policy"]["steps"]
-        names = [step.get("name") for step in steps]
-        expected_order = [
-            "Check out exact security-workflows candidate",
-            "Check out independent root policy",
-            "Set up CPython",
-            "Assert exact CPython runtime",
-            "Install isolated hash-locked policy environment",
-            "Test independent root policy",
-            "Install isolated hash-locked audit environment",
-            "Audit independent root policy dependencies",
-            "Apply independent security-workflows policy",
-        ]
-        self.assertEqual(names, expected_order)
-        setup = steps[2]
-        self.assertEqual(setup["with"]["python-version"], "3.12.10")
-        python_assertion = steps[3]["run"]
-        self.assertIn("platform.python_version()", python_assertion)
+        original = (root / ".github/workflows/security-workflows-policy.yml").read_text()
 
-        def assert_fatal_version_gate(run: str, variable: str, expected: str) -> None:
-            mismatch = re.search(
-                rf"(?m)^\s*if\s*\(\${variable}\s+-ne\s+'{re.escape(expected)}'\)\s*"
-                r"\{\s*(?:throw\b|exit\s+[1-9][0-9]*\b)", run
+        def assert_contract(workflow_text: str) -> None:
+            workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+            self.assertIsInstance(workflow, dict)
+            jobs = workflow["jobs"]
+            self.assertIsInstance(jobs, dict)
+            steps = jobs["security-workflows-policy"]["steps"]
+            names = [step.get("name") for step in steps]
+            expected_order = [
+                "Check out exact candidate",
+                "Check out independent root policy",
+                "Resolve and verify evaluation context",
+                "Set up CPython",
+                "Assert exact CPython runtime",
+                "Install isolated hash-locked policy environment",
+                "Test independent root policy",
+                "Install isolated hash-locked audit environment",
+                "Audit independent root policy dependencies",
+                "Apply independent security-workflows policy",
+            ]
+            self.assertEqual(names, expected_order)
+            candidate_checkout, policy_checkout, context = steps[:3]
+            self.assertEqual(candidate_checkout["with"]["repository"], "${{ github.repository }}")
+            self.assertEqual(candidate_checkout["with"]["ref"], "${{ github.sha }}")
+            self.assertEqual(candidate_checkout["with"]["path"], "candidate")
+            self.assertEqual(policy_checkout["with"]["repository"],
+                             "KiloAlpha021/security-policy")
+            self.assertEqual(policy_checkout["with"]["ref"], "main")
+            self.assertEqual(policy_checkout["with"]["path"], "policy")
+            dispatch = context["run"]
+            for fragment in (
+                "$env:EVENT_NAME -eq 'pull_request'",
+                "$env:EVENT_REPOSITORY -eq $selfRepository",
+                "$env:BASE_REPOSITORY -eq $selfRepository",
+                "$env:BASE_BRANCH -eq 'main'",
+                "$evaluationContext = 'SELF_PR_BOOTSTRAP'",
+                "$policySource = 'candidate'",
+                "$env:EVENT_NAME -in @('pull_request', 'merge_group')",
+                "$env:EVENT_REPOSITORY -eq $downstreamRepository",
+                "$env:BASE_REPOSITORY -eq $downstreamRepository",
+                "$evaluationContext = 'DOWNSTREAM_SECURITY_WORKFLOWS'",
+                "$policySource = 'policy'",
+                "throw 'Unsupported or ambiguous policy evaluation context'",
+                "^[0-9a-f]{40}$",
+                "Candidate and protected-policy roots must be separate",
+                "Candidate checkout repository mismatch",
+                "Protected-policy checkout repository mismatch",
+                "Candidate checkout does not match event SHA",
+                "Protected-policy checkout is not protected main",
+                "git -C candidate diff --name-only $policyHead $candidateHead",
+                "Security-policy self-PR exceeds the bounded five-file scope",
+                '"EVALUATION_CONTEXT=$evaluationContext" >> $env:GITHUB_ENV',
+                '"POLICY_SOURCE=$policySource" >> $env:GITHUB_ENV',
+            ):
+                self.assertIn(fragment, dispatch)
+            self.assertEqual(dispatch.count("$env:BASE_BRANCH -eq 'main'"), 2)
+            allowed_match = re.search(r"(?s)\$allowed\s*=\s*@\((.*?)\n\s*\)", dispatch)
+            self.assertIsNotNone(allowed_match)
+            assert allowed_match is not None
+            self.assertEqual(
+                re.findall(r"'([^']+)'", allowed_match.group(1)),
+                [
+                    ".github/workflows/security-workflows-policy.yml",
+                    "requirements-audit.lock",
+                    "requirements-policy.lock",
+                    "test_verify_security_workflows.py",
+                    "verify_security_workflows.py",
+                ],
             )
-            self.assertIsNotNone(mismatch)
 
-        assert_fatal_version_gate(python_assertion, "pythonVersion", "3.12.10")
+            setup = steps[3]
+            self.assertEqual(setup["with"]["python-version"], "3.12.10")
+            python_assertion = steps[4]["run"]
+            self.assertIn("platform.python_version()", python_assertion)
 
-        policy_install = steps[4]["run"]
-        for fragment in ("requirements-policy.lock", "--require-hashes", "--only-binary=:all:",
-                         "$yamlVersion", "print(yaml.__version__)",
-                         "policy-env\\Scripts\\python.exe -m pip check"):
-            self.assertIn(fragment, policy_install)
-        self.assertNotRegex(policy_install, r"\bassert\s+yaml\.__version__")
-        assert_fatal_version_gate(policy_install, "yamlVersion", "6.0.3")
-        policy_test = steps[5]["run"]
-        self.assertIn("-m unittest discover", policy_test)
-        audit_install = steps[6]["run"]
-        for fragment in ("python -m venv audit-env", "requirements-audit.lock", "--require-hashes",
-                         "--only-binary=:all:", "$auditVersion", "-m pip_audit --version",
-                         "audit-env\\Scripts\\python.exe -m pip check"):
-            self.assertIn(fragment, audit_install)
-        assert_fatal_version_gate(audit_install, "auditVersion", "pip-audit 2.10.1")
-        audit = steps[7]["run"]
-        self.assertIn("-m pip_audit --no-deps -r policy/requirements-policy.lock", audit)
-        validator = steps[8]["run"]
-        self.assertIn("policy-env\\Scripts\\python.exe policy/verify_security_workflows.py", validator)
-        self.assertNotIn("continue-on-error", workflow_text)
+            def assert_fatal_version_gate(run: str, variable: str, expected: str) -> None:
+                mismatch = re.search(
+                    rf"(?m)^\s*if\s*\(\${variable}\s+-ne\s+'{re.escape(expected)}'\)\s*"
+                    r"\{\s*(?:throw\b|exit\s+[1-9][0-9]*\b)", run
+                )
+                self.assertIsNotNone(mismatch)
 
-        for run, command in ((policy_install, "-m pip install"), (policy_test, "-m unittest"),
-                             (audit_install, "-m pip install"), (audit, "-m pip_audit"),
-                             (validator, "verify_security_workflows.py")):
-            lines = [line.strip() for line in run.splitlines() if line.strip()]
-            command_index = next(index for index, line in enumerate(lines) if command in line)
-            self.assertEqual(lines[command_index + 1], "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+            assert_fatal_version_gate(python_assertion, "pythonVersion", "3.12.10")
+            policy_install = steps[5]["run"]
+            for fragment in (
+                '$env:POLICY_SOURCE/requirements-policy.lock', "--require-hashes",
+                "--only-binary=:all:", "$yamlVersion", "print(yaml.__version__)",
+                "policy-env\\Scripts\\python.exe -m pip check",
+            ):
+                self.assertIn(fragment, policy_install)
+            assert_fatal_version_gate(policy_install, "yamlVersion", "6.0.3")
+            policy_test = steps[6]["run"]
+            self.assertIn("-m unittest discover -s $env:POLICY_SOURCE", policy_test)
+            self.assertIn("test_verify_security_workflows.py", policy_test)
+            audit_install = steps[7]["run"]
+            for fragment in (
+                "python -m venv audit-env", '$env:POLICY_SOURCE/requirements-audit.lock',
+                "--require-hashes", "--only-binary=:all:", "$auditVersion",
+                "-m pip_audit --version", "audit-env\\Scripts\\python.exe -m pip check",
+            ):
+                self.assertIn(fragment, audit_install)
+            assert_fatal_version_gate(audit_install, "auditVersion", "pip-audit 2.10.1")
+            audit = steps[8]["run"]
+            self.assertIn(
+                '-m pip_audit --no-deps -r "$env:POLICY_SOURCE/requirements-policy.lock"',
+                audit,
+            )
+            validator_step = steps[9]
+            self.assertEqual(validator_step["if"],
+                             "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
+            validator = validator_step["run"]
+            self.assertIn("policy-env\\Scripts\\python.exe policy/verify_security_workflows.py",
+                          validator)
+            self.assertNotIn("candidate/verify_security_workflows.py --candidate", validator)
+            self.assertNotIn("continue-on-error", workflow_text)
 
+            for run, command in (
+                (policy_install, "-m pip install"),
+                (policy_test, "-m unittest"),
+                (audit_install, "-m pip install"),
+                (audit, "-m pip_audit"),
+                (validator, "verify_security_workflows.py"),
+            ):
+                lines = [line.strip() for line in run.splitlines() if line.strip()]
+                command_index = next(index for index, line in enumerate(lines)
+                                     if command in line)
+                self.assertEqual(lines[command_index + 1],
+                                 "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+
+        assert_contract(original)
+        mutations = {
+            "self_event_weakened": ("$env:EVENT_NAME -eq 'pull_request'", "$true"),
+            "self_repository_weakened": ("$env:EVENT_REPOSITORY -eq $selfRepository", "$true"),
+            "self_base_weakened": ("$env:BASE_REPOSITORY -eq $selfRepository", "$true"),
+            "base_branch_weakened": ("$env:BASE_BRANCH -eq 'main'", "$true"),
+            "downstream_repository_weakened":
+                ("$env:EVENT_REPOSITORY -eq $downstreamRepository", "$true"),
+            "downstream_base_weakened":
+                ("$env:BASE_REPOSITORY -eq $downstreamRepository", "$true"),
+            "fallthrough_success":
+                ("throw 'Unsupported or ambiguous policy evaluation context'",
+                 "$evaluationContext = 'SELF_PR_BOOTSTRAP'"),
+            "sha_weakened": ("^[0-9a-f]{40}$", ".*"),
+            "root_separation_removed":
+                ("throw 'Candidate and protected-policy roots must be separate'",
+                 "Write-Output 'roots overlap'"),
+            "candidate_remote_removed":
+                ("throw 'Candidate checkout repository mismatch'", "Write-Output 'ignored'"),
+            "policy_remote_removed":
+                ("throw 'Protected-policy checkout repository mismatch'", "Write-Output 'ignored'"),
+            "candidate_head_removed":
+                ("throw 'Candidate checkout does not match event SHA'", "Write-Output 'ignored'"),
+            "protected_head_removed":
+                ("throw 'Protected-policy checkout is not protected main'", "Write-Output 'ignored'"),
+            "comparison_removed":
+                ("git -C candidate diff --name-only $policyHead $candidateHead", "Write-Output ''"),
+            "sixth_file_allowed":
+                ("'verify_security_workflows.py'", "'verify_security_workflows.py',\n              'extra.txt'"),
+            "candidate_lock_replaced":
+                ('$env:POLICY_SOURCE/requirements-policy.lock', "policy/requirements-policy.lock"),
+            "candidate_tests_replaced":
+                ("-s $env:POLICY_SOURCE", "-s policy"),
+            "candidate_audit_lock_replaced":
+                ('$env:POLICY_SOURCE/requirements-audit.lock', "policy/requirements-audit.lock"),
+            "downstream_validator_replaced":
+                ("policy/verify_security_workflows.py", "candidate/verify_security_workflows.py"),
+            "validator_condition_removed":
+                ("if: env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'", "if: always()"),
+            "hash_enforcement_removed": (" --require-hashes", ""),
+            "binary_enforcement_removed": (" --only-binary=:all:", ""),
+            "continue_on_error": ("    steps:\n", "    continue-on-error: true\n    steps:\n"),
+        }
+        for label, (old, new) in mutations.items():
+            with self.subTest(label=label):
+                mutated = original.replace(old, new, 1)
+                self.assertNotEqual(mutated, original)
+                with self.assertRaises((AssertionError, KeyError, StopIteration)):
+                    assert_contract(mutated)
     def test_policy_dependency_lock_identities(self) -> None:
         root = Path(__file__).parent
         policy = root / "requirements-policy.lock"
