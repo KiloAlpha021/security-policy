@@ -84,10 +84,49 @@ jobs:
               'test_verify_security_workflows.py',
               'verify_security_workflows.py'
             )
-            $changed = @(& git -C candidate diff --name-only $policyHead $candidateHead)
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            if (@($changed).Count -ne $allowed.Count -or @($changed | Where-Object { $_ -notin $allowed }).Count -ne 0) {
-              throw 'Security-policy self-PR exceeds the bounded five-file scope'
+            $allowedSet = [Collections.Generic.HashSet[string]]::new(
+              $allowed, [StringComparer]::Ordinal
+            )
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = 'git'
+            $start.WorkingDirectory = (Resolve-Path candidate).Path
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            foreach ($argument in @('diff', '--raw', '-z', '--no-renames', '--no-ext-diff', $policyHead, $candidateHead, '--')) {
+              [void]$start.ArgumentList.Add($argument)
+            }
+            $process = [Diagnostics.Process]::Start($start)
+            $buffer = [IO.MemoryStream]::new()
+            $process.StandardOutput.BaseStream.CopyTo($buffer)
+            $errorText = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) { throw "Unable to determine bounded self-PR scope: $errorText" }
+            $raw = $buffer.ToArray()
+            if ($raw.Length -eq 0 -or $raw[-1] -ne 0) { throw 'Empty or malformed self-PR Git diff' }
+            $tokens = [Text.Encoding]::UTF8.GetString($raw, 0, $raw.Length - 1).Split([char]0)
+            if ($tokens.Count % 2 -ne 0) { throw 'Ambiguous self-PR Git diff records' }
+            $changed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            for ($index = 0; $index -lt $tokens.Count; $index += 2) {
+              $metadata = $tokens[$index]
+              $path = $tokens[$index + 1]
+              if ($metadata -notmatch '^:100644 100644 [0-9a-f]{40} [0-9a-f]{40} M$') {
+                throw "Unsupported self-PR file status or mode: $metadata"
+              }
+              $components = $path.Split('/')
+              if ([string]::IsNullOrEmpty($path) -or [IO.Path]::IsPathRooted($path) -or
+                  $path.Contains('\\') -or $components -contains '' -or
+                  $components -contains '.' -or $components -contains '..' -or
+                  -not $allowedSet.Contains($path)) {
+                throw "Noncanonical or unsupported self-PR path: $path"
+              }
+              if (-not $changed.Add($path)) { throw "Duplicate self-PR path identity: $path" }
+            }
+            if ($changed.Count -eq 0) { throw 'Security-policy self-PR change set is empty' }
+            if (($changed.Contains('requirements-policy.lock') -or
+                 $changed.Contains('requirements-audit.lock')) -and
+                -not $changed.Contains('test_verify_security_workflows.py')) {
+              throw 'Policy lock changes require protected contract tests'
             }
           }
           "EVALUATION_CONTEXT=$evaluationContext" >> $env:GITHUB_ENV
@@ -138,6 +177,17 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           .\policy-env\Scripts\python.exe -m unittest discover -s $env:POLICY_SOURCE -p test_verify_security_workflows.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate candidate against protected baseline
+        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path protected-baseline) { Remove-Item protected-baseline -Recurse -Force }
+          Copy-Item candidate protected-baseline -Recurse
+          Copy-Item policy/test_verify_security_workflows.py protected-baseline/test_verify_security_workflows.py -Force
+          $env:POLICY_CONTRACT_TARGET = (Resolve-Path protected-baseline).Path
+          .\policy-env\Scripts\python.exe policy/test_verify_security_workflows.py RootPolicyTests.test_policy_dependency_workflow_contract RootPolicyTests.test_policy_dependency_lock_identities RootPolicyTests.test_protected_candidate_validator_contract -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Install isolated hash-locked audit environment
         shell: pwsh

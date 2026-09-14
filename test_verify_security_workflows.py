@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -19,6 +20,20 @@ def git(root: Path, *args: str) -> str:
 
 
 class RootPolicyTests(unittest.TestCase):
+    PROTECTED_FILES = frozenset({
+        ".github/workflows/security-workflows-policy.yml",
+        "requirements-audit.lock",
+        "requirements-policy.lock",
+        "test_verify_security_workflows.py",
+        "verify_security_workflows.py",
+    })
+
+    def assert_subset_policy(self, paths: set[str]) -> None:
+        self.assertTrue(paths)
+        self.assertLessEqual(paths, self.PROTECTED_FILES)
+        if paths & {"requirements-policy.lock", "requirements-audit.lock"}:
+            self.assertIn("test_verify_security_workflows.py", paths)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -182,7 +197,7 @@ def duplicate():
         self.assertCountEqual(action_references(workflow), observed)
 
     def test_policy_dependency_workflow_contract(self) -> None:
-        root = Path(__file__).parent
+        root = Path(os.environ.get("POLICY_CONTRACT_TARGET", Path(__file__).parent))
         original = (root / ".github/workflows/security-workflows-policy.yml").read_text()
 
         def assert_contract(workflow_text: str) -> None:
@@ -201,6 +216,7 @@ def duplicate():
                 "Assert exact CPython runtime",
                 "Install isolated hash-locked policy environment",
                 "Test independent root policy",
+                "Validate candidate against protected baseline",
                 "Install isolated hash-locked audit environment",
                 "Audit independent root policy dependencies",
                 "Apply independent security-workflows policy",
@@ -234,8 +250,16 @@ def duplicate():
                 "Protected-policy checkout repository mismatch",
                 "Candidate checkout does not match event SHA",
                 "Protected-policy checkout is not protected main",
-                "git -C candidate diff --name-only $policyHead $candidateHead",
-                "Security-policy self-PR exceeds the bounded five-file scope",
+                "'diff', '--raw', '-z', '--no-renames', '--no-ext-diff'",
+                "^:100644 100644 [0-9a-f]{40} [0-9a-f]{40} M$",
+                "Empty or malformed self-PR Git diff",
+                "Ambiguous self-PR Git diff records",
+                "Noncanonical or unsupported self-PR path",
+                "Duplicate self-PR path identity",
+                "Security-policy self-PR change set is empty",
+                "Policy lock changes require protected contract tests",
+                "$allowed, [StringComparer]::Ordinal",
+                "-not $allowedSet.Contains($path)",
                 '"EVALUATION_CONTEXT=$evaluationContext" >> $env:GITHUB_ENV',
                 '"POLICY_SOURCE=$policySource" >> $env:GITHUB_ENV',
             ):
@@ -315,7 +339,21 @@ def duplicate():
             policy_test = steps[7]["run"]
             self.assertIn("-m unittest discover -s $env:POLICY_SOURCE", policy_test)
             self.assertIn("test_verify_security_workflows.py", policy_test)
-            audit_install = steps[8]["run"]
+            baseline = steps[8]
+            self.assertEqual(baseline["if"], "env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'")
+            baseline_run = baseline["run"]
+            for fragment in (
+                "Copy-Item candidate protected-baseline -Recurse",
+                "Copy-Item policy/test_verify_security_workflows.py protected-baseline/test_verify_security_workflows.py -Force",
+                "$env:POLICY_CONTRACT_TARGET = (Resolve-Path protected-baseline).Path",
+                "policy/test_verify_security_workflows.py",
+                "RootPolicyTests.test_policy_dependency_workflow_contract",
+                "RootPolicyTests.test_policy_dependency_lock_identities",
+                "RootPolicyTests.test_protected_candidate_validator_contract",
+            ):
+                self.assertIn(fragment, baseline_run)
+            self.assertNotIn("candidate/test_verify_security_workflows.py protected-baseline", baseline_run)
+            audit_install = steps[9]["run"]
             for fragment in (
                 "python -m venv audit-env", '$env:POLICY_SOURCE/requirements-audit.lock',
                 "--require-hashes", "--only-binary=:all:", "$auditVersion",
@@ -323,12 +361,12 @@ def duplicate():
             ):
                 self.assertIn(fragment, audit_install)
             assert_fatal_version_gate(audit_install, "auditVersion", "pip-audit 2.10.1")
-            audit = steps[9]["run"]
+            audit = steps[10]["run"]
             self.assertIn(
                 '-m pip_audit --no-deps -r "$env:POLICY_SOURCE/requirements-policy.lock"',
                 audit,
             )
-            validator_step = steps[10]
+            validator_step = steps[11]
             self.assertEqual(validator_step["if"],
                              "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
             validator = validator_step["run"]
@@ -340,6 +378,7 @@ def duplicate():
             for run, command in (
                 (policy_install, "-m pip install"),
                 (policy_test, "-m unittest"),
+                (baseline_run, ".\\policy-env\\Scripts\\python.exe policy/test_verify_security_workflows.py"),
                 (audit_install, "-m pip install"),
                 (audit, "-m pip_audit"),
                 (validator, "verify_security_workflows.py"),
@@ -375,10 +414,26 @@ def duplicate():
                 ("throw 'Candidate checkout does not match event SHA'", "Write-Output 'ignored'"),
             "protected_head_removed":
                 ("throw 'Protected-policy checkout is not protected main'", "Write-Output 'ignored'"),
-            "comparison_removed":
-                ("git -C candidate diff --name-only $policyHead $candidateHead", "Write-Output ''"),
+            "nul_raw_comparison_removed":
+                ("'diff', '--raw', '-z', '--no-renames', '--no-ext-diff'", "'diff', '--name-only'"),
             "sixth_file_allowed":
                 ("'verify_security_workflows.py'", "'verify_security_workflows.py',\n              'extra.txt'"),
+            "empty_diff_allowed":
+                ("throw 'Security-policy self-PR change set is empty'", "Write-Output 'ignored'"),
+            "mode_check_removed":
+                ("^:100644 100644 [0-9a-f]{40} [0-9a-f]{40} M$", ".*"),
+            "path_check_removed":
+                ('throw "Noncanonical or unsupported self-PR path: $path"', "Write-Output 'ignored'"),
+            "ordinal_path_check_weakened":
+                ("-not $allowedSet.Contains($path)", "$path -notin $allowed"),
+            "duplicate_check_removed":
+                ('throw "Duplicate self-PR path identity: $path"', "Write-Output 'ignored'"),
+            "lock_coupling_removed":
+                ("throw 'Policy lock changes require protected contract tests'", "Write-Output 'ignored'"),
+            "protected_baseline_removed":
+                ("      - name: Validate candidate against protected baseline\n", "      - name: Missing protected baseline\n"),
+            "protected_test_replaced":
+                ("Copy-Item policy/test_verify_security_workflows.py", "Copy-Item candidate/test_verify_security_workflows.py"),
             "candidate_lock_replaced":
                 ('$env:POLICY_SOURCE/requirements-policy.lock', "policy/requirements-policy.lock"),
             "candidate_tests_replaced":
@@ -418,7 +473,7 @@ def duplicate():
         workflow = yaml.load(original, Loader=yaml.BaseLoader)
         steps = workflow["jobs"]["security-workflows-policy"]["steps"]
         normalization_step = steps.pop(3)
-        steps.insert(7, normalization_step)
+        steps.insert(8, normalization_step)
         with self.subTest(label="normalization_after_install"), self.assertRaises(
                 (AssertionError, KeyError, StopIteration)):
             assert_contract(yaml.safe_dump(workflow, sort_keys=False))
@@ -439,8 +494,32 @@ def duplicate():
         with self.subTest(label="normalization_after_hash"), self.assertRaises(
                 (AssertionError, KeyError, StopIteration)):
             assert_contract(yaml.safe_dump(workflow, sort_keys=False))
+
+    def test_self_pr_nonempty_subset_and_coupling_cases(self) -> None:
+        tests = "test_verify_security_workflows.py"
+        validator = "verify_security_workflows.py"
+        workflow = ".github/workflows/security-workflows-policy.yml"
+        policy_lock = "requirements-policy.lock"
+        audit_lock = "requirements-audit.lock"
+        accepted = (
+            {validator}, {workflow}, {validator, tests}, {workflow, tests},
+            {policy_lock, tests}, {audit_lock, tests},
+            {policy_lock, workflow, tests}, {audit_lock, workflow, tests},
+            set(self.PROTECTED_FILES),
+        )
+        for paths in accepted:
+            with self.subTest(accepted=sorted(paths)):
+                self.assert_subset_policy(paths)
+        rejected = (
+            set(), {"extra.txt"}, {policy_lock}, {audit_lock},
+            {tests.upper()}, {"../" + tests}, {"/" + tests},
+            {tests.replace("_", "\\_")},
+        )
+        for paths in rejected:
+            with self.subTest(rejected=sorted(paths)), self.assertRaises(AssertionError):
+                self.assert_subset_policy(paths)
     def test_policy_dependency_lock_identities(self) -> None:
-        root = Path(__file__).parent
+        root = Path(os.environ.get("POLICY_CONTRACT_TARGET", Path(__file__).parent))
         policy = root / "requirements-policy.lock"
         audit = root / "requirements-audit.lock"
         self.assertEqual(hashlib.sha256(policy.read_bytes()).hexdigest(),
@@ -458,6 +537,23 @@ def duplicate():
         self.assertEqual(len(audit_entries), 29)
         self.assertTrue(all(locked.fullmatch(entry) for entry in audit_entries))
         self.assertEqual(sum(entry.startswith("pip-audit==2.10.1 ") for entry in audit_entries), 1)
+
+    def test_protected_candidate_validator_contract(self) -> None:
+        target = os.environ.get("POLICY_CONTRACT_TARGET")
+        if target is None:
+            self.skipTest("protected candidate baseline is exercised only with an explicit target")
+        source = (Path(target) / "verify_security_workflows.py").read_text(encoding="utf-8")
+        for fragment in (
+            'TRADING_TARGET = "KiloAlpha021/automated-trading-bot"',
+            'TARGET = "KiloAlpha021/security-workflows"',
+            'POLICY = "KiloAlpha021/security-policy"',
+            'step["with"].get("repository") == TRADING_TARGET',
+            "if len(trading_checkouts) != 1:",
+            'trading_with.get("ref") != "${{ github.sha }}"',
+            'trading_with.get("path") != "candidate"',
+            'raise ValueError("Exact trading candidate checkout removed")',
+        ):
+            self.assertIn(fragment, source)
 
     def test_structural_rejections(self) -> None:
         workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text()
