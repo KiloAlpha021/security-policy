@@ -227,8 +227,18 @@ def duplicate():
         python_gate = role("Python gate", "platform.python_version()")
         policy_install = role("policy install", "-m pip install --require-hashes --only-binary=:all: -r \"$env:POLICY_SOURCE/requirements-policy.lock\"")
         candidate_tests = role("candidate evidence", "-m unittest discover -s candidate")
-        protected_tests = role("protected baseline", "test_protected_source_and_candidate_target_contract")
-        downstream_tests = role("downstream policy tests", "-m unittest discover -s policy")
+        protected_tests = role("protected Stage A baseline", "test_protected_source_and_candidate_target_contract")
+        policy_discovery = [(index, step) for index, step in enumerate(steps)
+                            if "-m unittest discover -s policy" in step.get("run", "")]
+        self.assertEqual(len(policy_discovery), 2)
+        legacy_matches = [item for item in policy_discovery
+                          if item[1].get("if") == "env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'"]
+        downstream_matches = [item for item in policy_discovery
+                              if item[1].get("if") == "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'"]
+        self.assertEqual(len(legacy_matches), 1)
+        self.assertEqual(len(downstream_matches), 1)
+        legacy_tests = legacy_matches[0]
+        downstream_tests = downstream_matches[0]
         audit_install_matches = [(index, step) for index, step in enumerate(steps)
                                  if "requirements-audit.lock" in step.get("run", "")
                                  and "-m pip install" in step.get("run", "")]
@@ -286,8 +296,12 @@ def duplicate():
             self.assertIn("-m pip check", run)
             self.assertIn(expected, run)
         proof_condition = "env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP' || env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'"
+        self.assertEqual(candidate_tests[1]["name"], "Run candidate Stage A evidence")
         self.assertEqual(candidate_tests[1]["if"], proof_condition)
-        self.assertEqual(protected_tests[1]["if"], proof_condition)
+        self.assertEqual(legacy_tests[1]["name"], "Run legacy protected health")
+        self.assertEqual(legacy_tests[1]["if"], "env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'")
+        self.assertEqual(protected_tests[1]["name"], "Apply protected Stage A baseline to candidate target")
+        self.assertEqual(protected_tests[1]["if"], "env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'")
         self.assertEqual(protected_tests[1]["env"], {
             "POLICY_CANDIDATE_ROOT": "${{ github.workspace }}/candidate",
             "POLICY_PROTECTED_ROOT": "${{ github.workspace }}/policy",
@@ -299,14 +313,22 @@ def duplicate():
         })
         self.assertEqual(downstream_tests[1]["if"], "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
         self.assertEqual(validator[1]["if"], "env.EVALUATION_CONTEXT == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
+        for method in (
+            "test_protected_source_and_candidate_target_contract",
+            "test_stage_a_candidate_invariants",
+            "test_stage_a_target_binding_executes_in_isolated_git_roots",
+        ):
+            self.assertNotIn(method, legacy_tests[1]["run"])
+            self.assertIn(method, protected_tests[1]["run"])
+        self.assertNotIn("candidate/test_verify_security_workflows.py", legacy_tests[1]["run"])
         self.assertNotIn("candidate/test_verify_security_workflows.py", protected_tests[1]["run"])
         self.assertNotIn("candidate/verify_security_workflows.py", validator[1]["run"])
         order = [candidate_checkout[0][0], protected_checkout[0][0], context[0], normalization[0],
-                 setup[0], python_gate[0], policy_install[0], candidate_tests[0], protected_tests[0],
+                 setup[0], python_gate[0], policy_install[0], candidate_tests[0], legacy_tests[0], protected_tests[0],
                  downstream_tests[0], audit_install[0], audit[0], validator[0]]
         self.assertEqual(order, sorted(order))
         for _, step in (context, normalization, python_gate, policy_install, candidate_tests,
-                        protected_tests, downstream_tests, audit_install, audit, validator):
+                        legacy_tests, protected_tests, downstream_tests, audit_install, audit, validator):
             self.assertIn("$ErrorActionPreference = 'Stop'", step["run"])
             self.assertIn("$LASTEXITCODE -ne 0", step["run"])
 
@@ -331,6 +353,12 @@ def duplicate():
             ("throw 'Security-policy self-PR exceeds the bounded five-file scope'", "Write-Output ignored"),
             (" --require-hashes", ""), (" --only-binary=:all:", ""),
             ("-m unittest discover -s candidate", "-m unittest discover -s policy"),
+            ("Run legacy protected health", "Run candidate Stage A evidence"),
+            ("env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          .\\policy-env\\Scripts\\python.exe -m unittest discover -s policy",
+             "env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          .\\policy-env\\Scripts\\python.exe -m unittest discover -s policy"),
+            ("if: env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'\n        shell: pwsh\n        env:\n          POLICY_CANDIDATE_ROOT",
+             "if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'\n        shell: pwsh\n        env:\n          POLICY_CANDIDATE_ROOT"),
+            ("test_protected_source_and_candidate_target_contract", "test_policy_dependency_workflow_contract"),
             ("policy/test_verify_security_workflows.py", "candidate/test_verify_security_workflows.py"),
             ("policy/verify_security_workflows.py", "candidate/verify_security_workflows.py"),
             ("$ErrorActionPreference = 'Stop'", "$ErrorActionPreference = 'Continue'"),

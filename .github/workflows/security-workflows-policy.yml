@@ -171,15 +171,22 @@ jobs:
           if ($yamlVersion -ne '6.0.3') { throw 'Unexpected PyYAML version' }
           .\policy-env\Scripts\python.exe -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run candidate policy tests as candidate evidence
+      - name: Run candidate Stage A evidence
         if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP' || env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           .\policy-env\Scripts\python.exe -m unittest discover -s candidate -p test_verify_security_workflows.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Apply protected baseline to candidate target
-        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP' || env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'
+      - name: Run legacy protected health
+        if: env.EVALUATION_CONTEXT == 'SELF_PR_BOOTSTRAP'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\policy-env\Scripts\python.exe -m unittest discover -s policy -p test_verify_security_workflows.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Apply protected Stage A baseline to candidate target
+        if: env.EVALUATION_CONTEXT == 'STAGE_A_PROTECTED_PROOF'
         shell: pwsh
         env:
           POLICY_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
