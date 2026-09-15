@@ -7,8 +7,13 @@ post-merge protected proof are required for the first landing.
 
 from __future__ import annotations
 
+import argparse
+import os
 import re
+import stat
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -21,10 +26,39 @@ IMMEDIATE_SUCCESSOR = "SECURITY-POLICY-BASELINE-2"
 TRANSITION_PROTECTED_BASE = "76a811e76edbefc76ab1baf20795e2755f5bb794"
 OWNER_AUTHORIZATION = "REQUIRED"
 POST_MERGE_PROOF = "REQUIRED"
+PROTECTED_UNIVERSE = (
+    ".github/workflows/security-workflows-policy.yml",
+    "requirements-audit.lock",
+    "requirements-policy.lock",
+    "test_verify_security_workflows.py",
+    "verify_security_workflows.py",
+    "protected_policy_bootstrap.py",
+)
+CANDIDATE_BASELINE_PATH = ".github/workflows/security-workflows-policy.yml"
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _BASELINE = re.compile(r"SECURITY-POLICY-BASELINE-([1-9][0-9]*)\Z")
+_BASELINE_DECLARATION = re.compile(
+    r"(?m)^  POLICY_BASELINE_VERSION: (SECURITY-POLICY-BASELINE-[1-9][0-9]*)$"
+)
+_ANY_BASELINE_DECLARATION = re.compile(r"(?m)^[ \t]*POLICY_BASELINE_VERSION[ \t]*:")
+_OUTPUT_KEYS = (
+    "evaluation-context",
+    "policy-source",
+    "version-disposition",
+    "owner-authorization",
+    "post-merge-proof",
+)
+
+
+class _Once(argparse.Action):
+    """Reject repeated options instead of silently accepting the last value."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"argument {option_string}: may be specified only once")
+        setattr(namespace, self.dest, values)
 
 
 class BootstrapError(ValueError):
@@ -83,6 +117,161 @@ class BootstrapResult:
             _clean(key, "output key")
             _clean(value, "output value")
         return values
+
+
+def extract_candidate_baseline(candidate_root: Path) -> str:
+    """Read one exact baseline declaration from the candidate workflow."""
+    root = _root(candidate_root, "candidate root")
+    path = root / CANDIDATE_BASELINE_PATH
+    try:
+        metadata = path.lstat()
+        data = path.read_bytes()
+    except OSError as error:
+        raise BootstrapError("Candidate baseline declaration is unavailable") from error
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise BootstrapError("Candidate baseline source must be a regular file")
+    if b"\x00" in data or b"\r" in data:
+        raise BootstrapError("Invalid candidate baseline source bytes")
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise BootstrapError("Invalid candidate baseline source encoding") from error
+    declarations = _ANY_BASELINE_DECLARATION.findall(text)
+    exact = _BASELINE_DECLARATION.findall(text)
+    if len(declarations) != 1 or len(exact) != 1:
+        raise BootstrapError("Candidate baseline must have one exact declaration")
+    baseline = exact[0]
+    if baseline not in {CURRENT_BASELINE, IMMEDIATE_SUCCESSOR}:
+        raise BootstrapError("Unsupported candidate baseline declaration")
+    return baseline
+
+
+def validate_universe_members(members: tuple[str, ...]) -> None:
+    """Validate an observed protected-universe identity against protected v2."""
+    if not isinstance(members, tuple) or len(set(members)) != len(members):
+        raise BootstrapError("Invalid protected universe identity")
+    for member in members:
+        clean = _clean(member, "protected universe member")
+        path = Path(clean)
+        if (path.is_absolute() or "\\" in clean or clean.startswith("/")
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.as_posix() != clean):
+            raise BootstrapError("Noncanonical protected universe member")
+    if members != PROTECTED_UNIVERSE:
+        raise BootstrapError("Protected universe does not match canonical v2")
+
+
+def validate_protected_universe(protected_root: Path, protected_sha: str) -> None:
+    """Require every canonical member to be a tracked regular 100644 blob."""
+    root = _root(protected_root, "protected root")
+    revision = _sha(protected_sha, "protected SHA")
+    validate_universe_members(PROTECTED_UNIVERSE)
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "ls-tree", "-z", revision, "--", *PROTECTED_UNIVERSE],
+            check=True, capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BootstrapError("Protected universe Git validation failed") from error
+    entries: dict[str, tuple[str, str]] = {}
+    try:
+        records = completed.stdout.split(b"\0")
+        for record in records:
+            if not record:
+                continue
+            identity, raw_path = record.split(b"\t", 1)
+            mode, kind, _object_id = identity.decode("ascii", errors="strict").split(" ", 2)
+            path = raw_path.decode("utf-8", errors="strict")
+            if path in entries:
+                raise BootstrapError("Duplicate protected universe member")
+            entries[path] = (mode, kind)
+    except (ValueError, UnicodeError) as error:
+        raise BootstrapError("Malformed protected universe Git output") from error
+    if set(entries) != set(PROTECTED_UNIVERSE):
+        raise BootstrapError("Protected universe member is missing or renamed")
+    if any(identity != ("100644", "blob") for identity in entries.values()):
+        raise BootstrapError("Protected universe member must be a regular 100644 blob")
+
+
+def _validated_outputs(result: BootstrapResult) -> tuple[tuple[str, str], ...]:
+    if not isinstance(result, BootstrapResult):
+        raise BootstrapError("Invalid bootstrap result")
+    if (not isinstance(result.evaluation_context, EvaluationContext)
+            or not isinstance(result.policy_source, PolicySource)
+            or not isinstance(result.version_disposition, VersionDisposition)
+            or result.owner_authorization != OWNER_AUTHORIZATION
+            or result.post_merge_proof != POST_MERGE_PROOF):
+        raise BootstrapError("Invalid bootstrap result authority")
+    expected = (
+        ("evaluation-context", result.evaluation_context.value),
+        ("policy-source", result.policy_source.value),
+        ("version-disposition", result.version_disposition.value),
+        ("owner-authorization", OWNER_AUTHORIZATION),
+        ("post-merge-proof", POST_MERGE_PROOF),
+    )
+    values = result.as_outputs()
+    if values != expected:
+        raise BootstrapError("Bootstrap outputs do not match protected result")
+    if tuple(key for key, _value in values) != _OUTPUT_KEYS:
+        raise BootstrapError("Invalid bootstrap output schema")
+    if len(set(key for key, _value in values)) != len(_OUTPUT_KEYS):
+        raise BootstrapError("Duplicate bootstrap output key")
+    allowed = {
+        "evaluation-context": {item.value for item in EvaluationContext},
+        "policy-source": {item.value for item in PolicySource},
+        "version-disposition": {item.value for item in VersionDisposition},
+        "owner-authorization": {OWNER_AUTHORIZATION},
+        "post-merge-proof": {POST_MERGE_PROOF},
+    }
+    if any(value not in allowed[key] for key, value in values):
+        raise BootstrapError("Invalid bootstrap output value")
+    return values
+
+
+def emit_github_output(
+        result: BootstrapResult, destination: Path,
+        candidate_root: Path, protected_root: Path) -> None:
+    """Atomically replace a trusted empty output file with validated outputs."""
+    values = _validated_outputs(result)
+    candidate = _root(candidate_root, "candidate root")
+    protected = _root(protected_root, "protected root")
+    if not isinstance(destination, Path) or not destination.is_absolute():
+        raise BootstrapError("Invalid GITHUB_OUTPUT destination")
+    try:
+        parent = destination.parent.resolve(strict=True)
+        resolved = destination.resolve(strict=True)
+        metadata = destination.lstat()
+    except OSError as error:
+        raise BootstrapError("Invalid GITHUB_OUTPUT destination") from error
+    if (resolved != destination or parent != destination.parent
+            or not stat.S_ISREG(metadata.st_mode) or destination.is_symlink()
+            or resolved.is_relative_to(candidate) or resolved.is_relative_to(protected)):
+        raise BootstrapError("Unsafe GITHUB_OUTPUT destination")
+    try:
+        if destination.read_bytes():
+            raise BootstrapError("GITHUB_OUTPUT destination must be empty")
+    except OSError as error:
+        raise BootstrapError("Invalid GITHUB_OUTPUT destination") from error
+    payload = "".join(f"{key}={value}\n" for key, value in values).encode("utf-8")
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", dir=parent, prefix=".bootstrap-output-",
+                delete=False) as temporary:
+            temporary_name = temporary.name
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    except OSError as error:
+        raise BootstrapError("Unable to emit bootstrap outputs") from error
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
 
 
 def _clean(value: object, label: str) -> str:
@@ -213,3 +402,59 @@ def evaluate(inputs: BootstrapInputs) -> BootstrapResult:
     else:
         source = PolicySource.POLICY
     return BootstrapResult(context, source, disposition, OWNER_AUTHORIZATION, POST_MERGE_PROOF)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="protected_policy_bootstrap.py")
+    commands = parser.add_subparsers(dest="operation", required=True)
+    evaluate_parser = commands.add_parser("evaluate")
+    for name in (
+            "event-name", "repository", "base-repository", "base-branch",
+            "candidate-sha", "protected-sha", "candidate-root", "protected-root",
+            "event-ref", "default-branch", "workflow-ref"):
+        evaluate_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
+    return parser
+
+
+def _cli_inputs(arguments: argparse.Namespace) -> BootstrapInputs:
+    candidate_root = Path(arguments.candidate_root)
+    protected_root = Path(arguments.protected_root)
+    baseline = extract_candidate_baseline(candidate_root)
+    return BootstrapInputs(
+        event_name=arguments.event_name,
+        repository=arguments.repository,
+        base_repository=arguments.base_repository,
+        base_branch=arguments.base_branch,
+        candidate_sha=arguments.candidate_sha,
+        protected_sha=arguments.protected_sha,
+        candidate_root=candidate_root,
+        protected_root=protected_root,
+        candidate_baseline=baseline,
+        event_ref=arguments.event_ref,
+        default_branch=arguments.default_branch,
+        workflow_ref=arguments.workflow_ref,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the one supported bootstrap operation and fail closed."""
+    try:
+        arguments = _parser().parse_args(argv)
+        if arguments.operation != "evaluate":
+            raise BootstrapError("Unsupported bootstrap operation")
+        inputs = _cli_inputs(arguments)
+        result = evaluate(inputs)
+        validate_protected_universe(inputs.protected_root, inputs.protected_sha)
+        raw_destination = os.environ.get("GITHUB_OUTPUT")
+        if raw_destination is None:
+            raise BootstrapError("GITHUB_OUTPUT is required")
+        emit_github_output(
+            result, Path(raw_destination), inputs.candidate_root, inputs.protected_root)
+    except BootstrapError as error:
+        print(f"bootstrap error: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
