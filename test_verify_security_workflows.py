@@ -913,7 +913,8 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
             if isinstance(node, ast.ImportFrom) and node.module
         }
         self.assertEqual(imported, {
-            "__future__", "re", "subprocess", "dataclasses", "enum", "pathlib"
+            "__future__", "argparse", "os", "re", "stat", "subprocess", "sys",
+            "tempfile", "dataclasses", "enum", "pathlib"
         })
         self.assertNotIn("yaml", path.read_text(encoding="utf-8").lower())
         completed = subprocess.run(
@@ -1048,6 +1049,283 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
         })
         self.assertFalse(hasattr(bootstrap.BootstrapInputs, "policy_source"))
         self.assertFalse(hasattr(bootstrap.BootstrapInputs, "supported_successor"))
+
+
+class ProtectedBootstrapP0b1Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.candidate = base / "candidate with spaces"
+        self.protected = base / "protected with spaces"
+        for root in (self.candidate, self.protected):
+            root.mkdir()
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "P0b1 Test")
+            git(root, "config", "user.email", "p0b1@example.invalid")
+            git(root, "remote", "add", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            self.write_universe(root, bootstrap.CURRENT_BASELINE)
+            git(root, "add", ".")
+            git(root, "commit", "-m", "protected universe v2")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.protected_sha)
+
+    @staticmethod
+    def write_universe(root: Path, baseline: str) -> None:
+        for member in bootstrap.PROTECTED_UNIVERSE:
+            path = root / member
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if member == bootstrap.CANDIDATE_BASELINE_PATH:
+                path.write_bytes(
+                    b"name: policy\nenv:\n  POLICY_BASELINE_VERSION: "
+                    + baseline.encode("ascii") + b"\n"
+                )
+            else:
+                path.write_bytes((member + "\n").encode("utf-8"))
+
+    def cli_arguments(self) -> list[str]:
+        return [
+            "evaluate", "--event-name", "pull_request",
+            "--repository", bootstrap.REPOSITORY,
+            "--base-repository", bootstrap.REPOSITORY,
+            "--base-branch", "main", "--candidate-sha", self.candidate_sha,
+            "--protected-sha", self.protected_sha,
+            "--candidate-root", str(self.candidate),
+            "--protected-root", str(self.protected),
+            "--event-ref", "refs/pull/1/merge", "--default-branch", "main",
+            "--workflow-ref", "KiloAlpha021/security-policy/.github/workflows/security-workflows-policy.yml@refs/pull/1/merge",
+        ]
+
+    def run_cli(self, arguments: list[str] | None = None,
+                destination: Path | None = None) -> subprocess.CompletedProcess[str]:
+        output = destination or (Path(self.temp.name).resolve() / "github-output")
+        if not output.exists():
+            output.write_bytes(b"")
+        environment = os.environ.copy()
+        environment["GITHUB_OUTPUT"] = str(output)
+        return subprocess.run(
+            [os.sys.executable, "-I", "-S", str(Path(bootstrap.__file__).resolve()),
+             *(arguments if arguments is not None else self.cli_arguments())],
+            env=environment, capture_output=True, text=True,
+        )
+
+    def test_cli_is_strict_stdlib_and_emits_fixed_schema(self) -> None:
+        output = Path(self.temp.name).resolve() / "github-output"
+        output.write_bytes(b"")
+        completed = self.run_cli(destination=output)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(output.read_bytes(), (
+            b"evaluation-context=SELF_PR_BOOTSTRAP\n"
+            b"policy-source=candidate\n"
+            b"version-disposition=SAME_VERSION\n"
+            b"owner-authorization=REQUIRED\n"
+            b"post-merge-proof=REQUIRED\n"
+        ))
+        help_result = self.run_cli(["--help"])
+        self.assertEqual(help_result.returncode, 0)
+        for arguments in (
+            [], ["unknown"], self.cli_arguments()[:-2],
+            self.cli_arguments() + ["--unknown", "value"],
+            self.cli_arguments() + ["--repository", bootstrap.REPOSITORY],
+            self.cli_arguments() + ["--candidate-baseline", bootstrap.CURRENT_BASELINE],
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(arguments)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_baseline_extraction_matrix(self) -> None:
+        workflow = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        for baseline in (bootstrap.CURRENT_BASELINE, bootstrap.IMMEDIATE_SUCCESSOR):
+            self.write_universe(self.candidate, baseline)
+            self.assertEqual(bootstrap.extract_candidate_baseline(self.candidate), baseline)
+        invalid = (
+            b"name: policy\n", b"  POLICY_BASELINE_VERSION: latest\n",
+            b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-3\n",
+            b"  policy_baseline_version: SECURITY-POLICY-BASELINE-1\n",
+            b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1..2\n",
+            b"  POLICY_BASELINE_VERSION: security-policy-baseline-1\n",
+            b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\r\n",
+            b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\x00\n",
+            (b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n" * 2),
+            b"x: 'POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1'\n",
+        )
+        for data in invalid:
+            with self.subTest(data=data):
+                workflow.write_bytes(data)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.extract_candidate_baseline(self.candidate)
+
+    def test_output_schema_destination_and_injection_fail_closed(self) -> None:
+        inputs = bootstrap.BootstrapInputs(
+            "pull_request", bootstrap.REPOSITORY, bootstrap.REPOSITORY, "main",
+            self.candidate_sha, self.protected_sha, self.candidate, self.protected,
+            bootstrap.CURRENT_BASELINE,
+        )
+        result = bootstrap.evaluate(inputs)
+        outside = Path(self.temp.name).resolve() / "output"
+        outside.write_bytes(b"")
+        bootstrap.emit_github_output(result, outside, self.candidate, self.protected)
+        self.assertEqual(len(outside.read_text(encoding="utf-8").splitlines()), 5)
+
+        for destination in (
+            Path("relative"), self.candidate / "output", self.protected / "output",
+            Path(self.temp.name).resolve() / "missing",
+        ):
+            if destination.is_absolute() and destination.parent.exists() and destination.name == "output":
+                destination.write_bytes(b"")
+            with self.subTest(destination=destination), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.emit_github_output(result, destination, self.candidate, self.protected)
+
+        nonempty = Path(self.temp.name).resolve() / "nonempty"
+        nonempty.write_bytes(b"prior=value\n")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.emit_github_output(result, nonempty, self.candidate, self.protected)
+        self.assertEqual(nonempty.read_bytes(), b"prior=value\n")
+
+        malformed = bootstrap.BootstrapResult(
+            bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+            bootstrap.PolicySource.CANDIDATE,
+            bootstrap.VersionDisposition.SAME_VERSION,
+            "REQUIRED\npolicy-source=policy", "REQUIRED",
+        )
+        empty = Path(self.temp.name).resolve() / "empty"
+        empty.write_bytes(b"")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.emit_github_output(malformed, empty, self.candidate, self.protected)
+        self.assertEqual(empty.read_bytes(), b"")
+        malformed_schemas = (
+            (("unknown", "value"),),
+            (("evaluation-context", "SELF_PR_BOOTSTRAP"),) * 5,
+            (("evaluation-context", "SELF_PR_BOOTSTRAP"),
+             ("policy-source", "policy"),
+             ("version-disposition", "IMMEDIATE_SUCCESSOR"),
+             ("owner-authorization", "REQUIRED"),
+             ("post-merge-proof", "REQUIRED")),
+        )
+        for schema in malformed_schemas:
+            empty.write_bytes(b"")
+            with self.subTest(schema=schema), mock.patch.object(
+                    bootstrap.BootstrapResult, "as_outputs", return_value=schema):
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.emit_github_output(result, empty, self.candidate, self.protected)
+                self.assertEqual(empty.read_bytes(), b"")
+
+    def test_exact_universe_membership_and_git_identity(self) -> None:
+        bootstrap.validate_universe_members(bootstrap.PROTECTED_UNIVERSE)
+        bootstrap.validate_protected_universe(self.protected, self.protected_sha)
+        invalid_members = (
+            bootstrap.PROTECTED_UNIVERSE[:-1],
+            bootstrap.PROTECTED_UNIVERSE + ("foreign.py",),
+            bootstrap.PROTECTED_UNIVERSE + (bootstrap.PROTECTED_UNIVERSE[-1],),
+            bootstrap.PROTECTED_UNIVERSE[:-1] + ("Protected_policy_bootstrap.py",),
+            bootstrap.PROTECTED_UNIVERSE[:-1] + ("../protected_policy_bootstrap.py",),
+            bootstrap.PROTECTED_UNIVERSE[:-1] + ("C:/protected_policy_bootstrap.py",),
+            bootstrap.PROTECTED_UNIVERSE[:-1] + ("dir\\protected_policy_bootstrap.py",),
+        )
+        for members in invalid_members:
+            with self.subTest(members=members), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.validate_universe_members(members)
+
+    def test_universe_rejects_delete_mode_symlink_and_gitlink(self) -> None:
+        component = bootstrap.PROTECTED_UNIVERSE[-1]
+        variants: list[tuple[str, list[str]]] = [
+            ("delete", ["rm", component]),
+            ("mode", ["update-index", "--chmod=+x", component]),
+            ("symlink", []),
+        ]
+        for name, command in variants:
+            with self.subTest(name=name):
+                root = Path(self.temp.name).resolve() / f"variant-{name}"
+                shutil.copytree(self.protected, root)
+                if name == "symlink":
+                    link_blob = git(root, "hash-object", "requirements-policy.lock")
+                    git(root, "update-index", "--cacheinfo",
+                        "120000," + link_blob + "," + component)
+                else:
+                    git(root, *command)
+                git(root, "commit", "-m", name)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_protected_universe(root, git(root, "rev-parse", "HEAD"))
+
+        root = Path(self.temp.name).resolve() / "variant-gitlink"
+        shutil.copytree(self.protected, root)
+        git(root, "rm", bootstrap.CANDIDATE_BASELINE_PATH)
+        git(root, "update-index", "--add", "--cacheinfo",
+            "160000," + self.protected_sha + "," + bootstrap.CANDIDATE_BASELINE_PATH)
+        git(root, "commit", "-m", "gitlink")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_protected_universe(root, git(root, "rev-parse", "HEAD"))
+
+    def test_cli_failure_leaves_no_partial_authority(self) -> None:
+        output = Path(self.temp.name).resolve() / "failed-output"
+        output.write_bytes(b"")
+        bad = self.cli_arguments()
+        bad[bad.index("--repository") + 1] = "KiloAlpha021/other"
+        completed = self.run_cli(bad, output)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("bootstrap error:", completed.stderr)
+        self.assertEqual(output.read_bytes(), b"")
+
+        output.write_bytes(b"")
+        environment = os.environ.copy()
+        environment.pop("GITHUB_OUTPUT", None)
+        completed = subprocess.run(
+            [os.sys.executable, "-I", "-S", str(Path(bootstrap.__file__).resolve()),
+             *self.cli_arguments()], env=environment, capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 2)
+
+    def test_cli_proof_and_downstream_contexts(self) -> None:
+        proof_candidate = Path(self.temp.name).resolve() / "proof candidate"
+        shutil.copytree(self.protected, proof_candidate)
+        proof_output = Path(self.temp.name).resolve() / "proof-output"
+        proof_output.write_bytes(b"")
+        proof_arguments = self.cli_arguments()
+        replacements = {
+            "--event-name": "workflow_dispatch",
+            "--candidate-sha": self.protected_sha,
+            "--candidate-root": str(proof_candidate),
+            "--event-ref": "refs/heads/main",
+            "--workflow-ref": (bootstrap.REPOSITORY
+                + "/.github/workflows/security-workflows-policy.yml@refs/heads/main"),
+        }
+        for option, value in replacements.items():
+            proof_arguments[proof_arguments.index(option) + 1] = value
+        completed = self.run_cli(proof_arguments, proof_output)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"evaluation-context=STAGE_A_PROTECTED_PROOF\n",
+                      proof_output.read_bytes())
+        self.assertIn(b"policy-source=policy\n", proof_output.read_bytes())
+
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        downstream_output = Path(self.temp.name).resolve() / "downstream-output"
+        downstream_output.write_bytes(b"")
+        downstream_arguments = self.cli_arguments()
+        for option in ("--repository", "--base-repository"):
+            downstream_arguments[downstream_arguments.index(option) + 1] = (
+                bootstrap.DOWNSTREAM_REPOSITORY)
+        completed = self.run_cli(downstream_arguments, downstream_output)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"evaluation-context=DOWNSTREAM_SECURITY_WORKFLOWS\n",
+                      downstream_output.read_bytes())
+        self.assertIn(b"policy-source=policy\n", downstream_output.read_bytes())
+
+    def test_p0a_api_and_authority_boundary_remain_closed(self) -> None:
+        self.assertFalse(hasattr(bootstrap.BootstrapInputs, "policy_source"))
+        self.assertFalse(hasattr(bootstrap.BootstrapInputs, "supported_successor"))
+        self.assertFalse("candidate-baseline" in " ".join(self.cli_arguments()))
+        self.assertEqual(bootstrap.PROTECTED_UNIVERSE, (
+            ".github/workflows/security-workflows-policy.yml",
+            "requirements-audit.lock", "requirements-policy.lock",
+            "test_verify_security_workflows.py", "verify_security_workflows.py",
+            "protected_policy_bootstrap.py",
+        ))
+        source = Path(bootstrap.__file__).read_text(encoding="utf-8")
+        self.assertIn("candidate proposal", source)
+        self.assertIn("cannot authorize its own landing", source)
 
 
 if __name__ == "__main__":
