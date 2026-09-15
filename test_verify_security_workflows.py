@@ -8,11 +8,14 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import ast
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
 from verify_security_workflows import action_references, validate_verifier, verify
+import protected_policy_bootstrap as bootstrap
 
 
 def git(root: Path, *args: str) -> str:
@@ -858,6 +861,193 @@ def duplicate():
                 self.tearDown(); self.setUp()
                 self.mutate(*mutations[name])
                 with self.assertRaises(ValueError): self.check()
+
+
+class ProtectedBootstrapComponentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.candidate = base / "candidate"
+        self.protected = base / "protected"
+        for root in (self.candidate, self.protected):
+            root.mkdir()
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "Bootstrap Test")
+            git(root, "config", "user.email", "bootstrap@example.invalid")
+            git(root, "remote", "add", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            (root / "identity.txt").write_text(root.name + "\n", encoding="utf-8")
+            git(root, "add", ".")
+            git(root, "commit", "-m", "identity")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.protected_sha)
+
+    def inputs(self, **changes: object) -> bootstrap.BootstrapInputs:
+        values: dict[str, object] = {
+            "event_name": "pull_request",
+            "repository": bootstrap.REPOSITORY,
+            "base_repository": bootstrap.REPOSITORY,
+            "base_branch": "main",
+            "candidate_sha": self.candidate_sha,
+            "protected_sha": self.protected_sha,
+            "candidate_root": self.candidate,
+            "protected_root": self.protected,
+            "candidate_baseline": bootstrap.CURRENT_BASELINE,
+        }
+        values.update(changes)
+        return bootstrap.BootstrapInputs(**values)  # type: ignore[arg-type]
+
+    def test_bootstrap_is_standard_library_only_and_pre_environment_importable(self) -> None:
+        path = Path(bootstrap.__file__).resolve()
+        syntax = ast.parse(path.read_text(encoding="utf-8"))
+        imported = {
+            alias.name.split(".")[0]
+            for node in ast.walk(syntax)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        } | {
+            node.module.split(".")[0]
+            for node in ast.walk(syntax)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        self.assertEqual(imported, {
+            "__future__", "re", "subprocess", "dataclasses", "enum", "pathlib"
+        })
+        self.assertNotIn("yaml", path.read_text(encoding="utf-8").lower())
+        completed = subprocess.run(
+            [os.sys.executable, "-I", "-S", "-c",
+             "import importlib.util,sys;"
+             "p=sys.argv[1];s=importlib.util.spec_from_file_location('b',p);"
+             "m=importlib.util.module_from_spec(s);sys.modules['b']=m;s.loader.exec_module(m);"
+             "print(m.CURRENT_BASELINE)", str(path)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), bootstrap.CURRENT_BASELINE)
+
+    def test_constants_and_first_landing_boundary_are_explicit(self) -> None:
+        self.assertEqual(bootstrap.CURRENT_BASELINE, "SECURITY-POLICY-BASELINE-1")
+        self.assertEqual(bootstrap.IMMEDIATE_SUCCESSOR, "SECURITY-POLICY-BASELINE-2")
+        self.assertEqual(bootstrap.TRANSITION_PROTECTED_BASE,
+                         "76a811e76edbefc76ab1baf20795e2755f5bb794")
+        text = Path(bootstrap.__file__).read_text(encoding="utf-8")
+        for statement in ("candidate proposal", "cannot authorize its own landing",
+                          "Owner authorization", "post-merge protected proof"):
+            self.assertIn(statement, text)
+
+    def test_context_and_policy_source_matrix(self) -> None:
+        same = bootstrap.evaluate(self.inputs())
+        self.assertEqual(same.evaluation_context, bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP)
+        self.assertEqual(same.policy_source, bootstrap.PolicySource.CANDIDATE)
+        self.assertEqual(same.version_disposition, bootstrap.VersionDisposition.SAME_VERSION)
+
+        shutil.copytree(self.protected, self.protected.parent / "proof-candidate")
+        proof_candidate = (self.protected.parent / "proof-candidate").resolve()
+        proof = bootstrap.evaluate(self.inputs(
+            event_name="workflow_dispatch", candidate_sha=self.protected_sha,
+            candidate_root=proof_candidate, event_ref="refs/heads/main",
+            workflow_ref=(bootstrap.REPOSITORY +
+                          "/.github/workflows/security-workflows-policy.yml@refs/heads/main"),
+        ))
+        self.assertEqual(proof.evaluation_context,
+                         bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF)
+        self.assertEqual(proof.policy_source, bootstrap.PolicySource.POLICY)
+
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        try:
+            for event in ("pull_request", "merge_group"):
+                downstream = bootstrap.evaluate(self.inputs(
+                    event_name=event, repository=bootstrap.DOWNSTREAM_REPOSITORY,
+                    base_repository=bootstrap.DOWNSTREAM_REPOSITORY,
+                ))
+                self.assertEqual(downstream.evaluation_context,
+                                 bootstrap.EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS)
+                self.assertEqual(downstream.policy_source, bootstrap.PolicySource.POLICY)
+        finally:
+            git(self.candidate, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+
+    def test_exact_successor_and_expiry(self) -> None:
+        def identity(root: Path, *arguments: str) -> str:
+            if arguments == ("remote", "get-url", "origin"):
+                return "https://github.com/KiloAlpha021/security-policy.git"
+            if arguments in (("rev-parse", "HEAD"),
+                             ("rev-parse", "refs/remotes/origin/main")):
+                return (self.candidate_sha if root == self.candidate
+                        else bootstrap.TRANSITION_PROTECTED_BASE)
+            raise AssertionError(arguments)
+
+        with mock.patch.object(bootstrap, "_git", side_effect=identity):
+            eligible = bootstrap.evaluate(self.inputs(
+                protected_sha=bootstrap.TRANSITION_PROTECTED_BASE,
+                candidate_baseline=bootstrap.IMMEDIATE_SUCCESSOR,
+            ))
+            self.assertEqual(eligible.version_disposition,
+                             bootstrap.VersionDisposition.IMMEDIATE_SUCCESSOR)
+            self.assertEqual(eligible.policy_source, bootstrap.PolicySource.POLICY)
+            self.assertEqual(eligible.owner_authorization, "REQUIRED")
+            self.assertEqual(eligible.post_merge_proof, "REQUIRED")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.evaluate(self.inputs(candidate_baseline=bootstrap.IMMEDIATE_SUCCESSOR))
+
+    def test_versions_inputs_and_injection_fail_closed(self) -> None:
+        invalid_versions = ("", "SECURITY-POLICY-BASELINE-3", "SECURITY-POLICY-BASELINE-99",
+                            "latest", "baseline-2", "SECURITY-POLICY-BASELINE-1..2",
+                            "security-policy-baseline-2", "SECURITY-POLICY-BASELINE-0")
+        for version in invalid_versions:
+            with self.subTest(version=version), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.evaluate(self.inputs(candidate_baseline=version))
+        for field, value in (
+            ("repository", "KiloAlpha021/other"), ("base_repository", "KiloAlpha021/other"),
+            ("base_branch", "dev"), ("event_name", "push"),
+            ("candidate_sha", "0" * 39), ("protected_sha", "A" * 40),
+            ("repository", "KiloAlpha021/security-policy\npolicy-source=policy"),
+            ("base_branch", "main\0other"),
+        ):
+            with self.subTest(field=field, value=value), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.evaluate(self.inputs(**{field: value}))
+
+    def test_git_root_remote_and_sha_fail_closed(self) -> None:
+        cases = (
+            {"candidate_root": self.protected},
+            {"candidate_root": self.candidate / "missing"},
+            {"candidate_root": Path("relative")},
+            {"candidate_sha": "0" * 40},
+            {"protected_sha": "0" * 40},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.evaluate(self.inputs(**changes))
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/other.git")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.evaluate(self.inputs())
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        git_metadata = self.candidate / ".git"
+        hidden_metadata = self.candidate / "git-metadata-disabled"
+        git_metadata.replace(hidden_metadata)
+        try:
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.evaluate(self.inputs())
+        finally:
+            hidden_metadata.replace(git_metadata)
+
+    def test_output_contract_is_closed_and_deterministic(self) -> None:
+        result = bootstrap.evaluate(self.inputs())
+        self.assertEqual(result.as_outputs(), result.as_outputs())
+        self.assertEqual(dict(result.as_outputs()), {
+            "evaluation-context": "SELF_PR_BOOTSTRAP",
+            "policy-source": "candidate",
+            "version-disposition": "SAME_VERSION",
+            "owner-authorization": "REQUIRED",
+            "post-merge-proof": "REQUIRED",
+        })
+        self.assertFalse(hasattr(bootstrap.BootstrapInputs, "policy_source"))
+        self.assertFalse(hasattr(bootstrap.BootstrapInputs, "supported_successor"))
 
 
 if __name__ == "__main__":
