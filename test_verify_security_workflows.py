@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 import ast
+import base64
 from pathlib import Path
 from unittest import mock
 
@@ -290,8 +291,9 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
             "1211595f9b0b5d1e76dd892bb210fece54f24b53",
             "P0b-2 transition expired after protected-main movement",
             "diff --name-status --no-renames", "$changed.Count -ne 2",
-            "M`t.github/workflows/security-workflows-policy.yml",
-            "M`ttest_verify_security_workflows.py",
+            "$workflowRecord = 'M' + [char]9 + '.github/workflows/security-workflows-policy.yml'",
+            "$testRecord = 'M' + [char]9 + 'test_verify_security_workflows.py'",
+            "$changed[0] -cne $workflowRecord", "$changed[1] -cne $testRecord",
         ):
             self.assertIn(fragment, admission["run"])
         self.assertNotIn("protected_policy_bootstrap.py", admission["run"])
@@ -357,7 +359,8 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
             ("POST_MERGE_PROOF -ne 'REQUIRED'", "POST_MERGE_PROOF -eq 'OPTIONAL'"),
             ("diff --name-status --no-renames", "diff --name-only"),
             ("$changed.Count -ne 2", "$changed.Count -lt 2"),
-            ("M`t.github/workflows/security-workflows-policy.yml", "M`tprotected_policy_bootstrap.py"),
+            ("'M' + [char]9 + '.github/workflows/security-workflows-policy.yml'",
+             "'M' + [char]9 + 'protected_policy_bootstrap.py'"),
             ("config core.autocrlf false", "config core.autocrlf true"),
             ("reset --hard $candidateSha", "reset --hard HEAD"),
             ("hash-object --no-filters $workflowPath", "hash-object $workflowPath"),
@@ -625,12 +628,160 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         self.assertIn("P0b-2 transition expired after protected-main movement", run)
         self.assertIn("diff --name-status --no-renames", run)
         self.assertIn("$changed.Count -ne 2", run)
-        self.assertEqual(run.count("M`t.github/workflows/security-workflows-policy.yml"), 1)
-        self.assertEqual(run.count("M`ttest_verify_security_workflows.py"), 1)
+        self.assertEqual(
+            run.count("$workflowRecord = 'M' + [char]9 + '.github/workflows/security-workflows-policy.yml'"), 1)
+        self.assertEqual(
+            run.count("$testRecord = 'M' + [char]9 + 'test_verify_security_workflows.py'"), 1)
+        self.assertEqual(run.count("$changed[0] -cne $workflowRecord"), 1)
+        self.assertEqual(run.count("$changed[1] -cne $testRecord"), 1)
+        self.assertNotIn("'M`t", run)
         for forbidden in ("protected_policy_bootstrap.py", "requirements-policy.lock",
-                          "requirements-audit.lock", "M`tverify_security_workflows.py",
+                          "requirements-audit.lock",
+                          "[char]9 + 'verify_security_workflows.py'",
                           "policy-manifest.json"):
             self.assertNotIn(forbidden, run)
+
+    def test_exact_p0b2_admission_executes_production_block_with_git_records(self) -> None:
+        root = Path(__file__).parent.resolve()
+        workflow = yaml.load(
+            (root / ".github/workflows/security-workflows-policy.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        admission = next(
+            step for step in workflow["jobs"]["security-workflows-policy"]["steps"]
+            if step["name"] == "Enforce exact P0b-2 self-PR admission"
+        )["run"]
+        protected_base = "1211595f9b0b5d1e76dd892bb210fece54f24b53"
+        workflow_member = Path(".github/workflows/security-workflows-policy.yml")
+        test_member = Path("test_verify_security_workflows.py")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            candidate = workspace / "candidate"
+            subprocess.run(
+                ["git", "-c", "safe.directory=*", "clone",
+                 "--no-hardlinks", str(root), str(candidate)],
+                check=True, capture_output=True, text=True,
+            )
+            git(candidate, "config", "user.name", "P0b2 Admission Test")
+            git(candidate, "config", "user.email", "p0b2-admission@example.invalid")
+
+            def append(member: Path) -> None:
+                target = candidate / member
+                target.write_bytes(target.read_bytes() + b"\n")
+
+            def execute(name: str, mutate: object, expected_success: bool) -> None:
+                git(candidate, "reset", "--hard", protected_base)
+                git(candidate, "clean", "-fd")
+                mutate()  # type: ignore[operator]
+                git(candidate, "add", "-A")
+                git(candidate, "commit", "-m", name)
+                target_sha = git(candidate, "rev-parse", "HEAD")
+                rendered = admission.replace("${{ github.workspace }}", workspace.as_posix())
+                rendered = rendered.replace(
+                    "${{ steps.protected-git.outputs.protected-sha }}", protected_base)
+                rendered = rendered.replace("${{ github.sha }}", target_sha)
+                encoded = base64.b64encode(rendered.encode("utf-16le")).decode("ascii")
+                completed = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                    cwd=workspace, capture_output=True, text=True,
+                )
+                with self.subTest(name=name):
+                    if expected_success:
+                        self.assertEqual(completed.returncode, 0,
+                                         completed.stderr or completed.stdout)
+                    else:
+                        self.assertNotEqual(completed.returncode, 0)
+
+            def exact_pair() -> None:
+                append(workflow_member)
+                append(test_member)
+
+            execute("exact M M", exact_pair, True)
+            execute("one file", lambda: append(workflow_member), False)
+
+            def third_file() -> None:
+                exact_pair()
+                (candidate / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+
+            execute("third added file", third_file, False)
+
+            def deleted_member() -> None:
+                (candidate / workflow_member).unlink()
+                append(test_member)
+
+            execute("deleted authorized member", deleted_member, False)
+
+            def renamed_member() -> None:
+                git(candidate, "mv", workflow_member.as_posix(),
+                    ".github/workflows/security-workflows-policy-renamed.yml")
+                append(test_member)
+
+            execute("renamed authorized member", renamed_member, False)
+
+            def copied_member() -> None:
+                exact_pair()
+                shutil.copyfile(candidate / workflow_member,
+                                candidate / ".github/workflows/security-workflows-policy-copy.yml")
+
+            execute("copy-like added member", copied_member, False)
+
+            def case_variant() -> None:
+                append(workflow_member)
+                git(candidate, "mv", test_member.as_posix(), "Test_verify_security_workflows.py")
+
+            execute("wrong-case path", case_variant, False)
+
+    def test_exact_p0b2_admission_rejects_delimiter_and_record_mutations(self) -> None:
+        workflow = yaml.load(
+            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
+                encoding="utf-8"), Loader=yaml.BaseLoader)
+        admission = next(
+            step for step in workflow["jobs"]["security-workflows-policy"]["steps"]
+            if step["name"] == "Enforce exact P0b-2 self-PR admission"
+        )["run"]
+        comparison_lines = [
+            line for line in admission.splitlines()
+            if line.startswith(("$workflowRecord = ", "$testRecord = ",
+                                "if ($changed[0] ", "if ($changed[1] "))
+        ]
+        self.assertEqual(len(comparison_lines), 4)
+        expected = (
+            "M\t.github/workflows/security-workflows-policy.yml",
+            "M\ttest_verify_security_workflows.py",
+        )
+
+        def execute(records: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+            literals = ", ".join("'" + record.replace("'", "''") + "'"
+                                 for record in records)
+            rendered = ("$ErrorActionPreference = 'Stop'\n$changed = @(" + literals
+                        + ")\n" + "\n".join(comparison_lines) + "\n")
+            encoded = base64.b64encode(rendered.encode("utf-16le")).decode("ascii")
+            return subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                capture_output=True, text=True,
+            )
+
+        passed = execute(expected)
+        self.assertEqual(passed.returncode, 0, passed.stderr or passed.stdout)
+        mutations = {
+            "literal backtick-t": ("M`t.github/workflows/security-workflows-policy.yml", expected[1]),
+            "spaces": ("M  .github/workflows/security-workflows-policy.yml", expected[1]),
+            "missing tab": ("M.github/workflows/security-workflows-policy.yml", expected[1]),
+            "extra tab": ("M\t\t.github/workflows/security-workflows-policy.yml", expected[1]),
+            "trailing whitespace": (expected[0] + " ", expected[1]),
+            "malformed status": ("X\t.github/workflows/security-workflows-policy.yml", expected[1]),
+            "case variant": (expected[0], "M\tTest_verify_security_workflows.py"),
+            "backslash path": ("M\t.github\\workflows\\security-workflows-policy.yml",
+                               expected[1]),
+            "duplicate": (expected[0], expected[0]),
+            "reversed order": (expected[1], expected[0]),
+        }
+        for name, records in mutations.items():
+            with self.subTest(name=name):
+                completed = execute(records)
+                self.assertNotEqual(completed.returncode, 0,
+                                    completed.stderr or completed.stdout)
 
     def test_stage_a_transition_removal_is_required_after_bootstrap(self) -> None:
         text = (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(encoding="utf-8")
@@ -718,6 +869,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         self.assertGreater(len(blocks), 0)
         for index, block in enumerate(blocks):
             with self.subTest(index=index):
+                self.assertIsNone(re.search(r"'[^'\r\n]*`[tnr][^'\r\n]*'", block))
                 rendered = re.sub(r"\$\{\{.*?\}\}", "GITHUB_EXPRESSION", block)
                 result = subprocess.run(
                     ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
