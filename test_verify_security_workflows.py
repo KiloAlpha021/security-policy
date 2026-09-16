@@ -1146,6 +1146,8 @@ class ProtectedBootstrapP0b1Tests(unittest.TestCase):
             b"  POLICY_BASELINE_VERSION: security-policy-baseline-1\n",
             b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\r\n",
             b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\r",
+            (b"name: policy\n"
+             b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\r\n"),
             b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\x00\n",
             b"\xef\xbb\xbf  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n",
             "  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n".encode("utf-16"),
@@ -1345,7 +1347,7 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         subprocess.run(
             ["git", "-c", f"safe.directory={source}",
              "-c", f"safe.directory={source_git_dir}", "clone", "--no-hardlinks",
-             str(source), str(self.protected)],
+             "--no-checkout", str(source), str(self.protected)],
             check=True, capture_output=True, text=True,
         )
         self._configure(self.protected)
@@ -1366,10 +1368,18 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
 
     @staticmethod
     def _configure(root: Path) -> None:
+        intended_head = git(root, "rev-parse", "HEAD")
         git(root, "config", "user.name", "Model D Admission Test")
         git(root, "config", "user.email", "model-d@example.invalid")
         git(root, "config", "core.autocrlf", "false")
-        git(root, "reset", "--hard", "HEAD")
+        git(root, "reset", "--hard", intended_head)
+        if git(root, "rev-parse", "HEAD") != intended_head:
+            raise AssertionError("D0 fixture HEAD materialization mismatch")
+        workflow = bootstrap.CANDIDATE_BASELINE_PATH
+        committed_blob = git(root, "rev-parse", f"{intended_head}:{workflow}")
+        worktree_blob = git(root, "hash-object", "--no-filters", workflow)
+        if worktree_blob != committed_blob:
+            raise AssertionError("D0 fixture workflow bytes differ from committed blob")
         git(root, "remote", "set-url", "origin",
             "https://github.com/KiloAlpha021/security-policy.git")
 
@@ -1383,7 +1393,8 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
                    mutate=None) -> Path:
         root = self.base / f"candidate-{name}"
         subprocess.run(
-            ["git", "clone", "--no-hardlinks", str(self.protected), str(root)],
+            ["git", "clone", "--no-hardlinks", "--no-checkout",
+             str(self.protected), str(root)],
             check=True, capture_output=True, text=True,
         )
         self._configure(root)
