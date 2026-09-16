@@ -60,6 +60,22 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $candidateRoot = "${{ github.workspace }}/candidate"
+          $candidateSha = "${{ github.sha }}"
+          git -C $candidateRoot config core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $candidateRoot reset --hard $candidateSha
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $observedHead = (git -C $candidateRoot rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from authorized candidate SHA' }
+          $workflowPath = '.github/workflows/security-workflows-policy.yml'
+          $expectedBlob = (git -C $candidateRoot rev-parse "${candidateSha}:$workflowPath").Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($expectedBlob -notmatch '^[0-9a-f]{40}$') { throw 'Malformed committed candidate workflow blob' }
+          $actualBlob = (git -C $candidateRoot hash-object --no-filters $workflowPath).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from exact committed Git blob' }
           python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate --event-name "${{ github.event_name }}" --repository "${{ github.repository }}" --base-repository "${{ github.event.pull_request.base.repo.full_name || github.repository }}" --base-branch "${{ github.event.pull_request.base.ref || 'main' }}" --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy" --event-ref "${{ github.ref }}" --default-branch "${{ github.event.repository.default_branch || 'main' }}" --workflow-ref "${{ github.workflow_ref }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

@@ -232,6 +232,31 @@ def duplicate():
         bootstrap_step = by_name["Resolve protected bootstrap authority"]
         self.assertEqual(bootstrap_step["id"], "protected-bootstrap")
         bootstrap_run = bootstrap_step["run"]
+        bootstrap_command = 'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py"'
+        self.assertEqual(bootstrap_run.count(bootstrap_command), 1)
+        preparation_run, invocation = bootstrap_run.split(bootstrap_command, 1)
+        self.assertEqual(preparation_run, """$ErrorActionPreference = 'Stop'
+$candidateRoot = "${{ github.workspace }}/candidate"
+$candidateSha = "${{ github.sha }}"
+git -C $candidateRoot config core.autocrlf false
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+git -C $candidateRoot reset --hard $candidateSha
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$observedHead = (git -C $candidateRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from authorized candidate SHA' }
+$workflowPath = '.github/workflows/security-workflows-policy.yml'
+$expectedBlob = (git -C $candidateRoot rev-parse "${candidateSha}:$workflowPath").Trim()
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($expectedBlob -notmatch '^[0-9a-f]{40}$') { throw 'Malformed committed candidate workflow blob' }
+$actualBlob = (git -C $candidateRoot hash-object --no-filters $workflowPath).Trim()
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from exact committed Git blob' }
+""")
+        self.assertNotIn('${{ github.workspace }}/policy', preparation_run)
+        self.assertTrue(invocation.startswith(" evaluate "))
+        self.assertEqual(names.index("Resolve protected bootstrap authority"),
+                         names.index("Acquire protected Git identity") + 1)
         self.assertIn('python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate', bootstrap_run)
         self.assertNotIn("candidate/protected_policy_bootstrap.py", bootstrap_run)
         for argument in (
@@ -333,6 +358,12 @@ def duplicate():
             ("diff --name-status --no-renames", "diff --name-only"),
             ("$changed.Count -ne 2", "$changed.Count -lt 2"),
             ("M`t.github/workflows/security-workflows-policy.yml", "M`tprotected_policy_bootstrap.py"),
+            ("config core.autocrlf false", "config core.autocrlf true"),
+            ("reset --hard $candidateSha", "reset --hard HEAD"),
+            ("hash-object --no-filters $workflowPath", "hash-object $workflowPath"),
+            ("if ($actualBlob -ne $expectedBlob)", "if ($actualBlob -eq $expectedBlob)"),
+            ('$candidateSha = "${{ github.sha }}"',
+             '$candidateSha = "${{ github.event.pull_request.head.sha }}"'),
             (" --require-hashes", ""), (" --only-binary=:all:", ""),
             ("policy/test_verify_security_workflows.py", "candidate/test_verify_security_workflows.py"),
             ("policy/verify_security_workflows.py", "candidate/verify_security_workflows.py"),
@@ -607,6 +638,73 @@ def duplicate():
         self.assertIn("P0b-2 transition expired after protected-main movement", text)
         self.assertNotIn("$stageABase", text)
         self.assertNotIn("Security-policy self-PR exceeds the bounded five-file scope", text)
+
+    def test_prebootstrap_preparation_restores_windows_checkout_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            candidate = workspace / "candidate"
+            protected = workspace / "policy"
+            candidate.mkdir()
+            protected.mkdir()
+            sentinel = protected / "sentinel"
+            sentinel.write_bytes(b"protected\n")
+            git(candidate, "init", "-b", "main")
+            git(candidate, "config", "user.name", "P0b2 Test")
+            git(candidate, "config", "user.email", "p0b2@example.invalid")
+            git(candidate, "config", "core.autocrlf", "false")
+            workflow_path = candidate / bootstrap.CANDIDATE_BASELINE_PATH
+            workflow_path.parent.mkdir(parents=True)
+            committed = (
+                b"name: policy\nenv:\n"
+                b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n"
+            )
+            workflow_path.write_bytes(committed)
+            git(candidate, "add", bootstrap.CANDIDATE_BASELINE_PATH)
+            git(candidate, "commit", "-m", "head")
+            head_sha = git(candidate, "rev-parse", "HEAD")
+            git(candidate, "commit", "--allow-empty", "-m", "synthetic merge")
+            merge_sha = git(candidate, "rev-parse", "HEAD")
+            self.assertNotEqual(head_sha, merge_sha)
+            committed_blob = git(
+                candidate, "rev-parse", f"{merge_sha}:{bootstrap.CANDIDATE_BASELINE_PATH}")
+
+            git(candidate, "config", "core.autocrlf", "true")
+            workflow_path.unlink()
+            git(candidate, "checkout", "--", bootstrap.CANDIDATE_BASELINE_PATH)
+            self.assertIn(b"\r\n", workflow_path.read_bytes())
+            self.assertEqual(git(candidate, "hash-object", bootstrap.CANDIDATE_BASELINE_PATH),
+                             committed_blob)
+            self.assertNotEqual(
+                git(candidate, "hash-object", "--no-filters", bootstrap.CANDIDATE_BASELINE_PATH),
+                committed_blob,
+            )
+            with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                        "Invalid candidate baseline source bytes"):
+                bootstrap.extract_candidate_baseline(candidate)
+
+            workflow = yaml.load(
+                (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
+                    encoding="utf-8"), Loader=yaml.BaseLoader)
+            step = next(item for item in workflow["jobs"]["security-workflows-policy"]["steps"]
+                        if item["name"] == "Resolve protected bootstrap authority")
+            preparation = step["run"].split(
+                'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py"', 1)[0]
+            rendered = preparation.replace("${{ github.workspace }}", workspace.as_posix())
+            rendered = rendered.replace("${{ github.sha }}", merge_sha)
+            completed = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", rendered],
+                cwd=workspace, capture_output=True, text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            self.assertEqual(git(candidate, "rev-parse", "HEAD"), merge_sha)
+            self.assertEqual(workflow_path.read_bytes(), committed)
+            self.assertEqual(
+                git(candidate, "hash-object", "--no-filters", bootstrap.CANDIDATE_BASELINE_PATH),
+                committed_blob,
+            )
+            self.assertEqual(bootstrap.extract_candidate_baseline(candidate),
+                             bootstrap.CURRENT_BASELINE)
+            self.assertEqual(sentinel.read_bytes(), b"protected\n")
 
     def test_all_pwsh_blocks_parse_executably(self) -> None:
         workflow = yaml.load(
@@ -1010,7 +1108,11 @@ class ProtectedBootstrapP0b1Tests(unittest.TestCase):
             b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1..2\n",
             b"  POLICY_BASELINE_VERSION: security-policy-baseline-1\n",
             b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\r\n",
+            b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\r",
             b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\x00\n",
+            b"\xef\xbb\xbf  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n",
+            "  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n".encode("utf-16"),
+            b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\xff\n",
             (b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n" * 2),
             b"x: 'POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1'\n",
         )
