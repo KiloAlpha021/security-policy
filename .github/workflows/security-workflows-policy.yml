@@ -95,19 +95,13 @@ jobs:
           if ($env:OWNER_AUTHORIZATION -ne 'REQUIRED') { throw 'Owner authorization output is not REQUIRED' }
           if ($env:POST_MERGE_PROOF -ne 'REQUIRED') { throw 'Post-merge proof output is not REQUIRED' }
 
-      - name: Enforce exact P0b-2 self-PR admission
+      - name: Enforce exact Model D maintenance admission
         if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ("${{ steps.protected-git.outputs.protected-sha }}" -ne '1211595f9b0b5d1e76dd892bb210fece54f24b53') { throw 'P0b-2 transition expired after protected-main movement' }
-          $changed = @(git -C "${{ github.workspace }}/candidate" diff --name-status --no-renames "${{ steps.protected-git.outputs.protected-sha }}" "${{ github.sha }}")
+          python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" admit-maintenance --maintenance-operation MODEL_D_ORCHESTRATION_V1 --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($changed.Count -ne 2) { throw 'P0b-2 requires exactly two modified protected files' }
-          $workflowRecord = 'M' + [char]9 + '.github/workflows/security-workflows-policy.yml'
-          $testRecord = 'M' + [char]9 + 'test_verify_security_workflows.py'
-          if ($changed[0] -cne $workflowRecord) { throw 'P0b-2 workflow admission mismatch' }
-          if ($changed[1] -cne $testRecord) { throw 'P0b-2 test admission mismatch' }
 
       - name: Normalize and verify committed policy bytes
         shell: pwsh
