@@ -26,6 +26,13 @@ IMMEDIATE_SUCCESSOR = "SECURITY-POLICY-BASELINE-2"
 TRANSITION_PROTECTED_BASE = "76a811e76edbefc76ab1baf20795e2755f5bb794"
 OWNER_AUTHORIZATION = "REQUIRED"
 POST_MERGE_PROOF = "REQUIRED"
+MODEL_D_MAINTENANCE_OPERATION = "MODEL_D_ORCHESTRATION_V1"
+MODEL_D_TRANSITION_BASE = "97774bf4f5885a5900a1ccea98c98af12482f9e0"
+MODEL_D_MAINTENANCE_PATHS = (
+    ".github/workflows/security-workflows-policy.yml",
+    "protected_policy_bootstrap.py",
+    "test_verify_security_workflows.py",
+)
 PROTECTED_UNIVERSE = (
     ".github/workflows/security-workflows-policy.yml",
     "requirements-audit.lock",
@@ -191,6 +198,130 @@ def validate_protected_universe(protected_root: Path, protected_sha: str) -> Non
         raise BootstrapError("Protected universe member is missing or renamed")
     if any(identity != ("100644", "blob") for identity in entries.values()):
         raise BootstrapError("Protected universe member must be a regular 100644 blob")
+
+
+def _git_bytes(root: Path, *arguments: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments], check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BootstrapError("Git maintenance admission failed") from error
+    return completed.stdout
+
+
+def _tree_entries(root: Path, revision: str,
+                  paths: tuple[str, ...]) -> dict[str, tuple[str, str]]:
+    output = _git_bytes(root, "ls-tree", "-z", revision, "--", *paths)
+    entries: dict[str, tuple[str, str]] = {}
+    try:
+        for record in output.split(b"\0"):
+            if not record:
+                continue
+            identity, raw_path = record.split(b"\t", 1)
+            mode, kind, _object_id = identity.decode(
+                "ascii", errors="strict").split(" ", 2)
+            path = raw_path.decode("utf-8", errors="strict")
+            if path in entries:
+                raise BootstrapError("Duplicate maintenance path identity")
+            entries[path] = (mode, kind)
+    except (ValueError, UnicodeError) as error:
+        raise BootstrapError("Malformed maintenance tree identity") from error
+    return entries
+
+
+def _model_d_records(output: bytes) -> tuple[tuple[str, str], ...]:
+    if not isinstance(output, bytes):
+        raise BootstrapError("Malformed Model D maintenance diff")
+    if not output.endswith(b"\0"):
+        raise BootstrapError("Malformed Model D maintenance diff")
+    fields = output.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) != len(MODEL_D_MAINTENANCE_PATHS) * 2:
+        raise BootstrapError("Model D maintenance requires exactly three records")
+    records: list[tuple[str, str]] = []
+    try:
+        for index in range(0, len(fields), 2):
+            status_value = fields[index].decode("ascii", errors="strict")
+            path_value = fields[index + 1].decode("utf-8", errors="strict")
+            path = Path(path_value)
+            if (any(char in path_value for char in "\r\n\0")
+                    or path.is_absolute() or "\\" in path_value
+                    or any(part in {"", ".", ".."} for part in path.parts)
+                    or path.as_posix() != path_value):
+                raise BootstrapError("Invalid Model D maintenance path")
+            records.append((status_value, path_value))
+    except (IndexError, UnicodeError) as error:
+        raise BootstrapError("Malformed Model D maintenance diff") from error
+    if len({path_value for _status, path_value in records}) != len(records):
+        raise BootstrapError("Duplicate Model D maintenance path")
+    if tuple(path_value for _status, path_value in records) != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError("Model D maintenance paths do not match protected scope")
+    if any(status_value != "M" for status_value, _path in records):
+        raise BootstrapError("Model D maintenance requires exact modified statuses")
+    return tuple(records)
+
+
+def validate_model_d_maintenance(
+        operation: str, candidate_root: Path, protected_root: Path,
+        candidate_sha: str, protected_sha: str) -> None:
+    """Admit one exact Model D operation during its protected lifecycle.
+
+    The protected authority commit must be the normal two-parent first landing
+    whose first parent is MODEL_D_TRANSITION_BASE.  After the comprehensive
+    Model D merge, protected main has a different first parent and this bridge
+    expires automatically.
+    """
+    if _clean(operation, "maintenance operation") != MODEL_D_MAINTENANCE_OPERATION:
+        raise BootstrapError("Unsupported maintenance operation")
+    candidate_revision = _sha(candidate_sha, "candidate SHA")
+    protected_revision = _sha(protected_sha, "protected SHA")
+    candidate = _root(candidate_root, "candidate root")
+    protected = _root(protected_root, "protected root")
+    if (candidate == protected or candidate.is_relative_to(protected)
+            or protected.is_relative_to(candidate)):
+        raise BootstrapError("Candidate and protected roots must be separate")
+    if _git(candidate, "rev-parse", "HEAD") != candidate_revision:
+        raise BootstrapError("Candidate checkout does not match authorized SHA")
+    if _git(protected, "rev-parse", "HEAD") != protected_revision:
+        raise BootstrapError("Protected checkout does not match protected SHA")
+    if _git(protected, "rev-parse", "refs/remotes/origin/main") != protected_revision:
+        raise BootstrapError("Protected checkout is not protected main")
+    if _canonical_remote(_git(candidate, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("Candidate checkout repository mismatch")
+    if _canonical_remote(_git(protected, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("Protected checkout repository mismatch")
+
+    parents = _git(protected, "rev-list", "--parents", "-n", "1",
+                   protected_revision).split(" ")
+    if (len(parents) != 3 or parents[0] != protected_revision
+            or parents[1] != MODEL_D_TRANSITION_BASE):
+        raise BootstrapError("Model D maintenance operation is expired or bound to another base")
+    _model_d_records(_git_bytes(
+        protected, "diff", "--name-status", "-z", "--no-renames",
+        MODEL_D_TRANSITION_BASE, protected_revision,
+    ))
+
+    validate_protected_universe(protected, protected_revision)
+    validate_protected_universe(candidate, candidate_revision)
+    if extract_candidate_baseline(candidate) != CURRENT_BASELINE:
+        raise BootstrapError("Model D maintenance requires the current protected baseline")
+
+    output = _git_bytes(
+        candidate, "diff", "--name-status", "-z", "--no-renames",
+        protected_revision, candidate_revision,
+    )
+    _model_d_records(output)
+
+    for root, revision in ((protected, protected_revision),
+                           (candidate, candidate_revision)):
+        entries = _tree_entries(root, revision, MODEL_D_MAINTENANCE_PATHS)
+        if tuple(entries) != MODEL_D_MAINTENANCE_PATHS:
+            raise BootstrapError("Model D maintenance tree paths do not match protected scope")
+        if any(identity != ("100644", "blob") for identity in entries.values()):
+            raise BootstrapError("Model D maintenance paths must be regular 100644 blobs")
 
 
 def _validated_outputs(result: BootstrapResult) -> tuple[tuple[str, str], ...]:
@@ -413,6 +544,12 @@ def _parser() -> argparse.ArgumentParser:
             "candidate-sha", "protected-sha", "candidate-root", "protected-root",
             "event-ref", "default-branch", "workflow-ref"):
         evaluate_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
+    maintenance_parser = commands.add_parser("admit-maintenance")
+    for name in (
+            "maintenance-operation", "candidate-sha", "protected-sha",
+            "candidate-root", "protected-root"):
+        maintenance_parser.add_argument(
+            f"--{name}", required=True, default=None, action=_Once)
     return parser
 
 
@@ -437,9 +574,16 @@ def _cli_inputs(arguments: argparse.Namespace) -> BootstrapInputs:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the one supported bootstrap operation and fail closed."""
+    """Run one closed protected bootstrap operation and fail closed."""
     try:
         arguments = _parser().parse_args(argv)
+        if arguments.operation == "admit-maintenance":
+            validate_model_d_maintenance(
+                arguments.maintenance_operation,
+                Path(arguments.candidate_root), Path(arguments.protected_root),
+                arguments.candidate_sha, arguments.protected_sha,
+            )
+            return 0
         if arguments.operation != "evaluate":
             raise BootstrapError("Unsupported bootstrap operation")
         inputs = _cli_inputs(arguments)

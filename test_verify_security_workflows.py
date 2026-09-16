@@ -208,7 +208,7 @@ def duplicate():
             "Check out exact candidate", "Check out independent root policy", "Set up CPython",
             "Assert exact CPython runtime", "Acquire protected Git identity",
             "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
-            "Enforce exact P0b-2 self-PR admission", "Normalize and verify committed policy bytes",
+            "Enforce exact Model D maintenance admission", "Normalize and verify committed policy bytes",
             "Install isolated hash-locked policy environment", "Run candidate Stage A evidence",
             "Run legacy protected health", "Apply protected Stage A baseline to candidate target",
             "Test independent root policy", "Install isolated hash-locked audit environment",
@@ -285,18 +285,20 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         ):
             self.assertIn(fragment, output_step["run"])
 
-        admission = by_name["Enforce exact P0b-2 self-PR admission"]
+        admission = by_name["Enforce exact Model D maintenance admission"]
         self.assertEqual(admission["if"], "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'")
         for fragment in (
-            "1211595f9b0b5d1e76dd892bb210fece54f24b53",
-            "P0b-2 transition expired after protected-main movement",
-            "diff --name-status --no-renames", "$changed.Count -ne 2",
-            "$workflowRecord = 'M' + [char]9 + '.github/workflows/security-workflows-policy.yml'",
-            "$testRecord = 'M' + [char]9 + 'test_verify_security_workflows.py'",
-            "$changed[0] -cne $workflowRecord", "$changed[1] -cne $testRecord",
+            'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py"',
+            "admit-maintenance", "--maintenance-operation MODEL_D_ORCHESTRATION_V1",
+            '--candidate-sha "${{ github.sha }}"',
+            '--protected-sha "${{ steps.protected-git.outputs.protected-sha }}"',
+            '--candidate-root "${{ github.workspace }}/candidate"',
+            '--protected-root "${{ github.workspace }}/policy"',
+            "$LASTEXITCODE -ne 0",
         ):
             self.assertIn(fragment, admission["run"])
-        self.assertNotIn("protected_policy_bootstrap.py", admission["run"])
+        self.assertNotIn("candidate/protected_policy_bootstrap.py", admission["run"])
+        self.assertNotIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", admission["run"])
 
         context_ref = "steps.protected-bootstrap.outputs.evaluation-context"
         self.assertEqual(by_name["Run candidate Stage A evidence"]["if"],
@@ -341,7 +343,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         for step in steps:
             if "run" in step:
                 self.assertIn("$ErrorActionPreference = 'Stop'", step["run"])
-                if step["name"] != "Assert protected bootstrap outputs" and step["name"] != "Enforce exact P0b-2 self-PR admission":
+                if step["name"] != "Assert protected bootstrap outputs":
                     self.assertIn("$LASTEXITCODE -ne 0", step["run"])
 
     def test_policy_dependency_workflow_contract(self) -> None:
@@ -357,10 +359,11 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
             ("steps.protected-bootstrap.outputs.policy-source", "env.POLICY_SOURCE"),
             ("OWNER_AUTHORIZATION -ne 'REQUIRED'", "OWNER_AUTHORIZATION -eq 'OPTIONAL'"),
             ("POST_MERGE_PROOF -ne 'REQUIRED'", "POST_MERGE_PROOF -eq 'OPTIONAL'"),
-            ("diff --name-status --no-renames", "diff --name-only"),
-            ("$changed.Count -ne 2", "$changed.Count -lt 2"),
-            ("'M' + [char]9 + '.github/workflows/security-workflows-policy.yml'",
-             "'M' + [char]9 + 'protected_policy_bootstrap.py'"),
+            ("admit-maintenance", "unknown-maintenance"),
+            ("--maintenance-operation MODEL_D_ORCHESTRATION_V1",
+             "--maintenance-operation CANDIDATE_SELECTED"),
+            ('"${{ github.workspace }}/policy/protected_policy_bootstrap.py" admit-maintenance',
+             '"${{ github.workspace }}/candidate/protected_policy_bootstrap.py" admit-maintenance'),
             ("config core.autocrlf false", "config core.autocrlf true"),
             ("reset --hard $candidateSha", "reset --hard HEAD"),
             ("hash-object --no-filters $workflowPath", "hash-object $workflowPath"),
@@ -620,173 +623,55 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         workflow_path = Path(__file__).parent / ".github/workflows/security-workflows-policy.yml"
         workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
         steps = workflow["jobs"]["security-workflows-policy"]["steps"]
-        admission = next(step for step in steps if step["name"] == "Enforce exact P0b-2 self-PR admission")
+        admission = next(step for step in steps
+                         if step["name"] == "Enforce exact Model D maintenance admission")
         run = admission["run"]
         self.assertEqual(admission["if"],
                          "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'")
-        self.assertIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", run)
-        self.assertIn("P0b-2 transition expired after protected-main movement", run)
-        self.assertIn("diff --name-status --no-renames", run)
-        self.assertIn("$changed.Count -ne 2", run)
-        self.assertEqual(
-            run.count("$workflowRecord = 'M' + [char]9 + '.github/workflows/security-workflows-policy.yml'"), 1)
-        self.assertEqual(
-            run.count("$testRecord = 'M' + [char]9 + 'test_verify_security_workflows.py'"), 1)
-        self.assertEqual(run.count("$changed[0] -cne $workflowRecord"), 1)
-        self.assertEqual(run.count("$changed[1] -cne $testRecord"), 1)
-        self.assertNotIn("'M`t", run)
-        for forbidden in ("protected_policy_bootstrap.py", "requirements-policy.lock",
-                          "requirements-audit.lock",
-                          "[char]9 + 'verify_security_workflows.py'",
-                          "policy-manifest.json"):
+        self.assertEqual(run.count("admit-maintenance"), 1)
+        self.assertEqual(run.count("--maintenance-operation MODEL_D_ORCHESTRATION_V1"), 1)
+        self.assertIn("policy/protected_policy_bootstrap.py", run)
+        self.assertIn("$LASTEXITCODE -ne 0", run)
+        for forbidden in ("candidate/protected_policy_bootstrap.py",
+                          "1211595f9b0b5d1e76dd892bb210fece54f24b53",
+                          "diff --name-status", "$changed"):
             self.assertNotIn(forbidden, run)
 
-    def test_exact_p0b2_admission_executes_production_block_with_git_records(self) -> None:
-        root = Path(__file__).parent.resolve()
-        workflow = yaml.load(
-            (root / ".github/workflows/security-workflows-policy.yml").read_text(encoding="utf-8"),
-            Loader=yaml.BaseLoader,
-        )
-        admission = next(
-            step for step in workflow["jobs"]["security-workflows-policy"]["steps"]
-            if step["name"] == "Enforce exact P0b-2 self-PR admission"
-        )["run"]
-        protected_base = "1211595f9b0b5d1e76dd892bb210fece54f24b53"
-        workflow_member = Path(".github/workflows/security-workflows-policy.yml")
-        test_member = Path("test_verify_security_workflows.py")
+    def test_exact_model_d_admission_scope_is_protected_python(self) -> None:
+        self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+                         "MODEL_D_ORCHESTRATION_V1")
+        self.assertEqual(bootstrap.MODEL_D_TRANSITION_BASE,
+                         "97774bf4f5885a5900a1ccea98c98af12482f9e0")
+        self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_PATHS, (
+            ".github/workflows/security-workflows-policy.yml",
+            "protected_policy_bootstrap.py",
+            "test_verify_security_workflows.py",
+        ))
+        self.assertTrue(callable(bootstrap.validate_model_d_maintenance))
 
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory).resolve()
-            candidate = workspace / "candidate"
-            subprocess.run(
-                ["git", "-c", "safe.directory=*", "clone",
-                 "--no-hardlinks", str(root), str(candidate)],
-                check=True, capture_output=True, text=True,
-            )
-            git(candidate, "config", "user.name", "P0b2 Admission Test")
-            git(candidate, "config", "user.email", "p0b2-admission@example.invalid")
-
-            def append(member: Path) -> None:
-                target = candidate / member
-                target.write_bytes(target.read_bytes() + b"\n")
-
-            def execute(name: str, mutate: object, expected_success: bool) -> None:
-                git(candidate, "reset", "--hard", protected_base)
-                git(candidate, "clean", "-fd")
-                mutate()  # type: ignore[operator]
-                git(candidate, "add", "-A")
-                git(candidate, "commit", "-m", name)
-                target_sha = git(candidate, "rev-parse", "HEAD")
-                rendered = admission.replace("${{ github.workspace }}", workspace.as_posix())
-                rendered = rendered.replace(
-                    "${{ steps.protected-git.outputs.protected-sha }}", protected_base)
-                rendered = rendered.replace("${{ github.sha }}", target_sha)
-                encoded = base64.b64encode(rendered.encode("utf-16le")).decode("ascii")
-                completed = subprocess.run(
-                    ["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-                    cwd=workspace, capture_output=True, text=True,
-                )
-                with self.subTest(name=name):
-                    if expected_success:
-                        self.assertEqual(completed.returncode, 0,
-                                         completed.stderr or completed.stdout)
-                    else:
-                        self.assertNotEqual(completed.returncode, 0)
-
-            def exact_pair() -> None:
-                append(workflow_member)
-                append(test_member)
-
-            execute("exact M M", exact_pair, True)
-            execute("one file", lambda: append(workflow_member), False)
-
-            def third_file() -> None:
-                exact_pair()
-                (candidate / "foreign.txt").write_text("foreign\n", encoding="utf-8")
-
-            execute("third added file", third_file, False)
-
-            def deleted_member() -> None:
-                (candidate / workflow_member).unlink()
-                append(test_member)
-
-            execute("deleted authorized member", deleted_member, False)
-
-            def renamed_member() -> None:
-                git(candidate, "mv", workflow_member.as_posix(),
-                    ".github/workflows/security-workflows-policy-renamed.yml")
-                append(test_member)
-
-            execute("renamed authorized member", renamed_member, False)
-
-            def copied_member() -> None:
-                exact_pair()
-                shutil.copyfile(candidate / workflow_member,
-                                candidate / ".github/workflows/security-workflows-policy-copy.yml")
-
-            execute("copy-like added member", copied_member, False)
-
-            def case_variant() -> None:
-                append(workflow_member)
-                git(candidate, "mv", test_member.as_posix(), "Test_verify_security_workflows.py")
-
-            execute("wrong-case path", case_variant, False)
-
-    def test_exact_p0b2_admission_rejects_delimiter_and_record_mutations(self) -> None:
-        workflow = yaml.load(
-            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
-                encoding="utf-8"), Loader=yaml.BaseLoader)
-        admission = next(
-            step for step in workflow["jobs"]["security-workflows-policy"]["steps"]
-            if step["name"] == "Enforce exact P0b-2 self-PR admission"
-        )["run"]
-        comparison_lines = [
-            line for line in admission.splitlines()
-            if line.startswith(("$workflowRecord = ", "$testRecord = ",
-                                "if ($changed[0] ", "if ($changed[1] "))
-        ]
-        self.assertEqual(len(comparison_lines), 4)
-        expected = (
-            "M\t.github/workflows/security-workflows-policy.yml",
-            "M\ttest_verify_security_workflows.py",
-        )
-
-        def execute(records: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
-            literals = ", ".join("'" + record.replace("'", "''") + "'"
-                                 for record in records)
-            rendered = ("$ErrorActionPreference = 'Stop'\n$changed = @(" + literals
-                        + ")\n" + "\n".join(comparison_lines) + "\n")
-            encoded = base64.b64encode(rendered.encode("utf-16le")).decode("ascii")
-            return subprocess.run(
-                ["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-                capture_output=True, text=True,
-            )
-
-        passed = execute(expected)
-        self.assertEqual(passed.returncode, 0, passed.stderr or passed.stdout)
-        mutations = {
-            "literal backtick-t": ("M`t.github/workflows/security-workflows-policy.yml", expected[1]),
-            "spaces": ("M  .github/workflows/security-workflows-policy.yml", expected[1]),
-            "missing tab": ("M.github/workflows/security-workflows-policy.yml", expected[1]),
-            "extra tab": ("M\t\t.github/workflows/security-workflows-policy.yml", expected[1]),
-            "trailing whitespace": (expected[0] + " ", expected[1]),
-            "malformed status": ("X\t.github/workflows/security-workflows-policy.yml", expected[1]),
-            "case variant": (expected[0], "M\tTest_verify_security_workflows.py"),
-            "backslash path": ("M\t.github\\workflows\\security-workflows-policy.yml",
-                               expected[1]),
-            "duplicate": (expected[0], expected[0]),
-            "reversed order": (expected[1], expected[0]),
-        }
-        for name, records in mutations.items():
-            with self.subTest(name=name):
-                completed = execute(records)
-                self.assertNotEqual(completed.returncode, 0,
-                                    completed.stderr or completed.stdout)
+    def test_exact_model_d_admission_rejects_record_mutations(self) -> None:
+        valid = b"".join(
+            b"M\0" + path.encode("utf-8") + b"\0"
+            for path in bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        bootstrap._model_d_records(valid)
+        for changed in (
+            valid.replace(b"M\0", b"A\0", 1),
+            valid.replace(b"M\0", b"D\0", 1),
+            valid.replace(b"protected_policy_bootstrap.py",
+                          b"Protected_policy_bootstrap.py"),
+            valid.replace(b"protected_policy_bootstrap.py",
+                          b"dir\\protected_policy_bootstrap.py"),
+            valid + b"M\0foreign.py\0",
+        ):
+            with self.subTest(changed=changed), self.assertRaises(
+                    bootstrap.BootstrapError):
+                bootstrap._model_d_records(changed)
 
     def test_stage_a_transition_removal_is_required_after_bootstrap(self) -> None:
         text = (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(encoding="utf-8")
-        self.assertIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", text)
-        self.assertIn("P0b-2 transition expired after protected-main movement", text)
+        self.assertNotIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", text)
+        self.assertNotIn("P0b-2 transition expired after protected-main movement", text)
+        self.assertIn("MODEL_D_ORCHESTRATION_V1", text)
         self.assertNotIn("$stageABase", text)
         self.assertNotIn("Security-policy self-PR exceeds the bounded five-file scope", text)
 
@@ -1442,6 +1327,255 @@ class ProtectedBootstrapP0b1Tests(unittest.TestCase):
         source = Path(bootstrap.__file__).read_text(encoding="utf-8")
         self.assertIn("candidate proposal", source)
         self.assertIn("cannot authorize its own landing", source)
+
+
+class ModelDMaintenanceAdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.protected = self.base / "protected authority with spaces"
+        source = Path(__file__).parent.resolve()
+        git_metadata = source / ".git"
+        source_git_dir = git_metadata
+        if git_metadata.is_file():
+            source_git_dir = Path(
+                git_metadata.read_text(encoding="utf-8").strip().removeprefix("gitdir: ")
+            ).resolve()
+        subprocess.run(
+            ["git", "-c", f"safe.directory={source}",
+             "-c", f"safe.directory={source_git_dir}", "clone", "--no-hardlinks",
+             str(source), str(self.protected)],
+            check=True, capture_output=True, text=True,
+        )
+        self._configure(self.protected)
+        git(self.protected, "checkout", "-B", "main",
+            bootstrap.MODEL_D_TRANSITION_BASE)
+        git(self.protected, "checkout", "-b", "d0-first-landing")
+        self._modify(self.protected, bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        git(self.protected, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        git(self.protected, "commit", "-m", "D0 first landing")
+        git(self.protected, "checkout", "main")
+        git(self.protected, "merge", "--no-ff", "d0-first-landing",
+            "-m", "Merge D0 first landing")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main",
+            self.protected_sha)
+        self.candidate = self._candidate("valid", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+
+    @staticmethod
+    def _configure(root: Path) -> None:
+        git(root, "config", "user.name", "Model D Admission Test")
+        git(root, "config", "user.email", "model-d@example.invalid")
+        git(root, "config", "core.autocrlf", "false")
+        git(root, "reset", "--hard", "HEAD")
+        git(root, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+
+    @staticmethod
+    def _modify(root: Path, paths: tuple[str, ...]) -> None:
+        for name in paths:
+            path = root / name
+            path.write_bytes(path.read_bytes() + b"\n# model-d-admission-test\n")
+
+    def _candidate(self, name: str, paths: tuple[str, ...],
+                   mutate=None) -> Path:
+        root = self.base / f"candidate-{name}"
+        subprocess.run(
+            ["git", "clone", "--no-hardlinks", str(self.protected), str(root)],
+            check=True, capture_output=True, text=True,
+        )
+        self._configure(root)
+        git(root, "checkout", "-b", f"candidate-{name}")
+        self._modify(root, paths)
+        git(root, "add", "-A")
+        if mutate is not None:
+            mutate(root)
+        git(root, "commit", "-m", name)
+        return root
+
+    def _validate(self, candidate: Path | None = None,
+                  protected: Path | None = None,
+                  operation: str | None = None) -> None:
+        candidate_root = candidate or self.candidate
+        protected_root = protected or self.protected
+        bootstrap.validate_model_d_maintenance(
+            (bootstrap.MODEL_D_MAINTENANCE_OPERATION
+             if operation is None else operation),
+            candidate_root, protected_root,
+            git(candidate_root, "rev-parse", "HEAD"),
+            git(protected_root, "rev-parse", "HEAD"),
+        )
+
+    def test_exact_operation_base_scope_and_required_dispositions(self) -> None:
+        self._validate()
+        self.assertEqual(bootstrap.MODEL_D_TRANSITION_BASE,
+                         "97774bf4f5885a5900a1ccea98c98af12482f9e0")
+        self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_PATHS, (
+            ".github/workflows/security-workflows-policy.yml",
+            "protected_policy_bootstrap.py",
+            "test_verify_security_workflows.py",
+        ))
+        self.assertEqual(bootstrap.OWNER_AUTHORIZATION, "REQUIRED")
+        self.assertEqual(bootstrap.POST_MERGE_PROOF, "REQUIRED")
+        self.assertEqual(len(bootstrap._OUTPUT_KEYS), 5)
+
+    def test_operation_grammar_and_cli_fail_closed(self) -> None:
+        arguments = [
+            "admit-maintenance", "--maintenance-operation",
+            bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+            "--candidate-sha", self.candidate_sha,
+            "--protected-sha", self.protected_sha,
+            "--candidate-root", str(self.candidate),
+            "--protected-root", str(self.protected),
+        ]
+        completed = subprocess.run(
+            [os.sys.executable, "-I", "-S",
+             str(Path(bootstrap.__file__).resolve()), *arguments],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        for bad in (
+            arguments[2:],
+            ["unknown-operation"],
+            arguments[:2] + ["UNKNOWN"] + arguments[3:],
+            arguments + ["--maintenance-operation",
+                         bootstrap.MODEL_D_MAINTENANCE_OPERATION],
+            arguments + ["--candidate-baseline", bootstrap.CURRENT_BASELINE],
+            arguments + ["--protected-base", bootstrap.MODEL_D_TRANSITION_BASE],
+            arguments + ["--policy-source", "candidate"],
+            arguments + ["--protected-universe", "candidate"],
+        ):
+            with self.subTest(arguments=bad):
+                result = subprocess.run(
+                    [os.sys.executable, "-I", "-S",
+                     str(Path(bootstrap.__file__).resolve()), *bad],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+        for operation in ("", "model-d-orchestration-v1", "latest",
+                          "MODEL_D_ORCHESTRATION_V1\nOTHER"):
+            with self.subTest(operation=operation), self.assertRaises(
+                    bootstrap.BootstrapError):
+                self._validate(operation=operation)
+
+    def test_record_parser_rejects_count_status_path_and_duplicates(self) -> None:
+        valid = b"".join(
+            b"M\0" + path.encode("utf-8") + b"\0"
+            for path in bootstrap.MODEL_D_MAINTENANCE_PATHS
+        )
+        self.assertEqual(
+            tuple(path for _status, path in bootstrap._model_d_records(valid)),
+            bootstrap.MODEL_D_MAINTENANCE_PATHS,
+        )
+        paths = bootstrap.MODEL_D_MAINTENANCE_PATHS
+        invalid = (
+            b"",
+            b"M\0" + paths[0].encode() + b"\0",
+            valid + b"M\0foreign.py\0",
+            valid.replace(b"M\0", b"A\0", 1),
+            valid.replace(b"M\0", b"D\0", 1),
+            valid.replace(b"M\0", b"R100\0", 1),
+            valid.replace(b"M\0", b"C100\0", 1),
+            valid.replace(paths[1].encode(), paths[0].encode()),
+            valid.replace(paths[1].encode(), b"Protected_policy_bootstrap.py"),
+            valid.replace(paths[1].encode(), b"dir\\protected_policy_bootstrap.py"),
+            valid.replace(paths[1].encode(), b"../protected_policy_bootstrap.py"),
+            valid.replace(paths[1].encode(), b"C:/protected_policy_bootstrap.py"),
+            valid.replace(paths[1].encode(), paths[1].encode() + b"\nforeign"),
+            valid[:-1],
+        )
+        for output in invalid:
+            with self.subTest(output=output), self.assertRaises(
+                    bootstrap.BootstrapError):
+                bootstrap._model_d_records(output)
+
+    def test_real_git_rejects_wrong_counts_foreign_and_deleted_paths(self) -> None:
+        def foreign(root: Path) -> None:
+            (root / "foreign.py").write_text("foreign\n", encoding="utf-8")
+            git(root, "add", "foreign.py")
+
+        def delete(root: Path) -> None:
+            git(root, "rm", bootstrap.MODEL_D_MAINTENANCE_PATHS[0])
+
+        def case_mutation(root: Path) -> None:
+            git(root, "mv", "protected_policy_bootstrap.py",
+                "Protected_policy_bootstrap.py")
+
+        cases = (
+            ("one", bootstrap.MODEL_D_MAINTENANCE_PATHS[:1], None),
+            ("two", bootstrap.MODEL_D_MAINTENANCE_PATHS[:2], None),
+            ("four", bootstrap.MODEL_D_MAINTENANCE_PATHS, foreign),
+            ("delete", bootstrap.MODEL_D_MAINTENANCE_PATHS[1:], delete),
+            ("case", bootstrap.MODEL_D_MAINTENANCE_PATHS[::2], case_mutation),
+        )
+        for name, paths, mutator in cases:
+            candidate = self._candidate(name, paths, mutator)
+            with self.subTest(name=name), self.assertRaises(bootstrap.BootstrapError):
+                self._validate(candidate=candidate)
+
+    def test_real_git_rejects_mode_symlink_and_gitlink(self) -> None:
+        def mode(root: Path) -> None:
+            git(root, "update-index", "--chmod=+x", "protected_policy_bootstrap.py")
+
+        def symlink(root: Path) -> None:
+            blob = git(root, "hash-object", "requirements-policy.lock")
+            git(root, "update-index", "--cacheinfo",
+                "120000," + blob + ",protected_policy_bootstrap.py")
+
+        def gitlink(root: Path) -> None:
+            git(root, "update-index", "--cacheinfo",
+                "160000," + self.protected_sha + ",protected_policy_bootstrap.py")
+
+        for name, mutator in (("mode", mode), ("symlink", symlink),
+                              ("gitlink", gitlink)):
+            candidate = self._candidate(
+                name, bootstrap.MODEL_D_MAINTENANCE_PATHS, mutator)
+            with self.subTest(name=name), self.assertRaises(bootstrap.BootstrapError):
+                self._validate(candidate=candidate)
+
+    def test_base_binding_expiry_remote_and_candidate_substitution(self) -> None:
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_model_d_maintenance(
+                bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+                self.candidate, self.protected, self.candidate_sha,
+                bootstrap.MODEL_D_TRANSITION_BASE,
+            )
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/other.git")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._validate()
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+
+        git(self.protected, "checkout", "-b", "consume-operation")
+        git(self.protected, "fetch", str(self.candidate), self.candidate_sha)
+        git(self.protected, "merge", "--no-ff", "FETCH_HEAD",
+            "-m", "Consume Model D operation")
+        consumed_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", consumed_sha)
+        replay = self._candidate("replay", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._validate(candidate=replay, protected=self.protected)
+
+    def test_workflow_uses_only_protected_bridge_and_preserves_outputs(self) -> None:
+        workflow = yaml.load(
+            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
+                encoding="utf-8"), Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        admission = next(
+            step for step in steps
+            if step["name"] == "Enforce exact Model D maintenance admission")
+        run = admission["run"]
+        self.assertEqual(run.count("admit-maintenance"), 1)
+        self.assertIn("policy/protected_policy_bootstrap.py", run)
+        self.assertNotIn("candidate/protected_policy_bootstrap.py", run)
+        self.assertNotIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", run)
+        self.assertEqual(bootstrap._OUTPUT_KEYS, (
+            "evaluation-context", "policy-source", "version-disposition",
+            "owner-authorization", "post-merge-proof",
+        ))
 
 
 if __name__ == "__main__":
