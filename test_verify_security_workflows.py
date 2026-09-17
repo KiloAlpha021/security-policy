@@ -198,7 +198,11 @@ def duplicate():
         workflow = yaml.load(text, Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group", "workflow_dispatch"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
-        self.assertEqual(workflow["env"], {"POLICY_BASELINE_VERSION": self.BASELINE_VERSION})
+        self.assertEqual(workflow["env"], {
+            "POLICY_BASELINE_VERSION": self.BASELINE_VERSION,
+            "MODEL_D_MAINTENANCE_GENERATION":
+                bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+        })
         self.assertNotIn("continue-on-error", text)
         self.assertNotIn("GITHUB_ENV", text)
 
@@ -640,8 +644,14 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
     def test_exact_model_d_admission_scope_is_protected_python(self) -> None:
         self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_OPERATION,
                          "MODEL_D_ORCHESTRATION_V1")
-        self.assertEqual(bootstrap.MODEL_D_TRANSITION_BASE,
-                         "97774bf4f5885a5900a1ccea98c98af12482f9e0")
+        self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+                         "MODEL_D_ORCHESTRATION_V1_GENERATION_1")
+        self.assertEqual(
+            bootstrap.MODEL_D_MAINTENANCE_LIFECYCLE,
+            "MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE")
+        self.assertEqual(
+            bootstrap.MODEL_D_MAINTENANCE_HISTORY_ANCHOR,
+            "2784fc943f9eebcab4e468980ad0040499eadc52")
         self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_PATHS, (
             ".github/workflows/security-workflows-policy.yml",
             "protected_policy_bootstrap.py",
@@ -1352,14 +1362,15 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         )
         self._configure(self.protected)
         git(self.protected, "checkout", "-B", "main",
-            bootstrap.MODEL_D_TRANSITION_BASE)
-        git(self.protected, "checkout", "-b", "d0-first-landing")
-        self._modify(self.protected, bootstrap.MODEL_D_MAINTENANCE_PATHS)
+            "2784fc943f9eebcab4e468980ad0040499eadc52")
+        git(self.protected, "checkout", "-b", "d0-generation-repair")
+        for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
+            (self.protected / name).write_bytes((source / name).read_bytes())
         git(self.protected, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
-        git(self.protected, "commit", "-m", "D0 first landing")
+        git(self.protected, "commit", "-m", "Repair D0 generation lifecycle")
         git(self.protected, "checkout", "main")
-        git(self.protected, "merge", "--no-ff", "d0-first-landing",
-            "-m", "Merge D0 first landing")
+        git(self.protected, "merge", "--no-ff", "d0-generation-repair",
+            "-m", "Merge D0 generation repair")
         self.protected_sha = git(self.protected, "rev-parse", "HEAD")
         git(self.protected, "update-ref", "refs/remotes/origin/main",
             self.protected_sha)
@@ -1388,6 +1399,19 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         for name in paths:
             path = root / name
             path.write_bytes(path.read_bytes() + b"\n# model-d-admission-test\n")
+        if "protected_policy_bootstrap.py" in paths:
+            path = root / "protected_policy_bootstrap.py"
+            data = path.read_bytes()
+            old = (b'MODEL_D_MAINTENANCE_LIFECYCLE = '
+                   b'"MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE"')
+            new = (b'MODEL_D_MAINTENANCE_LIFECYCLE = '
+                   b'"MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED"')
+            if data.count(old) == 1 and data.count(new) == 0:
+                path.write_bytes(data.replace(old, new))
+            elif data.count(old) == 0 and data.count(new) == 1:
+                pass
+            else:
+                raise AssertionError("D0 candidate active-state declaration mismatch")
 
     def _candidate(self, name: str, paths: tuple[str, ...],
                    mutate=None) -> Path:
@@ -1408,12 +1432,15 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
 
     def _validate(self, candidate: Path | None = None,
                   protected: Path | None = None,
-                  operation: str | None = None) -> None:
+                  operation: str | None = None,
+                  generation: str | None = None) -> None:
         candidate_root = candidate or self.candidate
         protected_root = protected or self.protected
         bootstrap.validate_model_d_maintenance(
             (bootstrap.MODEL_D_MAINTENANCE_OPERATION
              if operation is None else operation),
+            (bootstrap.MODEL_D_MAINTENANCE_GENERATION
+             if generation is None else generation),
             candidate_root, protected_root,
             git(candidate_root, "rev-parse", "HEAD"),
             git(protected_root, "rev-parse", "HEAD"),
@@ -1421,8 +1448,11 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
 
     def test_exact_operation_base_scope_and_required_dispositions(self) -> None:
         self._validate()
-        self.assertEqual(bootstrap.MODEL_D_TRANSITION_BASE,
-                         "97774bf4f5885a5900a1ccea98c98af12482f9e0")
+        self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+                         "MODEL_D_ORCHESTRATION_V1_GENERATION_1")
+        self.assertEqual(
+            bootstrap.MODEL_D_MAINTENANCE_LIFECYCLE,
+            "MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE")
         self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_PATHS, (
             ".github/workflows/security-workflows-policy.yml",
             "protected_policy_bootstrap.py",
@@ -1436,6 +1466,8 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         arguments = [
             "admit-maintenance", "--maintenance-operation",
             bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+            "--maintenance-generation",
+            bootstrap.MODEL_D_MAINTENANCE_GENERATION,
             "--candidate-sha", self.candidate_sha,
             "--protected-sha", self.protected_sha,
             "--candidate-root", str(self.candidate),
@@ -1453,8 +1485,10 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
             arguments[:2] + ["UNKNOWN"] + arguments[3:],
             arguments + ["--maintenance-operation",
                          bootstrap.MODEL_D_MAINTENANCE_OPERATION],
+            arguments + ["--maintenance-generation",
+                         bootstrap.MODEL_D_MAINTENANCE_GENERATION],
             arguments + ["--candidate-baseline", bootstrap.CURRENT_BASELINE],
-            arguments + ["--protected-base", bootstrap.MODEL_D_TRANSITION_BASE],
+            arguments + ["--protected-base", "latest"],
             arguments + ["--policy-source", "candidate"],
             arguments + ["--protected-universe", "candidate"],
         ):
@@ -1470,6 +1504,11 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
             with self.subTest(operation=operation), self.assertRaises(
                     bootstrap.BootstrapError):
                 self._validate(operation=operation)
+        for generation in ("", "generation-1", "latest",
+                           "MODEL_D_ORCHESTRATION_V1_GENERATION_1\nOTHER"):
+            with self.subTest(generation=generation), self.assertRaises(
+                    bootstrap.BootstrapError):
+                self._validate(generation=generation)
 
     def test_record_parser_rejects_count_status_path_and_duplicates(self) -> None:
         valid = b"".join(
@@ -1550,8 +1589,9 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         with self.assertRaises(bootstrap.BootstrapError):
             bootstrap.validate_model_d_maintenance(
                 bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+                bootstrap.MODEL_D_MAINTENANCE_GENERATION,
                 self.candidate, self.protected, self.candidate_sha,
-                bootstrap.MODEL_D_TRANSITION_BASE,
+                "97774bf4f5885a5900a1ccea98c98af12482f9e0",
             )
         git(self.candidate, "remote", "set-url", "origin",
             "https://github.com/KiloAlpha021/other.git")
@@ -1570,6 +1610,256 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         with self.assertRaises(bootstrap.BootstrapError):
             self._validate(candidate=replay, protected=self.protected)
 
+    def test_generation_survives_sequential_test_only_maintenance(self) -> None:
+        for index in range(2):
+            path = self.protected / "test_verify_security_workflows.py"
+            path.write_bytes(path.read_bytes() + f"\n# maintenance-{index}\n".encode())
+            git(self.protected, "add", "test_verify_security_workflows.py")
+            git(self.protected, "commit", "-m", f"Protected test maintenance {index}")
+            self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+            git(self.protected, "update-ref", "refs/remotes/origin/main",
+                self.protected_sha)
+            candidate = self._candidate(
+                f"after-maintenance-{index}", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+            self._validate(candidate=candidate)
+
+    def test_generation_survives_unrelated_ancestry_movement(self) -> None:
+        path = self.protected / "README.md"
+        path.write_bytes(path.read_bytes() + b"\n")
+        git(self.protected, "add", "README.md")
+        git(self.protected, "commit", "-m", "Unrelated governed maintenance")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main",
+            self.protected_sha)
+        candidate = self._candidate(
+            "after-unrelated-maintenance", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        self._validate(candidate=candidate)
+
+    def test_protected_generation_mutations_fail_closed(self) -> None:
+        mutations = (
+            ("workflow-generation", ".github/workflows/security-workflows-policy.yml",
+             b"MODEL_D_ORCHESTRATION_V1_GENERATION_1",
+             b"MODEL_D_ORCHESTRATION_V1_GENERATION_2"),
+            ("bootstrap-generation", "protected_policy_bootstrap.py",
+             b'MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_1"',
+             b'MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_2"'),
+            ("bootstrap-state", "protected_policy_bootstrap.py",
+             b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE',
+             b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED'),
+        )
+        for name, relative, old, new in mutations:
+            root = self.base / f"protected-{name}"
+            subprocess.run(
+                ["git", "clone", "--no-hardlinks", "--no-checkout",
+                 str(self.protected), str(root)],
+                check=True, capture_output=True, text=True)
+            git(root, "config", "user.name", "Model D Admission Test")
+            git(root, "config", "user.email", "model-d@example.invalid")
+            git(root, "config", "core.autocrlf", "false")
+            git(root, "checkout", "-B", "main", self.protected_sha)
+            git(root, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            path = root / relative
+            data = path.read_bytes()
+            self.assertEqual(data.count(old), 1)
+            path.write_bytes(data.replace(old, new))
+            git(root, "add", relative)
+            git(root, "commit", "-m", name)
+            changed_sha = git(root, "rev-parse", "HEAD")
+            git(root, "update-ref", "refs/remotes/origin/main", changed_sha)
+            with self.subTest(name=name), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.validate_model_d_maintenance(
+                    bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+                    bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+                    self.candidate, root, self.candidate_sha, changed_sha)
+
+    def test_candidate_cannot_substitute_or_extend_generation(self) -> None:
+        cases = (
+            ("candidate-generation", ".github/workflows/security-workflows-policy.yml",
+             b"MODEL_D_ORCHESTRATION_V1_GENERATION_1",
+             b"MODEL_D_ORCHESTRATION_V1_GENERATION_2"),
+            ("candidate-active", "protected_policy_bootstrap.py",
+             b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED',
+             b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE'),
+            ("candidate-missing", "protected_policy_bootstrap.py",
+             b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED', b""),
+            ("candidate-malformed", "protected_policy_bootstrap.py",
+             b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED',
+             b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:LATEST'),
+        )
+        for name, relative, old, new in cases:
+            candidate = self._candidate(name, bootstrap.MODEL_D_MAINTENANCE_PATHS)
+            path = candidate / relative
+            data = path.read_bytes()
+            self.assertEqual(data.count(old), 1)
+            path.write_bytes(data.replace(old, new))
+            git(candidate, "add", relative)
+            git(candidate, "commit", "--amend", "--no-edit")
+            with self.subTest(name=name), self.assertRaises(bootstrap.BootstrapError):
+                self._validate(candidate=candidate)
+
+    def test_full_lifecycle_consumption_and_replay_remain_expired(self) -> None:
+        self._validate()
+        git(self.protected, "checkout", "-b", "comprehensive-model-d")
+        git(self.protected, "fetch", str(self.candidate), self.candidate_sha)
+        git(self.protected, "merge", "--no-ff", "FETCH_HEAD",
+            "-m", "Consume comprehensive Model D generation")
+        consumed_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", consumed_sha)
+        replay = self._candidate("immediate-replay", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._validate(candidate=replay, protected=self.protected)
+        path = self.protected / "test_verify_security_workflows.py"
+        path.write_bytes(path.read_bytes() + b"\n# post-consumption-maintenance\n")
+        git(self.protected, "add", "test_verify_security_workflows.py")
+        git(self.protected, "commit", "-m", "Post-consumption test maintenance")
+        later_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", later_sha)
+        replay = self._candidate("later-replay", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._validate(candidate=replay, protected=self.protected)
+        bootstrap_path = self.protected / "protected_policy_bootstrap.py"
+        data = bootstrap_path.read_bytes()
+        consumed = b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED'
+        active = b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE'
+        self.assertEqual(data.count(consumed), 1)
+        bootstrap_path.write_bytes(data.replace(consumed, active))
+        git(self.protected, "add", "protected_policy_bootstrap.py")
+        git(self.protected, "commit", "-m", "Attempt generation rollback")
+        rollback_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", rollback_sha)
+        replay = self._candidate("rollback-replay", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._validate(candidate=replay, protected=self.protected)
+
+    def test_protected_history_completeness_fails_closed(self) -> None:
+        bootstrap._require_model_d_history(self.protected, self.protected_sha)
+
+        shallow = self.base / "protected-shallow"
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", "main",
+             self.protected.as_uri(), str(shallow)],
+            check=True, capture_output=True, text=True)
+        git(shallow, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        shallow_sha = git(shallow, "rev-parse", "HEAD")
+        git(shallow, "update-ref", "refs/remotes/origin/main", shallow_sha)
+        self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._require_model_d_history(shallow, shallow_sha)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_model_d_maintenance(
+                bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+                bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+                self.candidate, shallow, self.candidate_sha, shallow_sha)
+
+        unrelated = self.base / "protected-unrelated"
+        unrelated.mkdir()
+        git(unrelated, "init", "-b", "main")
+        git(unrelated, "config", "user.name", "Model D Admission Test")
+        git(unrelated, "config", "user.email", "model-d@example.invalid")
+        (unrelated / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+        git(unrelated, "add", ".")
+        git(unrelated, "commit", "-m", "unrelated history")
+        git(unrelated, "fetch", str(self.protected),
+            bootstrap.MODEL_D_MAINTENANCE_HISTORY_ANCHOR)
+        unrelated_sha = git(unrelated, "rev-parse", "HEAD")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._require_model_d_history(unrelated, unrelated_sha)
+
+        original = bootstrap._git_bytes
+        def fail_git(root: Path, *arguments: str) -> bytes:
+            if arguments and arguments[0] == "cat-file":
+                raise bootstrap.BootstrapError("simulated unavailable history object")
+            return original(root, *arguments)
+        with mock.patch.object(bootstrap, "_git_bytes", side_effect=fail_git):
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._require_model_d_history(
+                    self.protected, self.protected_sha)
+
+    def test_candidate_history_cannot_replace_protected_history(self) -> None:
+        bootstrap._require_model_d_history(self.protected, self.protected_sha)
+        shallow_candidate = self.base / "candidate-shallow-history"
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", "main",
+             self.protected.as_uri(), str(shallow_candidate)],
+            check=True, capture_output=True, text=True)
+        self.assertEqual(
+            git(shallow_candidate, "rev-parse", "--is-shallow-repository"), "true")
+        bootstrap._require_model_d_history(self.protected, self.protected_sha)
+
+    def test_protected_history_reads_cannot_lazy_fetch(self) -> None:
+        with mock.patch.object(
+                bootstrap.subprocess, "run",
+                wraps=bootstrap.subprocess.run) as run:
+            bootstrap._require_model_d_history(
+                self.protected, self.protected_sha)
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+
+    def test_generation_specific_consumption_is_isolated(self) -> None:
+        self.assertFalse(bootstrap._model_d_generation_was_consumed(
+            self.protected, self.protected_sha,
+            "MODEL_D_ORCHESTRATION_V1_GENERATION_2"))
+        git(self.protected, "checkout", "-b", "consume-g1-for-isolation")
+        git(self.protected, "fetch", str(self.candidate), self.candidate_sha)
+        git(self.protected, "merge", "--no-ff", "FETCH_HEAD",
+            "-m", "Consume generation one")
+        consumed_sha = git(self.protected, "rev-parse", "HEAD")
+        self.assertTrue(bootstrap._model_d_generation_was_consumed(
+            self.protected, consumed_sha,
+            "MODEL_D_ORCHESTRATION_V1_GENERATION_1"))
+        self.assertFalse(bootstrap._model_d_generation_was_consumed(
+            self.protected, consumed_sha,
+            "MODEL_D_ORCHESTRATION_V1_GENERATION_2"))
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._model_d_generation_was_consumed(
+                self.protected, consumed_sha, "foreign-generation")
+
+    def test_lifecycle_record_rejects_duplicate_conflict_and_malformed(self) -> None:
+        cases = (
+            ("duplicate", b'\nMODEL_D_MAINTENANCE_LIFECYCLE = '
+             b'"MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED"\n'),
+            ("conflict", b'\nMODEL_D_MAINTENANCE_LIFECYCLE = '
+             b'"MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE"\n'),
+            ("malformed", b'\nMODEL_D_MAINTENANCE_LIFECYCLE="latest"\n'),
+        )
+        for name, addition in cases:
+            candidate = self._candidate(name, bootstrap.MODEL_D_MAINTENANCE_PATHS)
+            path = candidate / "protected_policy_bootstrap.py"
+            path.write_bytes(path.read_bytes() + addition)
+            git(candidate, "add", "protected_policy_bootstrap.py")
+            git(candidate, "commit", "--amend", "--no-edit")
+            with self.subTest(name=name), self.assertRaises(bootstrap.BootstrapError):
+                self._validate(candidate=candidate)
+
+    def test_accumulated_d1_d4_path_reaches_one_d5_consumption(self) -> None:
+        root = self.base / "accumulated-model-d"
+        subprocess.run(
+            ["git", "clone", "--no-hardlinks", "--no-checkout",
+             str(self.protected), str(root)],
+            check=True, capture_output=True, text=True)
+        self._configure(root)
+        git(root, "checkout", "-b", "accumulated-model-d")
+        bootstrap_path = root / "protected_policy_bootstrap.py"
+        tests_path = root / "test_verify_security_workflows.py"
+        workflow_path = root / ".github/workflows/security-workflows-policy.yml"
+        bootstrap_path.write_bytes(
+            bootstrap_path.read_bytes() + b"\n# simulated-d1\n# simulated-d2\n")
+        tests_path.write_bytes(
+            tests_path.read_bytes() + b"\n# simulated-d1-d2\n# simulated-d4\n")
+        workflow_path.write_bytes(
+            workflow_path.read_bytes() + b"\n# simulated-d3\n")
+        data = bootstrap_path.read_bytes()
+        active = b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE'
+        consumed = b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED'
+        self.assertEqual(data.count(active), 1)
+        bootstrap_path.write_bytes(data.replace(active, consumed))
+        git(root, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        git(root, "commit", "-m", "Comprehensive D1-D4 Model D candidate")
+        self._validate(candidate=root)
+
     def test_workflow_uses_only_protected_bridge_and_preserves_outputs(self) -> None:
         workflow = yaml.load(
             (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
@@ -1580,6 +1870,8 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
             if step["name"] == "Enforce exact Model D maintenance admission")
         run = admission["run"]
         self.assertEqual(run.count("admit-maintenance"), 1)
+        self.assertIn(
+            '--maintenance-generation "${{ env.MODEL_D_MAINTENANCE_GENERATION }}"', run)
         self.assertIn("policy/protected_policy_bootstrap.py", run)
         self.assertNotIn("candidate/protected_policy_bootstrap.py", run)
         self.assertNotIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", run)

@@ -27,7 +27,9 @@ TRANSITION_PROTECTED_BASE = "76a811e76edbefc76ab1baf20795e2755f5bb794"
 OWNER_AUTHORIZATION = "REQUIRED"
 POST_MERGE_PROOF = "REQUIRED"
 MODEL_D_MAINTENANCE_OPERATION = "MODEL_D_ORCHESTRATION_V1"
-MODEL_D_TRANSITION_BASE = "97774bf4f5885a5900a1ccea98c98af12482f9e0"
+MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_1"
+MODEL_D_MAINTENANCE_HISTORY_ANCHOR = "2784fc943f9eebcab4e468980ad0040499eadc52"
+MODEL_D_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE"
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
     "protected_policy_bootstrap.py",
@@ -177,6 +179,7 @@ def validate_protected_universe(protected_root: Path, protected_sha: str) -> Non
         completed = subprocess.run(
             ["git", "-C", str(root), "ls-tree", "-z", revision, "--", *PROTECTED_UNIVERSE],
             check=True, capture_output=True,
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise BootstrapError("Protected universe Git validation failed") from error
@@ -205,6 +208,7 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
         completed = subprocess.run(
             ["git", "-C", str(root), *arguments], check=True,
             capture_output=True,
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise BootstrapError("Git maintenance admission failed") from error
@@ -264,18 +268,78 @@ def _model_d_records(output: bytes) -> tuple[tuple[str, str], ...]:
     return tuple(records)
 
 
-def validate_model_d_maintenance(
-        operation: str, candidate_root: Path, protected_root: Path,
-        candidate_sha: str, protected_sha: str) -> None:
-    """Admit one exact Model D operation during its protected lifecycle.
+def _model_d_generation_state(root: Path, revision: str) -> str:
+    """Read the closed generation state from protected Git objects."""
+    bootstrap_source = _git_bytes(
+        root, "show", f"{revision}:protected_policy_bootstrap.py")
+    workflow_source = _git_bytes(
+        root, "show", f"{revision}:.github/workflows/security-workflows-policy.yml")
+    try:
+        bootstrap_text = bootstrap_source.decode("utf-8", errors="strict")
+        workflow_text = workflow_source.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise BootstrapError("Invalid Model D generation source encoding") from error
+    if any(value in bootstrap_source + workflow_source for value in (b"\r", b"\0")):
+        raise BootstrapError("Invalid Model D generation source bytes")
+    generation_line = (
+        f'MODEL_D_MAINTENANCE_GENERATION = "{MODEL_D_MAINTENANCE_GENERATION}"')
+    lifecycle_name = "MODEL_D_MAINTENANCE_" + "LIFECYCLE"
+    lifecycle_lines = re.findall(
+        rf"^{re.escape(lifecycle_name)}[^\n]*$", bootstrap_text, re.MULTILINE)
+    lifecycle_pattern = re.compile(
+        rf'^{re.escape(lifecycle_name)} = "'
+        rf'({re.escape(MODEL_D_MAINTENANCE_GENERATION)}):(ACTIVE|CONSUMED)"$')
+    workflow_generation = (
+        "  MODEL_D_MAINTENANCE_GENERATION: " + MODEL_D_MAINTENANCE_GENERATION)
+    invocation = '--maintenance-generation "${{ env.MODEL_D_MAINTENANCE_GENERATION }}"'
+    if (bootstrap_text.count(generation_line) != 1
+            or workflow_text.count(workflow_generation) != 1
+            or workflow_text.count(invocation) != 1):
+        raise BootstrapError("Model D maintenance generation identity mismatch")
+    if len(lifecycle_lines) != 1:
+        raise BootstrapError("Missing or malformed Model D lifecycle record")
+    lifecycle = lifecycle_pattern.fullmatch(lifecycle_lines[0])
+    if lifecycle is None:
+        raise BootstrapError("Missing or malformed Model D lifecycle record")
+    return lifecycle.group(2)
 
-    The protected authority commit must be the normal two-parent first landing
-    whose first parent is MODEL_D_TRANSITION_BASE.  After the comprehensive
-    Model D merge, protected main has a different first parent and this bridge
-    expires automatically.
-    """
+
+def _require_model_d_history(root: Path, revision: str) -> None:
+    """Require sufficient protected ancestry for lifecycle consumption checks."""
+    shallow = _git_bytes(root, "rev-parse", "--is-shallow-repository")
+    if shallow != b"false\n":
+        raise BootstrapError("Protected lifecycle history is shallow or malformed")
+    _git_bytes(
+        root, "cat-file", "-e", MODEL_D_MAINTENANCE_HISTORY_ANCHOR + "^{commit}")
+    _git_bytes(
+        root, "merge-base", "--is-ancestor",
+        MODEL_D_MAINTENANCE_HISTORY_ANCHOR, revision)
+
+
+def _model_d_generation_was_consumed(
+        root: Path, revision: str,
+        generation: str = MODEL_D_MAINTENANCE_GENERATION) -> bool:
+    """Reject an ACTIVE rollback whose protected history already consumed it."""
+    if re.fullmatch(r"MODEL_D_ORCHESTRATION_V1_GENERATION_[1-9][0-9]*", generation) is None:
+        raise BootstrapError("Malformed Model D maintenance generation")
+    lifecycle_name = "MODEL_D_MAINTENANCE_" + "LIFECYCLE"
+    declaration = f'{lifecycle_name} = "{generation}:CON' + 'SUMED"'
+    output = _git_bytes(
+        root, "log", "--format=%H", "-S" + declaration,
+        f"{MODEL_D_MAINTENANCE_HISTORY_ANCHOR}..{revision}",
+        "--", "protected_policy_bootstrap.py")
+    return bool(output.strip())
+
+
+def validate_model_d_maintenance(
+        operation: str, generation: str,
+        candidate_root: Path, protected_root: Path,
+        candidate_sha: str, protected_sha: str) -> None:
+    """Admit one exact Model D operation from one protected generation."""
     if _clean(operation, "maintenance operation") != MODEL_D_MAINTENANCE_OPERATION:
         raise BootstrapError("Unsupported maintenance operation")
+    if _clean(generation, "maintenance generation") != MODEL_D_MAINTENANCE_GENERATION:
+        raise BootstrapError("Unsupported maintenance generation")
     candidate_revision = _sha(candidate_sha, "candidate SHA")
     protected_revision = _sha(protected_sha, "protected SHA")
     candidate = _root(candidate_root, "candidate root")
@@ -294,15 +358,10 @@ def validate_model_d_maintenance(
     if _canonical_remote(_git(protected, "remote", "get-url", "origin")) != REPOSITORY:
         raise BootstrapError("Protected checkout repository mismatch")
 
-    parents = _git(protected, "rev-list", "--parents", "-n", "1",
-                   protected_revision).split(" ")
-    if (len(parents) != 3 or parents[0] != protected_revision
-            or parents[1] != MODEL_D_TRANSITION_BASE):
-        raise BootstrapError("Model D maintenance operation is expired or bound to another base")
-    _model_d_records(_git_bytes(
-        protected, "diff", "--name-status", "-z", "--no-renames",
-        MODEL_D_TRANSITION_BASE, protected_revision,
-    ))
+    _require_model_d_history(protected, protected_revision)
+    if (_model_d_generation_state(protected, protected_revision) != "ACTIVE"
+            or _model_d_generation_was_consumed(protected, protected_revision)):
+        raise BootstrapError("Model D maintenance generation is not active")
 
     validate_protected_universe(protected, protected_revision)
     validate_protected_universe(candidate, candidate_revision)
@@ -314,6 +373,8 @@ def validate_model_d_maintenance(
         protected_revision, candidate_revision,
     )
     _model_d_records(output)
+    if _model_d_generation_state(candidate, candidate_revision) != "CONSUMED":
+        raise BootstrapError("Model D maintenance candidate must consume the generation")
 
     for root, revision in ((protected, protected_revision),
                            (candidate, candidate_revision)):
@@ -442,6 +503,7 @@ def _git(root: Path, *arguments: str) -> str:
         completed = subprocess.run(
             ["git", "-C", str(root), *arguments], check=True,
             capture_output=True, text=True, encoding="utf-8", errors="strict",
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
         )
     except (OSError, subprocess.SubprocessError, UnicodeError) as error:
         raise BootstrapError("Git identity verification failed") from error
@@ -546,7 +608,8 @@ def _parser() -> argparse.ArgumentParser:
         evaluate_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
     maintenance_parser = commands.add_parser("admit-maintenance")
     for name in (
-            "maintenance-operation", "candidate-sha", "protected-sha",
+            "maintenance-operation", "maintenance-generation",
+            "candidate-sha", "protected-sha",
             "candidate-root", "protected-root"):
         maintenance_parser.add_argument(
             f"--{name}", required=True, default=None, action=_Once)
@@ -580,6 +643,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.operation == "admit-maintenance":
             validate_model_d_maintenance(
                 arguments.maintenance_operation,
+                arguments.maintenance_generation,
                 Path(arguments.candidate_root), Path(arguments.protected_root),
                 arguments.candidate_sha, arguments.protected_sha,
             )
