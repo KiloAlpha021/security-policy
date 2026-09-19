@@ -104,35 +104,49 @@ jobs:
           python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" admit-maintenance --maintenance-operation MODEL_D_ORCHESTRATION_V1 --maintenance-generation "${{ env.MODEL_D_MAINTENANCE_GENERATION }}" --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Normalize and verify committed policy bytes
+      - name: Resolve protected Model D orchestration
+        id: protected-model-d
         shell: pwsh
-        env:
-          POLICY_SOURCE: ${{ steps.protected-bootstrap.outputs.policy-source }}
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($root in @('candidate', 'policy')) {
-            git -C $root config core.autocrlf false
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            git -C $root reset --hard HEAD
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          foreach ($lock in @('requirements-policy.lock', 'requirements-audit.lock')) {
-            $expected = (git -C $env:POLICY_SOURCE rev-parse "HEAD:$lock").Trim()
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $actual = (git hash-object --no-filters "$env:POLICY_SOURCE/$lock").Trim()
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            if ($actual -ne $expected) { throw 'Policy lock bytes differ from committed Git bytes' }
-          }
+          python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" run-model-d --event-name "${{ github.event_name }}" --repository "${{ github.repository }}" --base-repository "${{ github.event.pull_request.base.repo.full_name || github.repository }}" --base-branch "${{ github.event.pull_request.base.ref || 'main' }}" --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy" --event-ref "${{ github.ref }}" --default-branch "${{ github.event.repository.default_branch || 'main' }}" --workflow-ref "${{ github.workflow_ref }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Assert protected Model D outputs
+        shell: pwsh
+        env:
+          D0_CONTEXT: ${{ steps.protected-bootstrap.outputs.evaluation-context }}
+          D0_SOURCE: ${{ steps.protected-bootstrap.outputs.policy-source }}
+          D0_VERSION: ${{ steps.protected-bootstrap.outputs.version-disposition }}
+          MODEL_D_CONTEXT: ${{ steps.protected-model-d.outputs.evaluation-context }}
+          MODEL_D_SOURCE: ${{ steps.protected-model-d.outputs.policy-source }}
+          MODEL_D_VERSION: ${{ steps.protected-model-d.outputs.version-disposition }}
+          MODEL_D_OWNER: ${{ steps.protected-model-d.outputs.owner-authorization }}
+          MODEL_D_PROOF: ${{ steps.protected-model-d.outputs.post-merge-proof }}
+          NORMALIZATION_ROOTS: ${{ steps.protected-model-d.outputs.normalization-roots }}
+          POLICY_LOCK_SOURCE: ${{ steps.protected-model-d.outputs.policy-lock-source }}
+          AUDIT_LOCK_SOURCE: ${{ steps.protected-model-d.outputs.audit-lock-source }}
+          CANDIDATE_EVIDENCE: ${{ steps.protected-model-d.outputs.candidate-evidence }}
+          PROTECTED_EVIDENCE: ${{ steps.protected-model-d.outputs.protected-evidence }}
+          DOWNSTREAM_VALIDATION: ${{ steps.protected-model-d.outputs.downstream-validation }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:MODEL_D_CONTEXT -ne $env:D0_CONTEXT -or $env:MODEL_D_SOURCE -ne $env:D0_SOURCE -or $env:MODEL_D_VERSION -ne $env:D0_VERSION) { throw 'Protected Model D outputs differ from D0 authority' }
+          if ($env:MODEL_D_OWNER -ne 'REQUIRED' -or $env:MODEL_D_PROOF -ne 'REQUIRED') { throw 'Protected Model D owner/proof contract differs' }
+          if ($env:NORMALIZATION_ROOTS -notmatch '^[a-z]+(,[a-z]+)*$') { throw 'Invalid protected normalization roots output' }
+          if ($env:POLICY_LOCK_SOURCE -notin @('candidate', 'policy')) { throw 'Invalid protected policy-lock source output' }
+          if ($env:AUDIT_LOCK_SOURCE -notin @('candidate', 'policy')) { throw 'Invalid protected audit-lock source output' }
+          if ($env:CANDIDATE_EVIDENCE -notin @('RUN_CANDIDATE_STAGE_A_EVIDENCE', 'SKIP')) { throw 'Invalid protected candidate-evidence output' }
+          if ($env:PROTECTED_EVIDENCE -notin @('RUN_LEGACY_PROTECTED_HEALTH', 'APPLY_PROTECTED_STAGE_A_TO_CANDIDATE', 'TEST_INDEPENDENT_ROOT_POLICY')) { throw 'Invalid protected evidence output' }
+          if ($env:DOWNSTREAM_VALIDATION -notin @('RUN_DOWNSTREAM_VALIDATION', 'SKIP')) { throw 'Invalid protected downstream-validation output' }
 
       - name: Install isolated hash-locked policy environment
         shell: pwsh
-        env:
-          POLICY_SOURCE: ${{ steps.protected-bootstrap.outputs.policy-source }}
         run: |
           $ErrorActionPreference = 'Stop'
           python -m venv policy-env
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\policy-env\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r "$env:POLICY_SOURCE/requirements-policy.lock"
+          .\policy-env\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r "${{ steps.protected-model-d.outputs.policy-lock-source }}/requirements-policy.lock"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\policy-env\Scripts\python.exe -c "import yaml; assert yaml.__version__ == '6.0.3'"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -140,7 +154,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run candidate Stage A evidence
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' || steps.protected-bootstrap.outputs.evaluation-context == 'STAGE_A_PROTECTED_PROOF'
+        if: steps.protected-model-d.outputs.candidate-evidence == 'RUN_CANDIDATE_STAGE_A_EVIDENCE'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -148,7 +162,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run legacy protected health
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'
+        if: steps.protected-model-d.outputs.protected-evidence == 'RUN_LEGACY_PROTECTED_HEALTH'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -156,7 +170,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Apply protected Stage A baseline to candidate target
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'STAGE_A_PROTECTED_PROOF'
+        if: steps.protected-model-d.outputs.protected-evidence == 'APPLY_PROTECTED_STAGE_A_TO_CANDIDATE'
         shell: pwsh
         env:
           POLICY_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
@@ -173,7 +187,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test independent root policy
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'DOWNSTREAM_SECURITY_WORKFLOWS'
+        if: steps.protected-model-d.outputs.protected-evidence == 'TEST_INDEPENDENT_ROOT_POLICY'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -182,13 +196,11 @@ jobs:
 
       - name: Install isolated hash-locked audit environment
         shell: pwsh
-        env:
-          POLICY_SOURCE: ${{ steps.protected-bootstrap.outputs.policy-source }}
         run: |
           $ErrorActionPreference = 'Stop'
           python -m venv audit-env
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\audit-env\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r "$env:POLICY_SOURCE/requirements-audit.lock"
+          .\audit-env\Scripts\python.exe -m pip install --require-hashes --only-binary=:all: -r "${{ steps.protected-model-d.outputs.audit-lock-source }}/requirements-audit.lock"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\audit-env\Scripts\python.exe -c "import pip_audit; from importlib.metadata import version; assert version('pip-audit') == '2.10.1'"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -197,15 +209,13 @@ jobs:
 
       - name: Audit locked policy dependencies
         shell: pwsh
-        env:
-          POLICY_SOURCE: ${{ steps.protected-bootstrap.outputs.policy-source }}
         run: |
           $ErrorActionPreference = 'Stop'
-          .\audit-env\Scripts\python.exe -m pip_audit --no-deps -r "$env:POLICY_SOURCE/requirements-policy.lock"
+          .\audit-env\Scripts\python.exe -m pip_audit --no-deps -r "${{ steps.protected-model-d.outputs.policy-lock-source }}/requirements-policy.lock"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Validate downstream security workflows
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'DOWNSTREAM_SECURITY_WORKFLOWS'
+        if: steps.protected-model-d.outputs.downstream-validation == 'RUN_DOWNSTREAM_VALIDATION'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'

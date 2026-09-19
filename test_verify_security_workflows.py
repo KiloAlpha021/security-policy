@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import ast
 import base64
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -212,7 +213,8 @@ def duplicate():
             "Check out exact candidate", "Check out independent root policy", "Set up CPython",
             "Assert exact CPython runtime", "Acquire protected Git identity",
             "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
-            "Enforce exact Model D maintenance admission", "Normalize and verify committed policy bytes",
+            "Enforce exact Model D maintenance admission",
+            "Resolve protected Model D orchestration", "Assert protected Model D outputs",
             "Install isolated hash-locked policy environment", "Run candidate Stage A evidence",
             "Run legacy protected health", "Apply protected Stage A baseline to candidate target",
             "Test independent root policy", "Install isolated hash-locked audit environment",
@@ -304,35 +306,48 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         self.assertNotIn("candidate/protected_policy_bootstrap.py", admission["run"])
         self.assertNotIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", admission["run"])
 
+        model_d = by_name["Resolve protected Model D orchestration"]
+        self.assertEqual(model_d["id"], "protected-model-d")
+        self.assertIn('policy/protected_policy_bootstrap.py" run-model-d', model_d["run"])
+        self.assertNotIn('candidate/protected_policy_bootstrap.py', model_d["run"])
+        self.assertLess(names.index("Enforce exact Model D maintenance admission"),
+                        names.index("Resolve protected Model D orchestration"))
+        asserted_plan = by_name["Assert protected Model D outputs"]
+        self.assertEqual(asserted_plan["env"]["NORMALIZATION_ROOTS"],
+                         "${{ steps.protected-model-d.outputs.normalization-roots }}")
+        self.assertIn("Protected Model D outputs differ from D0 authority", asserted_plan["run"])
+
         context_ref = "steps.protected-bootstrap.outputs.evaluation-context"
+        candidate_ref = "steps.protected-model-d.outputs.candidate-evidence"
+        protected_ref = "steps.protected-model-d.outputs.protected-evidence"
+        downstream_ref = "steps.protected-model-d.outputs.downstream-validation"
         self.assertEqual(by_name["Run candidate Stage A evidence"]["if"],
-                         f"{context_ref} == 'SELF_PR_BOOTSTRAP' || {context_ref} == 'STAGE_A_PROTECTED_PROOF'")
+                         f"{candidate_ref} == 'RUN_CANDIDATE_STAGE_A_EVIDENCE'")
         self.assertEqual(by_name["Run legacy protected health"]["if"],
-                         f"{context_ref} == 'SELF_PR_BOOTSTRAP'")
+                         f"{protected_ref} == 'RUN_LEGACY_PROTECTED_HEALTH'")
         self.assertEqual(by_name["Apply protected Stage A baseline to candidate target"]["if"],
-                         f"{context_ref} == 'STAGE_A_PROTECTED_PROOF'")
+                         f"{protected_ref} == 'APPLY_PROTECTED_STAGE_A_TO_CANDIDATE'")
         self.assertEqual(
             by_name["Apply protected Stage A baseline to candidate target"]["env"]["POLICY_EXPECTED_PROTECTED_SHA"],
             "${{ steps.protected-git.outputs.protected-sha }}",
         )
         self.assertEqual(by_name["Test independent root policy"]["if"],
-                         f"{context_ref} == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
+                         f"{protected_ref} == 'TEST_INDEPENDENT_ROOT_POLICY'")
         self.assertEqual(by_name["Validate downstream security workflows"]["if"],
-                         f"{context_ref} == 'DOWNSTREAM_SECURITY_WORKFLOWS'")
+                         f"{downstream_ref} == 'RUN_DOWNSTREAM_VALIDATION'")
 
-        for name in ("Normalize and verify committed policy bytes", "Install isolated hash-locked policy environment",
-                     "Install isolated hash-locked audit environment", "Audit locked policy dependencies"):
-            self.assertEqual(by_name[name]["env"], {
-                "POLICY_SOURCE": "${{ steps.protected-bootstrap.outputs.policy-source }}"
-            })
+        for name, output, lock in (
+                ("Install isolated hash-locked policy environment", "policy-lock-source", "requirements-policy.lock"),
+                ("Install isolated hash-locked audit environment", "audit-lock-source", "requirements-audit.lock"),
+                ("Audit locked policy dependencies", "policy-lock-source", "requirements-policy.lock")):
+            self.assertNotIn("env", by_name[name])
+            self.assertIn(f"${{{{ steps.protected-model-d.outputs.{output} }}}}/{lock}",
+                          by_name[name]["run"])
         self.assertNotIn("env.EVALUATION_CONTEXT", text)
         self.assertNotIn("env.POLICY_SOURCE", text)
 
-        normalization = by_name["Normalize and verify committed policy bytes"]["run"]
-        for fragment in ("foreach ($root in @('candidate', 'policy'))", "config core.autocrlf false",
-                         "reset --hard HEAD", "hash-object --no-filters",
-                         "Policy lock bytes differ from committed Git bytes"):
-            self.assertIn(fragment, normalization)
+        self.assertNotIn("Normalize and verify committed policy bytes", by_name)
+        self.assertNotIn("foreach ($root in @('candidate', 'policy'))", text)
         policy_install = by_name["Install isolated hash-locked policy environment"]["run"]
         audit_install = by_name["Install isolated hash-locked audit environment"]["run"]
         for run, expected in ((policy_install, "6.0.3"), (audit_install, "'pip-audit') == '2.10.1'")):
@@ -347,7 +362,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         for step in steps:
             if "run" in step:
                 self.assertIn("$ErrorActionPreference = 'Stop'", step["run"])
-                if step["name"] != "Assert protected bootstrap outputs":
+                if step["name"] not in ("Assert protected bootstrap outputs", "Assert protected Model D outputs"):
                     self.assertIn("$LASTEXITCODE -ne 0", step["run"])
 
     def test_policy_dependency_workflow_contract(self) -> None:
@@ -648,7 +663,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                          "MODEL_D_ORCHESTRATION_V1_GENERATION_1")
         self.assertEqual(
             bootstrap.MODEL_D_MAINTENANCE_LIFECYCLE,
-            "MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE")
+            "MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED")
         self.assertEqual(
             bootstrap.MODEL_D_MAINTENANCE_HISTORY_ANCHOR,
             "2784fc943f9eebcab4e468980ad0040499eadc52")
@@ -686,7 +701,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         self.assertNotIn("Security-policy self-PR exceeds the bounded five-file scope", text)
 
     def test_prebootstrap_preparation_restores_windows_checkout_bytes(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="Model D path with spaces ") as directory:
             workspace = Path(directory).resolve()
             candidate = workspace / "candidate"
             protected = workspace / "policy"
@@ -906,6 +921,334 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
         values.update(changes)
         return bootstrap.BootstrapInputs(**values)  # type: ignore[arg-type]
 
+    def test_atomic_model_d_plan_correspondence_rejects_forged_values(self) -> None:
+        inputs = self.inputs()
+        result, plan = bootstrap.evaluate_model_d_plan(inputs)
+        self.assertEqual((result, plan), bootstrap.evaluate_model_d_plan(inputs))
+        self.assertEqual(
+            (result, plan),
+            bootstrap.validate_model_d_plan_correspondence(inputs, result, plan))
+        # Copies and reconstructed values have no provenance; matching values
+        # are accepted only after canonical evaluation of the inputs again.
+        self.assertEqual(
+            (result, plan), bootstrap.validate_model_d_plan_correspondence(
+                inputs, replace(result), replace(plan)))
+        for forged_result in (
+                replace(result, policy_source=bootstrap.PolicySource.POLICY),
+                replace(result, owner_authorization="OPTIONAL"),
+                replace(result, post_merge_proof="OPTIONAL")):
+            with self.subTest(forged_result=forged_result), self.assertRaises(
+                    bootstrap.BootstrapError):
+                bootstrap.validate_model_d_plan_correspondence(
+                    inputs, forged_result, plan)
+        for forged_plan in (
+                replace(plan, policy_lock_source=bootstrap.PolicySource.POLICY),
+                replace(plan, audit_lock_source=bootstrap.PolicySource.POLICY),
+                replace(plan, candidate_evidence=bootstrap.CandidateEvidenceDisposition.SKIP),
+                replace(plan, protected_evidence=bootstrap.ProtectedEvidenceDisposition.TEST_INDEPENDENT_POLICY),
+                replace(plan, downstream_validation=bootstrap.DownstreamValidationDisposition.RUN)):
+            with self.subTest(forged_plan=forged_plan), self.assertRaises(
+                    bootstrap.BootstrapError):
+                bootstrap.validate_model_d_plan_correspondence(inputs, result, forged_plan)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_model_d_plan_correspondence(
+                replace(inputs, candidate_baseline=bootstrap.IMMEDIATE_SUCCESSOR),
+                result, plan)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.evaluate_model_d_plan(replace(inputs, candidate_sha="0" * 40))
+
+    def test_atomic_model_d_plan_supported_evaluations(self) -> None:
+        same = self.inputs()
+        result, plan = bootstrap.evaluate_model_d_plan(same)
+        self.assertEqual(result, bootstrap.evaluate(same))
+        self.assertEqual(plan, bootstrap.derive_model_d_plan(result))
+        proof_candidate = self.protected.parent / "proof-candidate-plan"
+        shutil.copytree(self.protected, proof_candidate)
+        proof = self.inputs(
+            event_name="workflow_dispatch", candidate_sha=self.protected_sha,
+            candidate_root=proof_candidate, event_ref="refs/heads/main",
+            workflow_ref=(bootstrap.REPOSITORY +
+                          "/.github/workflows/security-workflows-policy.yml@refs/heads/main"))
+        self.assertEqual(bootstrap.evaluate_model_d_plan(proof)[0].evaluation_context,
+                         bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF)
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        downstream = self.inputs(
+            repository=bootstrap.DOWNSTREAM_REPOSITORY,
+            base_repository=bootstrap.DOWNSTREAM_REPOSITORY)
+        self.assertEqual(bootstrap.evaluate_model_d_plan(downstream)[0].evaluation_context,
+                         bootstrap.EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS)
+
+    def _model_d_lock_fixture(self) -> None:
+        source = Path(__file__).parent
+        for root in (self.candidate, self.protected):
+            for name in ("requirements-policy.lock", "requirements-audit.lock"):
+                (root / name).write_bytes((source / name).read_bytes())
+            git(root, "add", "requirements-policy.lock", "requirements-audit.lock")
+            git(root, "commit", "-m", "lock identities")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.protected_sha)
+
+    def test_d2_normalization_and_lock_sources_follow_atomic_plan(self) -> None:
+        self._model_d_lock_fixture()
+        inputs = self.inputs()
+        for _ in range(2):
+            result, plan = bootstrap.normalize_and_validate_model_d_bytes(inputs)
+            self.assertEqual((result, plan), bootstrap.evaluate_model_d_plan(inputs))
+            self.assertIs(plan.policy_lock_source, bootstrap.PolicySource.CANDIDATE)
+            self.assertIs(plan.audit_lock_source, bootstrap.PolicySource.CANDIDATE)
+            for root in (self.candidate, self.protected):
+                self.assertEqual(git(root, "config", "--local", "--get", "core.autocrlf"),
+                                 "false")
+                for name in ("requirements-policy.lock", "requirements-audit.lock"):
+                    self.assertEqual(git(root, "hash-object", "--no-filters", name),
+                                     git(root, "rev-parse", f"HEAD:{name}"))
+        with mock.patch.object(bootstrap, "TRANSITION_PROTECTED_BASE", self.protected_sha):
+            successor = self.inputs(candidate_baseline=bootstrap.IMMEDIATE_SUCCESSOR)
+            result, plan = bootstrap.normalize_and_validate_model_d_bytes(successor)
+            self.assertIs(result.version_disposition,
+                          bootstrap.VersionDisposition.IMMEDIATE_SUCCESSOR)
+            self.assertIs(plan.policy_lock_source, bootstrap.PolicySource.POLICY)
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        downstream = self.inputs(repository=bootstrap.DOWNSTREAM_REPOSITORY,
+                                 base_repository=bootstrap.DOWNSTREAM_REPOSITORY)
+        result, plan = bootstrap.normalize_and_validate_model_d_bytes(downstream)
+        self.assertIs(result.evaluation_context,
+                      bootstrap.EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS)
+        self.assertIs(plan.audit_lock_source, bootstrap.PolicySource.POLICY)
+
+    def test_d3_fixed_outputs_follow_public_d2_for_all_contexts(self) -> None:
+        self._model_d_lock_fixture()
+        proof_candidate = self.protected.parent / "proof-candidate-d3"
+        shutil.copytree(self.protected, proof_candidate)
+        proof = self.inputs(
+            event_name="workflow_dispatch", candidate_sha=self.protected_sha,
+            candidate_root=proof_candidate, event_ref="refs/heads/main",
+            workflow_ref=(bootstrap.REPOSITORY +
+                          "/.github/workflows/security-workflows-policy.yml@refs/heads/main"))
+        cases = [(self.inputs(), None),
+                 (self.inputs(candidate_baseline=bootstrap.IMMEDIATE_SUCCESSOR),
+                  self.protected_sha), (proof, None)]
+        for index, (inputs, transition) in enumerate(cases):
+            with self.subTest(index=index), mock.patch.object(
+                    bootstrap, "TRANSITION_PROTECTED_BASE", transition):
+                result, plan = bootstrap.normalize_and_validate_model_d_bytes(inputs)
+                output = Path(self.temp.name).resolve() / f"d3-output-{index}"
+                output.write_bytes(b"")
+                bootstrap.emit_model_d_output(inputs, result, plan, output)
+                lines = output.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(lines), 11)
+                self.assertEqual(tuple(line.split("=", 1)[0] for line in lines),
+                                 bootstrap._OUTPUT_KEYS + bootstrap._MODEL_D_OUTPUT_KEYS)
+                self.assertEqual(dict(line.split("=", 1) for line in lines),
+                                 dict(bootstrap._validated_outputs(result) +
+                                      bootstrap._validated_model_d_outputs(plan)))
+                forged = replace(plan, policy_lock_source=(
+                    bootstrap.PolicySource.POLICY if plan.policy_lock_source is
+                    bootstrap.PolicySource.CANDIDATE else bootstrap.PolicySource.CANDIDATE))
+                rejected = Path(self.temp.name).resolve() / f"d3-rejected-{index}"
+                rejected.write_bytes(b"")
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.emit_model_d_output(inputs, result, forged, rejected)
+                self.assertEqual(rejected.read_bytes(), b"")
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        downstream = self.inputs(repository=bootstrap.DOWNSTREAM_REPOSITORY,
+                                 base_repository=bootstrap.DOWNSTREAM_REPOSITORY)
+        result, plan = bootstrap.normalize_and_validate_model_d_bytes(downstream)
+        output = Path(self.temp.name).resolve() / "d3-downstream"
+        output.write_bytes(b"")
+        bootstrap.emit_model_d_output(downstream, result, plan, output)
+        self.assertIn(b"downstream-validation=RUN_DOWNSTREAM_VALIDATION\n",
+                      output.read_bytes())
+
+    def test_d3_cli_runs_canonical_d2_and_emits_only_after_success(self) -> None:
+        self._model_d_lock_fixture()
+        inputs = self.inputs()
+        argv = ["run-model-d"]
+        for name in ("event-name", "repository", "base-repository", "base-branch",
+                     "candidate-sha", "protected-sha", "candidate-root", "protected-root",
+                     "event-ref", "default-branch", "workflow-ref"):
+            argv.extend((f"--{name}", "bound"))
+        output = Path(self.temp.name).resolve() / "d3-cli-output"
+        output.write_bytes(b"")
+        with mock.patch.object(bootstrap, "_cli_inputs", return_value=inputs), \
+             mock.patch.object(bootstrap, "validate_protected_universe"), \
+             mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+            self.assertEqual(bootstrap.main(argv), 0)
+        self.assertEqual(len(output.read_text(encoding="utf-8").splitlines()), 11)
+        output.write_bytes(b"")
+        broken = replace(inputs, candidate_sha="0" * 40)
+        with mock.patch.object(bootstrap, "_cli_inputs", return_value=broken), \
+             mock.patch.object(bootstrap, "validate_protected_universe"), \
+             mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+            self.assertEqual(bootstrap.main(argv), 2)
+        self.assertEqual(output.read_bytes(), b"")
+
+    def test_d2_lock_byte_and_representation_fail_closed(self) -> None:
+        self._model_d_lock_fixture()
+        name = "requirements-policy.lock"
+        path = self.candidate / name
+        original = path.read_bytes()
+        mutations = (
+            original + b"# drift\n", original.replace(b"\n", b"\r\n"),
+            original.replace(b"\n", b"\r", 1), b"\xef\xbb\xbf" + original,
+            original + b"\0", b"\xff" + original,
+        )
+        for changed in mutations:
+            with self.subTest(changed=changed[:12]):
+                path.write_bytes(changed)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validate_model_d_lock(
+                        self.candidate, self.candidate_sha, name,
+                        bootstrap.PolicySource.CANDIDATE)
+        path.write_bytes(original)
+        path.unlink()
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._validate_model_d_lock(
+                self.candidate, self.candidate_sha, name,
+                bootstrap.PolicySource.CANDIDATE)
+
+    def test_d2_committed_lock_format_and_type_fail_closed(self) -> None:
+        self._model_d_lock_fixture()
+        name = "requirements-audit.lock"
+        root = self.candidate
+        original_sha = self.candidate_sha
+        path = root / name
+        path.write_bytes(path.read_bytes() + b"unhashed==1.0\n")
+        git(root, "add", name)
+        git(root, "commit", "-m", "malformed lock")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.normalize_and_validate_model_d_bytes(
+                self.inputs(candidate_sha=git(root, "rev-parse", "HEAD")))
+        git(root, "reset", "--hard", original_sha)
+        for mode, object_id in (("120000", git(root, "hash-object", name)),
+                                ("160000", original_sha)):
+            with self.subTest(mode=mode):
+                git(root, "update-index", "--add", "--cacheinfo",
+                    f"{mode},{object_id},{name}")
+                git(root, "commit", "-m", f"lock mode {mode}")
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validate_model_d_lock(
+                        root, git(root, "rev-parse", "HEAD"), name,
+                        bootstrap.PolicySource.CANDIDATE)
+                git(root, "reset", "--hard", original_sha)
+
+    def test_d2_swapped_lock_roles_and_protected_identity_fail_closed(self) -> None:
+        self._model_d_lock_fixture()
+        policy = self.candidate / "requirements-policy.lock"
+        audit = self.candidate / "requirements-audit.lock"
+        policy_bytes, audit_bytes = policy.read_bytes(), audit.read_bytes()
+        policy.write_bytes(audit_bytes)
+        audit.write_bytes(policy_bytes)
+        git(self.candidate, "add", "requirements-policy.lock", "requirements-audit.lock")
+        git(self.candidate, "commit", "-m", "swap lock roles")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.normalize_and_validate_model_d_bytes(self.inputs(
+                candidate_sha=git(self.candidate, "rev-parse", "HEAD")))
+
+        protected_policy = self.protected / "requirements-policy.lock"
+        protected_policy.write_bytes(policy_bytes + b"# protected drift\n")
+        git(self.protected, "add", "requirements-policy.lock")
+        git(self.protected, "commit", "-m", "protected lock drift")
+        changed_protected = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", changed_protected)
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.normalize_and_validate_model_d_bytes(self.inputs(
+                repository=bootstrap.DOWNSTREAM_REPOSITORY,
+                base_repository=bootstrap.DOWNSTREAM_REPOSITORY,
+                candidate_sha=git(self.candidate, "rev-parse", "HEAD"),
+                protected_sha=changed_protected))
+
+    def test_d2_identity_failure_precedes_mutation(self) -> None:
+        self._model_d_lock_fixture()
+        wrong = replace(self.inputs(), candidate_sha="0" * 40)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.normalize_and_validate_model_d_bytes(wrong)
+        self.assertNotEqual(subprocess.run(
+            ["git", "-C", str(self.candidate), "config", "--local", "--get",
+             "core.autocrlf"], capture_output=True, text=True).stdout.strip(), "false")
+        with mock.patch.object(bootstrap, "_git_bytes",
+                               side_effect=bootstrap.BootstrapError("Git failure")):
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.normalize_and_validate_model_d_bytes(self.inputs())
+
+    def test_d2_public_entry_ignores_forged_root_order_omission_and_addition(self) -> None:
+        self._model_d_lock_fixture()
+        canonical = (bootstrap.NormalizationRoot.CANDIDATE,
+                     bootstrap.NormalizationRoot.POLICY)
+        variants = (
+            ("reordered", canonical[::-1]),
+            ("omitted", canonical[:1]),
+            ("added", canonical + ("foreign",)),
+        )
+        for label, injected_roots in variants:
+            with self.subTest(mutation=label):
+                inputs = self.inputs()
+                result, plan = bootstrap.evaluate_model_d_plan(inputs)
+                forged_plan = replace(plan)
+                object.__setattr__(forged_plan, "normalization_roots", injected_roots)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_model_d_plan_correspondence(
+                        inputs, result, forged_plan)
+                # BootstrapInputs is a value object, not a plan authority.
+                object.__setattr__(inputs, "normalization_roots", injected_roots)
+                with mock.patch.object(bootstrap, "_git_bytes",
+                                       wraps=bootstrap._git_bytes) as git_calls:
+                    actual_result, actual_plan = (
+                        bootstrap.normalize_and_validate_model_d_bytes(inputs))
+                self.assertEqual(actual_result, result)
+                self.assertEqual(actual_plan.normalization_roots, canonical)
+                normalized_roots = [call.args[0] for call in git_calls.call_args_list
+                                    if call.args[1:4] == (
+                                        "config", "--local", "core.autocrlf")]
+                self.assertEqual(normalized_roots, [self.candidate, self.protected])
+
+    def test_d2_public_entry_protected_proof_context(self) -> None:
+        self._model_d_lock_fixture()
+        proof_candidate = self.protected.parent / "d2-proof-candidate"
+        shutil.copytree(self.protected, proof_candidate)
+        inputs = self.inputs(
+            event_name="workflow_dispatch", candidate_root=proof_candidate,
+            candidate_sha=self.protected_sha, event_ref="refs/heads/main",
+            workflow_ref=(bootstrap.REPOSITORY +
+                          "/.github/workflows/security-workflows-policy.yml@refs/heads/main"))
+        result, plan = bootstrap.normalize_and_validate_model_d_bytes(inputs)
+        self.assertEqual((result, plan), bootstrap.evaluate_model_d_plan(inputs))
+        self.assertIs(result.evaluation_context,
+                      bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF)
+        self.assertEqual(plan.normalization_roots, (
+            bootstrap.NormalizationRoot.CANDIDATE,
+            bootstrap.NormalizationRoot.POLICY))
+        self.assertIs(plan.policy_lock_source, bootstrap.PolicySource.POLICY)
+        self.assertIs(plan.audit_lock_source, bootstrap.PolicySource.POLICY)
+        for name in ("requirements-policy.lock", "requirements-audit.lock"):
+            self.assertEqual(git(self.protected, "hash-object", "--no-filters", name),
+                             git(self.protected, "rev-parse", f"HEAD:{name}"))
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.normalize_and_validate_model_d_bytes(
+                replace(inputs, protected_sha="0" * 40))
+
+    def test_d2_public_entry_restores_dirty_selected_lock_from_commit(self) -> None:
+        self._model_d_lock_fixture()
+        name = "requirements-policy.lock"
+        path = self.candidate / name
+        committed = path.read_bytes()
+        path.write_bytes(committed + b"# uncommitted worktree drift\n")
+        self.assertNotEqual(git(self.candidate, "hash-object", "--no-filters", name),
+                            git(self.candidate, "rev-parse", f"HEAD:{name}"))
+        result, plan = bootstrap.normalize_and_validate_model_d_bytes(self.inputs())
+        self.assertIs(plan.policy_lock_source, bootstrap.PolicySource.CANDIDATE)
+        self.assertIs(result.evaluation_context,
+                      bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP)
+        self.assertEqual(path.read_bytes(), committed)
+        self.assertEqual(git(self.candidate, "hash-object", "--no-filters", name),
+                         git(self.candidate, "rev-parse", f"HEAD:{name}"))
+
     def test_bootstrap_is_standard_library_only_and_pre_environment_importable(self) -> None:
         path = Path(bootstrap.__file__).resolve()
         syntax = ast.parse(path.read_text(encoding="utf-8"))
@@ -920,10 +1263,10 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
             if isinstance(node, ast.ImportFrom) and node.module
         }
         self.assertEqual(imported, {
-            "__future__", "argparse", "os", "re", "stat", "subprocess", "sys",
+            "__future__", "argparse", "hashlib", "os", "re", "stat", "subprocess", "sys",
             "tempfile", "dataclasses", "enum", "pathlib"
         })
-        self.assertNotIn("yaml", path.read_text(encoding="utf-8").lower())
+        self.assertNotIn("yaml", imported)
         completed = subprocess.run(
             [os.sys.executable, "-I", "-S", "-c",
              "import importlib.util,sys;"
@@ -989,10 +1332,14 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
             raise AssertionError(arguments)
 
         with mock.patch.object(bootstrap, "_git", side_effect=identity):
-            eligible = bootstrap.evaluate(self.inputs(
+            eligible_inputs = self.inputs(
                 protected_sha=bootstrap.TRANSITION_PROTECTED_BASE,
                 candidate_baseline=bootstrap.IMMEDIATE_SUCCESSOR,
-            ))
+            )
+            eligible = bootstrap.evaluate(eligible_inputs)
+            atomic_result, atomic_plan = bootstrap.evaluate_model_d_plan(eligible_inputs)
+            self.assertEqual(atomic_result, eligible)
+            self.assertIs(atomic_plan.policy_lock_source, bootstrap.PolicySource.POLICY)
             self.assertEqual(eligible.version_disposition,
                              bootstrap.VersionDisposition.IMMEDIATE_SUCCESSOR)
             self.assertEqual(eligible.policy_source, bootstrap.PolicySource.POLICY)
@@ -1341,6 +1688,773 @@ class ProtectedBootstrapP0b1Tests(unittest.TestCase):
         self.assertIn("cannot authorize its own landing", source)
 
 
+class ModelDPlanV1Tests(unittest.TestCase):
+    @staticmethod
+    def result(context: bootstrap.EvaluationContext,
+               source: bootstrap.PolicySource,
+               version: bootstrap.VersionDisposition) -> bootstrap.BootstrapResult:
+        return bootstrap.BootstrapResult(
+            context, source, version,
+            bootstrap.OWNER_AUTHORIZATION, bootstrap.POST_MERGE_PROOF)
+
+    def test_exact_closed_plan_matrix(self) -> None:
+        self.assertEqual(bootstrap.MODEL_D_PLAN_OPERATION, "MODEL_D_PLAN_V1")
+        matrix = (
+            (bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+             bootstrap.PolicySource.CANDIDATE,
+             bootstrap.VersionDisposition.SAME_VERSION,
+             bootstrap.CandidateEvidenceDisposition.RUN_STAGE_A,
+             bootstrap.ProtectedEvidenceDisposition.RUN_LEGACY_HEALTH,
+             bootstrap.DownstreamValidationDisposition.SKIP),
+            (bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.IMMEDIATE_SUCCESSOR,
+             bootstrap.CandidateEvidenceDisposition.RUN_STAGE_A,
+             bootstrap.ProtectedEvidenceDisposition.RUN_LEGACY_HEALTH,
+             bootstrap.DownstreamValidationDisposition.SKIP),
+            (bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.SAME_VERSION,
+             bootstrap.CandidateEvidenceDisposition.RUN_STAGE_A,
+             bootstrap.ProtectedEvidenceDisposition.APPLY_STAGE_A_TO_CANDIDATE,
+             bootstrap.DownstreamValidationDisposition.SKIP),
+            (bootstrap.EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.SAME_VERSION,
+             bootstrap.CandidateEvidenceDisposition.SKIP,
+             bootstrap.ProtectedEvidenceDisposition.TEST_INDEPENDENT_POLICY,
+             bootstrap.DownstreamValidationDisposition.RUN),
+        )
+        for context, source, version, candidate, protected, downstream in matrix:
+            with self.subTest(context=context, source=source, version=version):
+                result = self.result(context, source, version)
+                plan = bootstrap.derive_model_d_plan(result)
+                self.assertEqual(plan, bootstrap.derive_model_d_plan(result))
+                self.assertEqual(hash(plan), hash(bootstrap.derive_model_d_plan(result)))
+                self.assertEqual(plan.normalization_roots, (
+                    bootstrap.NormalizationRoot.CANDIDATE,
+                    bootstrap.NormalizationRoot.POLICY,
+                ))
+                self.assertIs(plan.policy_lock_source, source)
+                self.assertIs(plan.audit_lock_source, source)
+                self.assertIs(plan.candidate_evidence, candidate)
+                self.assertIs(plan.protected_evidence, protected)
+                self.assertIs(plan.downstream_validation, downstream)
+
+    def test_plan_schema_is_exact_immutable_and_closed(self) -> None:
+        self.assertEqual(tuple(bootstrap.ModelDOrchestrationPlan.__dataclass_fields__), (
+            "normalization_roots", "policy_lock_source", "audit_lock_source",
+            "candidate_evidence", "protected_evidence", "downstream_validation",
+        ))
+        plan = bootstrap.derive_model_d_plan(self.result(
+            bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+            bootstrap.PolicySource.CANDIDATE,
+            bootstrap.VersionDisposition.SAME_VERSION))
+        with self.assertRaises((AttributeError, TypeError)):
+            plan.policy_lock_source = bootstrap.PolicySource.POLICY
+        with self.assertRaises(ValueError):
+            bootstrap.CandidateEvidenceDisposition("RUN_ARBITRARY")
+        with self.assertRaises(ValueError):
+            bootstrap.ProtectedEvidenceDisposition("candidate\nINJECT")
+        with self.assertRaises(ValueError):
+            bootstrap.DownstreamValidationDisposition("DEFAULT_SUCCESS")
+        for field, invalid in (
+                ("normalization_roots", [bootstrap.NormalizationRoot.CANDIDATE,
+                                          bootstrap.NormalizationRoot.POLICY]),
+                ("normalization_roots", ("candidate", bootstrap.NormalizationRoot.POLICY)),
+                ("policy_lock_source", "candidate"),
+                ("audit_lock_source", "candidate"),
+                ("candidate_evidence", "RUN_STAGE_A"),
+                ("protected_evidence", "RUN_LEGACY_HEALTH"),
+                ("downstream_validation", "SKIP")):
+            with self.subTest(field=field), self.assertRaises(bootstrap.BootstrapError):
+                replace(plan, **{field: invalid})
+
+    def test_unsupported_authority_combinations_fail_closed(self) -> None:
+        supported = {
+            (bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+             bootstrap.PolicySource.CANDIDATE,
+             bootstrap.VersionDisposition.SAME_VERSION),
+            (bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.IMMEDIATE_SUCCESSOR),
+            (bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.SAME_VERSION),
+            (bootstrap.EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.SAME_VERSION),
+        }
+        for context in bootstrap.EvaluationContext:
+            for source in bootstrap.PolicySource:
+                for version in bootstrap.VersionDisposition:
+                    if (context, source, version) in supported:
+                        continue
+                    with self.subTest(context=context, source=source, version=version):
+                        with self.assertRaises(bootstrap.BootstrapError):
+                            bootstrap.derive_model_d_plan(
+                                self.result(context, source, version))
+
+    def test_malformed_tampered_and_injected_inputs_fail_closed(self) -> None:
+        valid = self.result(
+            bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+            bootstrap.PolicySource.CANDIDATE,
+            bootstrap.VersionDisposition.SAME_VERSION)
+        invalid = (
+            None,
+            {},
+            bootstrap.BootstrapResult(
+                "SELF_PR_BOOTSTRAP", bootstrap.PolicySource.CANDIDATE,
+                bootstrap.VersionDisposition.SAME_VERSION, "REQUIRED", "REQUIRED"),
+            bootstrap.BootstrapResult(
+                bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP, "candidate",
+                bootstrap.VersionDisposition.SAME_VERSION, "REQUIRED", "REQUIRED"),
+            bootstrap.BootstrapResult(
+                bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+                bootstrap.PolicySource.CANDIDATE, "SAME_VERSION",
+                "REQUIRED", "REQUIRED"),
+            bootstrap.BootstrapResult(
+                bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+                bootstrap.PolicySource.CANDIDATE,
+                bootstrap.VersionDisposition.SAME_VERSION,
+                "REQUIRED\npolicy-source=policy", "REQUIRED"),
+            bootstrap.BootstrapResult(
+                bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+                bootstrap.PolicySource.CANDIDATE,
+                bootstrap.VersionDisposition.SAME_VERSION,
+                "REQUIRED", "OPTIONAL"),
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.derive_model_d_plan(value)
+
+        object.__setattr__(valid, "candidate_plan", "RUN_ARBITRARY")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.derive_model_d_plan(valid)
+
+        class CandidateResult(bootstrap.BootstrapResult):
+            pass
+
+        candidate = CandidateResult(
+            bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+            bootstrap.PolicySource.CANDIDATE,
+            bootstrap.VersionDisposition.SAME_VERSION,
+            bootstrap.OWNER_AUTHORIZATION, bootstrap.POST_MERGE_PROOF)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.derive_model_d_plan(candidate)
+
+    def test_plan_derivation_has_no_io_command_or_mutable_global_authority(self) -> None:
+        result = self.result(
+            bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF,
+            bootstrap.PolicySource.POLICY,
+            bootstrap.VersionDisposition.SAME_VERSION)
+        before = dict(vars(result))
+        with mock.patch.object(bootstrap.subprocess, "run",
+                               side_effect=AssertionError("command execution")), \
+             mock.patch.object(Path, "read_bytes",
+                               side_effect=AssertionError("filesystem authority")):
+            plan = bootstrap.derive_model_d_plan(result)
+        self.assertEqual(vars(result), before)
+        self.assertEqual(plan.normalization_roots, (
+            bootstrap.NormalizationRoot.CANDIDATE,
+            bootstrap.NormalizationRoot.POLICY,
+        ))
+
+    def test_d3_workflow_plan_dispositions_and_five_key_contract(self) -> None:
+        workflow_path = Path(__file__).parent / ".github/workflows/security-workflows-policy.yml"
+        workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        by_name = {step["name"]: step for step in steps}
+        self.assertEqual(
+            by_name["Run candidate Stage A evidence"]["if"],
+            "steps.protected-model-d.outputs.candidate-evidence == 'RUN_CANDIDATE_STAGE_A_EVIDENCE'")
+        self.assertEqual(
+            by_name["Run legacy protected health"]["if"],
+            "steps.protected-model-d.outputs.protected-evidence == 'RUN_LEGACY_PROTECTED_HEALTH'")
+        self.assertEqual(
+            by_name["Apply protected Stage A baseline to candidate target"]["if"],
+            "steps.protected-model-d.outputs.protected-evidence == 'APPLY_PROTECTED_STAGE_A_TO_CANDIDATE'")
+        self.assertEqual(
+            by_name["Test independent root policy"]["if"],
+            "steps.protected-model-d.outputs.protected-evidence == 'TEST_INDEPENDENT_ROOT_POLICY'")
+        self.assertEqual(
+            by_name["Validate downstream security workflows"]["if"],
+            "steps.protected-model-d.outputs.downstream-validation == 'RUN_DOWNSTREAM_VALIDATION'")
+        self.assertEqual(bootstrap._OUTPUT_KEYS, (
+            "evaluation-context", "policy-source", "version-disposition",
+            "owner-authorization", "post-merge-proof",
+        ))
+        self.assertIn("run-model-d", workflow_path.read_text(encoding="utf-8"))
+
+    def test_d3_workflow_has_one_plan_source_and_fatal_mechanics(self) -> None:
+        text = (Path(__file__).parent /
+                ".github/workflows/security-workflows-policy.yml").read_text(encoding="utf-8")
+        workflow = yaml.load(text, Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        names = [step["name"] for step in steps]
+        self.assertNotIn("Normalize and verify committed policy bytes", names)
+        self.assertEqual(text.count("run-model-d --event-name"), 1)
+        self.assertNotIn("foreach ($root in @('candidate', 'policy'))", text)
+        self.assertNotIn("$env:POLICY_SOURCE/requirements-", text)
+        self.assertNotIn("$env:POLICY_LOCK_ROOT", text)
+        self.assertNotIn("$env:AUDIT_LOCK_ROOT", text)
+        self.assertNotIn("GITHUB_ENV", text)
+        authority = names.index("Resolve protected bootstrap authority")
+        admission = names.index("Enforce exact Model D maintenance admission")
+        plan = names.index("Resolve protected Model D orchestration")
+        install = names.index("Install isolated hash-locked policy environment")
+        self.assertLess(authority, admission)
+        self.assertLess(admission, plan)
+        self.assertLess(plan, install)
+        for step in steps:
+            if "run" in step and step["name"] not in (
+                    "Assert protected bootstrap outputs", "Assert protected Model D outputs"):
+                self.assertIn("$LASTEXITCODE -ne 0", step["run"])
+        for name in ("Run candidate Stage A evidence", "Run legacy protected health",
+                     "Apply protected Stage A baseline to candidate target",
+                     "Test independent root policy", "Validate downstream security workflows"):
+            self.assertIn("steps.protected-model-d.outputs.",
+                          next(step for step in steps if step["name"] == name)["if"])
+            self.assertNotIn("evaluation-context",
+                             next(step for step in steps if step["name"] == name)["if"])
+
+    def test_d3_every_native_command_has_immediate_fatal_guard(self) -> None:
+        workflow = yaml.load(
+            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml")
+            .read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        command = re.compile(
+            r"^(?:git\s|python\s|\.\\(?:policy-env|audit-env)\\Scripts\\python\.exe\s|"
+            r"\$[A-Za-z]+\s*=\s*\(?(?:git|python)\s)")
+        guard = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+
+        def missing_guard(run: str) -> bool:
+            lines = [line.strip() for line in run.splitlines() if line.strip()]
+            return any(command.match(line) and (index + 1 == len(lines) or
+                       lines[index + 1] != guard)
+                       for index, line in enumerate(lines))
+
+        checked = 0
+        for step in steps:
+            if "run" not in step:
+                continue
+            run = step["run"]
+            self.assertFalse(missing_guard(run), step["name"])
+            for index, line in enumerate(run.splitlines()):
+                if line.strip() != guard:
+                    continue
+                changed = run.splitlines()
+                changed[index] = "  $null = 1"
+                if missing_guard("\n".join(changed)):
+                    checked += 1
+        self.assertGreaterEqual(checked, 20)
+
+
+class ModelDClosedPowerShellProfileTests(unittest.TestCase):
+    """D4 closed profile for the one protected Model D workflow, not generic PS."""
+
+    _AST_TYPES = frozenset({
+        "ArrayExpressionAst", "ArrayLiteralAst", "AssignmentStatementAst",
+        "BinaryExpressionAst", "CommandAst", "CommandExpressionAst",
+        "CommandParameterAst", "ConstantExpressionAst", "ExitStatementAst",
+        "ExpandableStringExpressionAst", "IfStatementAst", "InvokeMemberExpressionAst",
+        "NamedBlockAst", "ParenExpressionAst", "PipelineAst", "ScriptBlockAst",
+        "StatementBlockAst", "StringConstantExpressionAst", "ThrowStatementAst",
+        "VariableExpressionAst",
+    })
+    _COMMANDS = {
+        "Assert exact CPython runtime": ("python",),
+        "Acquire protected Git identity": ("git", "Out-File"),
+        "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "python"),
+        "Assert protected bootstrap outputs": (),
+        "Enforce exact Model D maintenance admission": ("python",),
+        "Resolve protected Model D orchestration": ("python",),
+        "Assert protected Model D outputs": (),
+        "Install isolated hash-locked policy environment":
+            ("python",) + (r".\policy-env\Scripts\python.exe",) * 3,
+        "Run candidate Stage A evidence": (r".\policy-env\Scripts\python.exe",),
+        "Run legacy protected health": (r".\policy-env\Scripts\python.exe",),
+        "Apply protected Stage A baseline to candidate target":
+            (r".\policy-env\Scripts\python.exe",),
+        "Test independent root policy": (r".\policy-env\Scripts\python.exe",),
+        "Install isolated hash-locked audit environment":
+            ("python",) + (r".\audit-env\Scripts\python.exe",) * 3,
+        "Audit locked policy dependencies": (r".\audit-env\Scripts\python.exe",),
+        "Validate downstream security workflows": (r".\policy-env\Scripts\python.exe",),
+    }
+    # Fixed command/argument forms and GitHub bindings for this one workflow.
+    # AST parsing uses BOUND placeholders, so source expressions are pinned separately.
+    _COMMAND_DIGESTS = {
+        "Assert exact CPython runtime": "ff4765d5070a8f20c672195931f3296bd7f98d025cc603a3253336a1909ef10a",
+        "Acquire protected Git identity": "c46b07aa33fec226c61a81e56ac420d8ca2d7335557f1098132ba9a518dd3de4",
+        "Resolve protected bootstrap authority": "1033bc372e862723b7301df8269c8d55268af0263a4049e665c44a2bd491e9d1",
+        "Enforce exact Model D maintenance admission": "a27a6cb21b57491d4f10396fcd1e05d9f1db6cc2e3570a5b6c28b2828c6fab66",
+        "Resolve protected Model D orchestration": "55508070002061086a43cc0996f426eda44cb46106fb1094c77bcb7cd3885713",
+        "Install isolated hash-locked policy environment": "ee8dac9367b0f079fcccfb636cceee965b4802e963649a1645a5da2be9fb3520",
+        "Run candidate Stage A evidence": "c6a33626a4760d1526501debed802cb4d810f4885103ab660032ed345d92d296",
+        "Run legacy protected health": "435b6b77a7e2d99f14a71ee6474e163492bd72b0dd516bd63f305393af4853fa",
+        "Apply protected Stage A baseline to candidate target": "5ad3325fe6559847a7a7cdaddee067938df81bfe0156b179dc6dcbaf0c77d8d6",
+        "Test independent root policy": "435b6b77a7e2d99f14a71ee6474e163492bd72b0dd516bd63f305393af4853fa",
+        "Install isolated hash-locked audit environment": "b96ce83b8b71555e5b23570d0f7d92f5ff1fc3f38b5b264ad7902f119980813f",
+        "Audit locked policy dependencies": "0c70fcfd7f2074edd996e1deaf7ca5ac06ab49c6e578e525a6321c8bb7ec17ec",
+        "Validate downstream security workflows": "98622aeb4b2c26df74de7cbcd68750ffebb2ad7de78a6abd1b6df9c7045d8be8",
+    }
+    _EXPRESSION_DIGESTS = {
+        "Acquire protected Git identity": "837295a19625c7f7bacd0c82e6bfe4238723e8266b416182ada72993d5b20023",
+        "Resolve protected bootstrap authority": "d10fe55d40daab7b732dc2414601063a036a64f8fd75abe71ecfa089546a4ff2",
+        "Enforce exact Model D maintenance admission": "29db63d8930ddf1d99aec626572563076a3f2c429d6c7b4e6c23889c7b4484aa",
+        "Resolve protected Model D orchestration": "3b75d73c87092e553ff4a60922371a26049cb145e72d34863a65df263987a6c7",
+        "Install isolated hash-locked policy environment": "6d079a592228d8f8d41be75c44f12aadbf9c7a04a268939af4f9ab330c84ed45",
+        "Install isolated hash-locked audit environment": "14db3625de27e1630df2c448364e8b26521bb169aecceac851a270172d6ffa61",
+        "Audit locked policy dependencies": "6d079a592228d8f8d41be75c44f12aadbf9c7a04a268939af4f9ab330c84ed45",
+    }
+    _ASSIGNMENT_DIGESTS = {
+        "Assert exact CPython runtime": "d28dad29c037f617afecde27704bef3d358314acff79e6e0dc6e838ef68ddbab",
+        "Acquire protected Git identity": "a7957a942a016cffc750015c04cc690d6976cd3094083d8b79f364380ba25791",
+        "Resolve protected bootstrap authority": "7345417463fdbf2b043e1c7a229cc9ce631efc2c8de8348111022a2d6e8df5d6",
+    }
+    _STOP_ASSIGNMENT_DIGEST = "a6ff9ace77f1623d434a131b94c045ea59228ca4c1afaffe3900356c386bb1a5"
+    _IF = {
+        "Enforce exact Model D maintenance admission":
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'",
+        "Run candidate Stage A evidence":
+            "steps.protected-model-d.outputs.candidate-evidence == 'RUN_CANDIDATE_STAGE_A_EVIDENCE'",
+        "Run legacy protected health":
+            "steps.protected-model-d.outputs.protected-evidence == 'RUN_LEGACY_PROTECTED_HEALTH'",
+        "Apply protected Stage A baseline to candidate target":
+            "steps.protected-model-d.outputs.protected-evidence == 'APPLY_PROTECTED_STAGE_A_TO_CANDIDATE'",
+        "Test independent root policy":
+            "steps.protected-model-d.outputs.protected-evidence == 'TEST_INDEPENDENT_ROOT_POLICY'",
+        "Validate downstream security workflows":
+            "steps.protected-model-d.outputs.downstream-validation == 'RUN_DOWNSTREAM_VALIDATION'",
+    }
+    _ASSERTIONS = {
+        "Assert exact CPython runtime": ("$pythonVersion -ne '3.12.10'",),
+        "Acquire protected Git identity": ("$protectedSha -notmatch '^[0-9a-f]{40}$'",),
+        "Resolve protected bootstrap authority": (
+            "$observedHead -ne $candidateSha",
+            "$expectedBlob -notmatch '^[0-9a-f]{40}$'",
+            "$actualBlob -ne $expectedBlob",
+        ),
+        "Assert protected bootstrap outputs": (
+            "$env:EVALUATION_CONTEXT -notin @('SELF_PR_BOOTSTRAP', 'STAGE_A_PROTECTED_PROOF', 'DOWNSTREAM_SECURITY_WORKFLOWS')",
+            "$env:POLICY_SOURCE -notin @('candidate', 'policy')",
+            "$env:VERSION_DISPOSITION -notin @('SAME_VERSION', 'IMMEDIATE_SUCCESSOR')",
+            "$env:OWNER_AUTHORIZATION -ne 'REQUIRED'",
+            "$env:POST_MERGE_PROOF -ne 'REQUIRED'",
+        ),
+        "Assert protected Model D outputs": (
+            "$env:MODEL_D_CONTEXT -ne $env:D0_CONTEXT -or $env:MODEL_D_SOURCE -ne $env:D0_SOURCE -or $env:MODEL_D_VERSION -ne $env:D0_VERSION",
+            "$env:MODEL_D_OWNER -ne 'REQUIRED' -or $env:MODEL_D_PROOF -ne 'REQUIRED'",
+            "$env:NORMALIZATION_ROOTS -notmatch '^[a-z]+(,[a-z]+)*$'",
+            "$env:POLICY_LOCK_SOURCE -notin @('candidate', 'policy')",
+            "$env:AUDIT_LOCK_SOURCE -notin @('candidate', 'policy')",
+            "$env:CANDIDATE_EVIDENCE -notin @('RUN_CANDIDATE_STAGE_A_EVIDENCE', 'SKIP')",
+            "$env:PROTECTED_EVIDENCE -notin @('RUN_LEGACY_PROTECTED_HEALTH', 'APPLY_PROTECTED_STAGE_A_TO_CANDIDATE', 'TEST_INDEPENDENT_ROOT_POLICY')",
+            "$env:DOWNSTREAM_VALIDATION -notin @('RUN_DOWNSTREAM_VALIDATION', 'SKIP')",
+        ),
+    }
+    _VARIABLES = frozenset({
+        "actualBlob", "candidateRoot", "candidateSha", "ErrorActionPreference",
+        "expectedBlob", "LASTEXITCODE", "observedHead", "protectedSha",
+        "pythonVersion", "workflowPath", "env:GITHUB_OUTPUT",
+        "env:AUDIT_LOCK_SOURCE", "env:CANDIDATE_EVIDENCE", "env:D0_CONTEXT",
+        "env:D0_SOURCE", "env:D0_VERSION", "env:DOWNSTREAM_VALIDATION",
+        "env:EVALUATION_CONTEXT", "env:MODEL_D_CONTEXT", "env:MODEL_D_OWNER",
+        "env:MODEL_D_PROOF", "env:MODEL_D_SOURCE", "env:MODEL_D_VERSION",
+        "env:NORMALIZATION_ROOTS", "env:OWNER_AUTHORIZATION",
+        "env:POLICY_LOCK_SOURCE", "env:POLICY_SOURCE", "env:POST_MERGE_PROOF",
+        "env:PROTECTED_EVIDENCE", "env:VERSION_DISPOSITION",
+    })
+    _ASSIGNMENTS = frozenset({
+        "$ErrorActionPreference", "$pythonVersion", "$protectedSha",
+        "$candidateRoot", "$candidateSha", "$observedHead", "$workflowPath",
+        "$expectedBlob", "$actualBlob",
+    })
+    _INSPECTOR = r'''
+$ErrorActionPreference = 'Stop'
+$items = ConvertFrom-Json -InputObject ([Console]::In.ReadToEnd())
+$reports = @(foreach ($item in $items) {
+  $source = [regex]::Replace([string]$item.run, '\$\{\{.*?\}\}', 'BOUND')
+  $tokens = $null; $errors = $null
+  $tree = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+  $nodes = @($tree.FindAll({param($node) $true}, $true))
+  $ifs = @($nodes | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] })
+  [pscustomobject]@{
+    name = $item.name
+    errors = @($errors | ForEach-Object { $_.Message })
+    types = @($nodes | ForEach-Object { $_.GetType().Name } | Select-Object -Unique)
+    commands = @($nodes | Where-Object { $_ -is [System.Management.Automation.Language.CommandAst] } | ForEach-Object { $_.GetCommandName() })
+    commandTexts = @($nodes | Where-Object { $_ -is [System.Management.Automation.Language.CommandAst] } | ForEach-Object { $_.Extent.Text })
+    variables = @($nodes | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } | ForEach-Object { $_.VariablePath.UserPath } | Select-Object -Unique)
+    assignments = @($nodes | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] } | ForEach-Object { $_.Left.Extent.Text })
+    assignmentTexts = @($nodes | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] } | ForEach-Object { $_.Extent.Text })
+    outputPipelines = @($nodes | Where-Object { $_ -is [System.Management.Automation.Language.PipelineAst] -and $_.Extent.Text -match '\bOut-File\b' } | ForEach-Object { $_.Extent.Text })
+    conditions = @($ifs | ForEach-Object { $_.Clauses[0].Item1.Extent.Text })
+    bodies = @($ifs | ForEach-Object { $_.Clauses[0].Item2.Extent.Text.Trim() })
+    elseCount = @($ifs | Where-Object { $_.ElseClause -or $_.Clauses.Count -ne 1 }).Count
+  }
+})
+ConvertTo-Json -InputObject $reports -Depth 5 -Compress
+'''
+
+    @staticmethod
+    def _parse_workflow(text: str) -> dict[str, object]:
+        node = yaml.compose(text, Loader=yaml.BaseLoader)
+        if node is None:
+            raise AssertionError("Empty Model D workflow")
+
+        def visit(current: yaml.Node) -> None:
+            if isinstance(current, yaml.MappingNode):
+                seen: set[str] = set()
+                for key, value in current.value:
+                    if not isinstance(key, yaml.ScalarNode) or key.value in seen:
+                        raise AssertionError("Duplicate or non-scalar Model D YAML key")
+                    seen.add(key.value)
+                    visit(value)
+            elif isinstance(current, yaml.SequenceNode):
+                for member in current.value:
+                    visit(member)
+
+        visit(node)
+        return yaml.load(text, Loader=yaml.BaseLoader)
+
+    @classmethod
+    def _workflow(cls) -> dict[str, object]:
+        path = Path(__file__).parent / ".github/workflows/security-workflows-policy.yml"
+        return cls._parse_workflow(path.read_text(encoding="utf-8"))
+
+    def _inspect(self, steps: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+        blocks = [{"name": step["name"], "run": step["run"]}
+                  for step in steps if "run" in step]
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", self._INSPECTOR],
+            input=json.dumps(blocks), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        reports = json.loads(result.stdout)
+        self.assertEqual(len(reports), len(blocks))
+        return {report["name"]: report for report in reports}
+
+    def _assert_closed(self, workflow: dict[str, object]) -> None:
+        self.assertEqual(set(workflow), {"name", "on", "permissions", "env", "jobs"})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group", "workflow_dispatch"})
+        self.assertEqual(workflow["env"], {
+            "POLICY_BASELINE_VERSION": bootstrap.CURRENT_BASELINE,
+            "MODEL_D_MAINTENANCE_GENERATION": bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+        })
+        self.assertEqual(tuple(workflow["jobs"]), ("security-workflows-policy",))
+        job = workflow["jobs"]["security-workflows-policy"]
+        self.assertEqual(set(job), {"name", "runs-on", "steps"})
+        self.assertEqual(job["runs-on"], "windows-latest")
+        steps = job["steps"]
+        self.assertEqual([step["name"] for step in steps], [
+            "Check out exact candidate", "Check out independent root policy",
+            "Set up CPython", *self._COMMANDS,
+        ])
+        self.assertEqual({step["name"]: step["if"] for step in steps if "if" in step},
+                         self._IF)
+        self.assertTrue(all("continue-on-error" not in step for step in steps))
+        for step in steps:
+            allowed = ({"name", "uses", "with"} if "uses" in step else
+                       {"name", "shell", "run"} |
+                       ({"id"} if "id" in step else set()) |
+                       ({"if"} if "if" in step else set()) |
+                       ({"env"} if "env" in step else set()))
+            self.assertEqual(set(step), allowed, step["name"])
+            if "run" in step:
+                self.assertEqual(step["shell"], "pwsh", step["name"])
+        expected_env = {
+            "Assert protected bootstrap outputs": {
+                "EVALUATION_CONTEXT": "evaluation-context",
+                "POLICY_SOURCE": "policy-source",
+                "VERSION_DISPOSITION": "version-disposition",
+                "OWNER_AUTHORIZATION": "owner-authorization",
+                "POST_MERGE_PROOF": "post-merge-proof",
+            },
+            "Assert protected Model D outputs": {
+                "D0_CONTEXT": "evaluation-context", "D0_SOURCE": "policy-source",
+                "D0_VERSION": "version-disposition",
+                "MODEL_D_CONTEXT": "evaluation-context", "MODEL_D_SOURCE": "policy-source",
+                "MODEL_D_VERSION": "version-disposition",
+                "MODEL_D_OWNER": "owner-authorization", "MODEL_D_PROOF": "post-merge-proof",
+                "NORMALIZATION_ROOTS": "normalization-roots",
+                "POLICY_LOCK_SOURCE": "policy-lock-source",
+                "AUDIT_LOCK_SOURCE": "audit-lock-source",
+                "CANDIDATE_EVIDENCE": "candidate-evidence",
+                "PROTECTED_EVIDENCE": "protected-evidence",
+                "DOWNSTREAM_VALIDATION": "downstream-validation",
+            },
+        }
+        self.assertEqual({step["name"] for step in steps if "env" in step},
+                         set(expected_env) | {"Apply protected Stage A baseline to candidate target"})
+        by_name = {step["name"]: step for step in steps}
+        for name, keys in expected_env.items():
+            expected = {}
+            for key, output in keys.items():
+                source = ("protected-bootstrap" if name == "Assert protected bootstrap outputs"
+                          or key.startswith("D0_") else "protected-model-d")
+                expected[key] = "${{ steps." + source + ".outputs." + output + " }}"
+            self.assertEqual(by_name[name]["env"], expected)
+        self.assertEqual(set(by_name["Apply protected Stage A baseline to candidate target"]["env"]), {
+            "POLICY_CANDIDATE_ROOT", "POLICY_PROTECTED_ROOT", "POLICY_EXPECTED_REPOSITORY",
+            "POLICY_EXPECTED_CANDIDATE_SHA", "POLICY_EXPECTED_PROTECTED_SHA",
+            "POLICY_EXPECTED_BASE_REPOSITORY", "POLICY_EXPECTED_BASE_BRANCH",
+            "POLICY_EXPECTED_EVENT",
+        })
+        self.assertEqual({step["name"]: step["id"] for step in steps if "id" in step}, {
+            "Acquire protected Git identity": "protected-git",
+            "Resolve protected bootstrap authority": "protected-bootstrap",
+            "Resolve protected Model D orchestration": "protected-model-d",
+        })
+        self.assertEqual(steps[0]["with"]["path"], "candidate")
+        self.assertEqual(steps[1]["with"]["path"], "policy")
+        self.assertEqual(steps[0]["with"]["fetch-depth"], "0")
+        self.assertEqual(steps[1]["with"]["fetch-depth"], "0")
+        self.assertEqual(steps[2]["with"]["python-version"], "3.12.10")
+        self.assertIn('policy/protected_policy_bootstrap.py" evaluate',
+                      by_name["Resolve protected bootstrap authority"]["run"])
+        self.assertIn('policy/protected_policy_bootstrap.py" admit-maintenance',
+                      by_name["Enforce exact Model D maintenance admission"]["run"])
+        self.assertIn('policy/protected_policy_bootstrap.py" run-model-d',
+                      by_name["Resolve protected Model D orchestration"]["run"])
+        for name, output, lock in (
+                ("Install isolated hash-locked policy environment", "policy-lock-source", "requirements-policy.lock"),
+                ("Install isolated hash-locked audit environment", "audit-lock-source", "requirements-audit.lock"),
+                ("Audit locked policy dependencies", "policy-lock-source", "requirements-policy.lock")):
+            self.assertIn(f"${{{{ steps.protected-model-d.outputs.{output} }}}}/{lock}",
+                          by_name[name]["run"])
+        reports = self._inspect(steps)
+        for name, commands in self._COMMANDS.items():
+            run = by_name[name]["run"]
+            report = reports[name]
+            self.assertEqual(report["errors"], [], name)
+            self.assertTrue(set(report["types"]) <= self._AST_TYPES, name)
+            self.assertEqual(tuple(report["commands"]), commands, name)
+            command_digest = hashlib.sha256(
+                "\0".join(report["commandTexts"]).encode("utf-8")).hexdigest()
+            self.assertEqual(command_digest, self._COMMAND_DIGESTS.get(
+                name, hashlib.sha256(b"").hexdigest()), name)
+            expressions = re.findall(r"\$\{\{.*?\}\}", run)
+            expression_digest = hashlib.sha256(
+                "\0".join(expressions).encode("utf-8")).hexdigest()
+            self.assertEqual(expression_digest, self._EXPRESSION_DIGESTS.get(
+                name, hashlib.sha256(b"").hexdigest()), name)
+            self.assertTrue(set(report["variables"]) <= self._VARIABLES, name)
+            self.assertTrue(set(report["assignments"]) <= self._ASSIGNMENTS, name)
+            assignment_digest = hashlib.sha256(
+                "\0".join(report["assignmentTexts"]).encode("utf-8")).hexdigest()
+            self.assertEqual(assignment_digest, self._ASSIGNMENT_DIGESTS.get(
+                name, self._STOP_ASSIGNMENT_DIGEST), name)
+            self.assertEqual(report["outputPipelines"],
+                             ['"protected-sha=$protectedSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append']
+                             if name == "Acquire protected Git identity" else [], name)
+            self.assertEqual(report["elseCount"], 0, name)
+            self.assertTrue(run.lstrip().startswith("$ErrorActionPreference = 'Stop'"), name)
+            assertions = tuple(condition for condition in report["conditions"]
+                               if condition != "$LASTEXITCODE -ne 0")
+            self.assertEqual(assertions, self._ASSERTIONS.get(name, ()), name)
+            guard_count = report["conditions"].count("$LASTEXITCODE -ne 0")
+            self.assertEqual(guard_count,
+                             len(commands) - (1 if "Out-File" in commands else 0), name)
+            for condition, body in zip(report["conditions"], report["bodies"]):
+                if condition == "$LASTEXITCODE -ne 0":
+                    self.assertEqual(body, "{ exit $LASTEXITCODE }", name)
+                else:
+                    self.assertRegex(body, r"^\{ throw '[^'\r\n]+' \}$", name)
+
+    def test_current_workflow_has_closed_ast_and_structure(self) -> None:
+        self._assert_closed(self._workflow())
+
+    def test_comments_and_string_text_do_not_create_ast_authority(self) -> None:
+        workflow = self._workflow()
+        step = workflow["jobs"]["security-workflows-policy"]["steps"][3]
+        step["run"] += "\n# Invoke-Expression $env:GITHUB_ENV is forbidden as code\n"
+        step["run"] = step["run"].replace(
+            "Unexpected CPython version",
+            "Invoke-Expression $env:GITHUB_ENV is inert inside this string")
+        self._assert_closed(workflow)
+
+    def test_duplicate_yaml_output_key_rejects_before_profile(self) -> None:
+        path = Path(__file__).parent / ".github/workflows/security-workflows-policy.yml"
+        source = path.read_text(encoding="utf-8")
+        marker = "          MODEL_D_CONTEXT: ${{ steps.protected-model-d.outputs.evaluation-context }}"
+        self.assertIn(marker, source)
+        mutated = source.replace(marker, marker + "\n" + marker, 1)
+        with self.assertRaisesRegex(AssertionError, "Duplicate"):
+            self._parse_workflow(mutated)
+
+    def test_protected_output_assertion_executes_and_rejects_mutations(self) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        run = next(step["run"] for step in steps
+                   if step["name"] == "Assert protected Model D outputs")
+        values = {
+            "D0_CONTEXT": "SELF_PR_BOOTSTRAP", "D0_SOURCE": "candidate",
+            "D0_VERSION": "SAME_VERSION", "MODEL_D_CONTEXT": "SELF_PR_BOOTSTRAP",
+            "MODEL_D_SOURCE": "candidate", "MODEL_D_VERSION": "SAME_VERSION",
+            "MODEL_D_OWNER": "REQUIRED", "MODEL_D_PROOF": "REQUIRED",
+            "NORMALIZATION_ROOTS": "candidate,policy", "POLICY_LOCK_SOURCE": "candidate",
+            "AUDIT_LOCK_SOURCE": "candidate",
+            "CANDIDATE_EVIDENCE": "RUN_CANDIDATE_STAGE_A_EVIDENCE",
+            "PROTECTED_EVIDENCE": "RUN_LEGACY_PROTECTED_HEALTH",
+            "DOWNSTREAM_VALIDATION": "SKIP",
+        }
+
+        def execute(changes: dict[str, str | None]) -> subprocess.CompletedProcess[str]:
+            environment = os.environ.copy()
+            environment.update(values)
+            for key, value in changes.items():
+                if value is None:
+                    environment.pop(key, None)
+                else:
+                    environment[key] = value
+            return subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", run],
+                env=environment, capture_output=True, text=True)
+
+        self.assertEqual(execute({}).returncode, 0)
+        mutations = (
+            {"MODEL_D_CONTEXT": "DOWNSTREAM_SECURITY_WORKFLOWS"},
+            {"POLICY_LOCK_SOURCE": None}, {"AUDIT_LOCK_SOURCE": "foreign"},
+            {"CANDIDATE_EVIDENCE": "RUN_CANDIDATE_STAGE_A_EVIDENCE\nX=Y"},
+            {"PROTECTED_EVIDENCE": "SKIP"}, {"DOWNSTREAM_VALIDATION": "RUN_OTHER"},
+            {"MODEL_D_OWNER": "OPTIONAL"}, {"NORMALIZATION_ROOTS": "policy,candidate\nX=Y"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(execute(mutation).returncode, 0)
+
+    def test_real_powershell_propagates_native_failure_immediately(self) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        for name in ("Resolve protected Model D orchestration",
+                     "Install isolated hash-locked policy environment",
+                     "Run candidate Stage A evidence", "Run legacy protected health",
+                     "Install isolated hash-locked audit environment",
+                     "Audit locked policy dependencies", "Validate downstream security workflows"):
+            run = next(step["run"] for step in steps if step["name"] == name)
+            guard = next(line.strip() for line in run.splitlines()
+                         if line.strip().startswith("if ($LASTEXITCODE -ne 0)"))
+            probe = "python -c 'import sys; sys.exit(23)'\n" + guard + "\nWrite-Output REACHED"
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", probe],
+                capture_output=True, text=True)
+            with self.subTest(step=name):
+                self.assertEqual(result.returncode, 23, result.stderr or result.stdout)
+                self.assertNotIn("REACHED", result.stdout)
+
+    def test_model_d_output_schema_tampering_fails_closed(self) -> None:
+        result = bootstrap.BootstrapResult(
+            bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+            bootstrap.PolicySource.CANDIDATE,
+            bootstrap.VersionDisposition.SAME_VERSION,
+            bootstrap.OWNER_AUTHORIZATION, bootstrap.POST_MERGE_PROOF)
+        plan = bootstrap.derive_model_d_plan(result)
+        self.assertEqual(len(bootstrap._validated_model_d_outputs(plan)), 6)
+        for schema in (
+                bootstrap._MODEL_D_OUTPUT_KEYS[:-1],
+                bootstrap._MODEL_D_OUTPUT_KEYS[:-1] +
+                (bootstrap._MODEL_D_OUTPUT_KEYS[0],),
+                bootstrap._MODEL_D_OUTPUT_KEYS[:-1] + ("unknown-output",)):
+            with self.subTest(schema=schema), mock.patch.object(
+                    bootstrap, "_MODEL_D_OUTPUT_KEYS", schema):
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap._validated_model_d_outputs(plan)
+        object.__setattr__(plan, "candidate_evidence", "RUN\nforged=value")
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._validated_model_d_outputs(plan)
+
+    def test_authority_control_and_order_mutations_reject(self) -> None:
+        original = self._workflow()
+        cases = (
+            ("context branch", "Run candidate Stage A evidence", "if",
+             "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'"),
+            ("missing disposition", "Run candidate Stage A evidence", "if", ""),
+            ("candidate authority", "Run candidate Stage A evidence", "if",
+             "github.event.pull_request.head.sha != ''"),
+            ("ignored error", "Install isolated hash-locked policy environment",
+             "run", "continue-on-error: true"),
+        )
+        for label, step_name, field, value in cases:
+            with self.subTest(label=label):
+                workflow = json.loads(json.dumps(original))
+                step = next(item for item in workflow["jobs"]["security-workflows-policy"]["steps"]
+                            if item["name"] == step_name)
+                if field == "run":
+                    step[field] += "\n" + value
+                else:
+                    step[field] = value
+                with self.assertRaises(AssertionError):
+                    self._assert_closed(workflow)
+        for label, mutate in (
+                ("later authority", lambda steps: steps.insert(10, steps.pop(8))),
+                ("missing validation", lambda steps: steps.pop(9)),
+                ("downstream before authority", lambda steps: steps.insert(5, steps.pop(-1)))):
+            with self.subTest(label=label):
+                workflow = json.loads(json.dumps(original))
+                mutate(workflow["jobs"]["security-workflows-policy"]["steps"])
+                with self.assertRaises(AssertionError):
+                    self._assert_closed(workflow)
+
+    def test_ast_forbidden_and_failure_mutations_reject(self) -> None:
+        original = self._workflow()
+        mutations = (
+            "\nInvoke-Expression 'python -V'",
+            "\n& python -V",
+            "\ntry { python -V } catch { exit 0 }",
+            "\ntrap { continue }",
+            "\nStart-Job { python -V }",
+            "\n$global:POLICY_SOURCE = 'candidate'",
+            "\n$env:GITHUB_ENV = 'authority'",
+            "\nif ($env:POLICY_SOURCE -eq 'policy') { exit 0 }",
+            "\nforeach ($root in @('policy','candidate')) { git -C $root reset --hard HEAD }",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                workflow = json.loads(json.dumps(original))
+                step = workflow["jobs"]["security-workflows-policy"]["steps"][5]
+                step["run"] += mutation
+                with self.assertRaises(AssertionError):
+                    self._assert_closed(workflow)
+        for label, before, after in (
+                ("missing guard", "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", ""),
+                ("default success", "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+                 "if ($LASTEXITCODE -ne 0) { exit 0 }"),
+                ("error suppression", "$ErrorActionPreference = 'Stop'",
+                 "$ErrorActionPreference = 'Continue'")):
+            with self.subTest(label=label):
+                workflow = json.loads(json.dumps(original))
+                step = workflow["jobs"]["security-workflows-policy"]["steps"][5]
+                step["run"] = step["run"].replace(before, after, 1)
+                with self.assertRaises(AssertionError):
+                    self._assert_closed(workflow)
+        for label, step_name, before, after in (
+                ("candidate SHA source", "Resolve protected bootstrap authority",
+                 '--candidate-sha "${{ github.sha }}"',
+                 '--candidate-sha "${{ github.event.pull_request.head.sha }}"'),
+                ("venv isolation", "Install isolated hash-locked policy environment",
+                 "python -m venv policy-env", "python -m venv policy-env --system-site-packages"),
+                ("lock source", "Install isolated hash-locked audit environment",
+                 "steps.protected-model-d.outputs.audit-lock-source",
+                 "steps.protected-bootstrap.outputs.policy-source"),
+                ("root literal", "Resolve protected bootstrap authority",
+                 '${{ github.workspace }}/candidate', '${{ github.workspace }}/policy'),
+                ("protected output key", "Acquire protected Git identity",
+                 '"protected-sha=$protectedSha" | Out-File',
+                 '"candidate-sha=$protectedSha" | Out-File'),
+                ("parse error", "Resolve protected Model D orchestration",
+                 "$ErrorActionPreference = 'Stop'", "$ErrorActionPreference = 'Stop'\nif (")):
+            with self.subTest(label=label):
+                workflow = json.loads(json.dumps(original))
+                step = next(item for item in workflow["jobs"]["security-workflows-policy"]["steps"]
+                            if item["name"] == step_name)
+                self.assertIn(before, step["run"])
+                step["run"] = step["run"].replace(before, after, 1)
+                with self.assertRaises(AssertionError):
+                    self._assert_closed(workflow)
+
+
 class ModelDMaintenanceAdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -1362,15 +2476,7 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         )
         self._configure(self.protected)
         git(self.protected, "checkout", "-B", "main",
-            "2784fc943f9eebcab4e468980ad0040499eadc52")
-        git(self.protected, "checkout", "-b", "d0-generation-repair")
-        for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
-            (self.protected / name).write_bytes((source / name).read_bytes())
-        git(self.protected, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
-        git(self.protected, "commit", "-m", "Repair D0 generation lifecycle")
-        git(self.protected, "checkout", "main")
-        git(self.protected, "merge", "--no-ff", "d0-generation-repair",
-            "-m", "Merge D0 generation repair")
+            "6a60970906f7bdf8d7a691f8309e38c09f8071e4")
         self.protected_sha = git(self.protected, "rev-parse", "HEAD")
         git(self.protected, "update-ref", "refs/remotes/origin/main",
             self.protected_sha)
@@ -1452,7 +2558,7 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
                          "MODEL_D_ORCHESTRATION_V1_GENERATION_1")
         self.assertEqual(
             bootstrap.MODEL_D_MAINTENANCE_LIFECYCLE,
-            "MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE")
+            "MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED")
         self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_PATHS, (
             ".github/workflows/security-workflows-policy.yml",
             "protected_policy_bootstrap.py",
@@ -1835,6 +2941,7 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
                 self._validate(candidate=candidate)
 
     def test_accumulated_d1_d4_path_reaches_one_d5_consumption(self) -> None:
+        """Admit the exact accumulated worktree, then prove its protected route."""
         root = self.base / "accumulated-model-d"
         subprocess.run(
             ["git", "clone", "--no-hardlinks", "--no-checkout",
@@ -1842,23 +2949,103 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
             check=True, capture_output=True, text=True)
         self._configure(root)
         git(root, "checkout", "-b", "accumulated-model-d")
-        bootstrap_path = root / "protected_policy_bootstrap.py"
-        tests_path = root / "test_verify_security_workflows.py"
-        workflow_path = root / ".github/workflows/security-workflows-policy.yml"
-        bootstrap_path.write_bytes(
-            bootstrap_path.read_bytes() + b"\n# simulated-d1\n# simulated-d2\n")
-        tests_path.write_bytes(
-            tests_path.read_bytes() + b"\n# simulated-d1-d2\n# simulated-d4\n")
-        workflow_path.write_bytes(
-            workflow_path.read_bytes() + b"\n# simulated-d3\n")
-        data = bootstrap_path.read_bytes()
-        active = b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE'
-        consumed = b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED'
-        self.assertEqual(data.count(active), 1)
-        bootstrap_path.write_bytes(data.replace(active, consumed))
+        source = Path(__file__).parent.resolve()
+        for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
+            (root / name).write_bytes((source / name).read_bytes())
         git(root, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
         git(root, "commit", "-m", "Comprehensive D1-D4 Model D candidate")
+        for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
+            self.assertEqual(git(root, "rev-parse", f"HEAD:{name}"),
+                             git(source, "hash-object", "--no-filters", name))
+        self.assertEqual(bootstrap._model_d_generation_state(
+            self.protected, self.protected_sha), "ACTIVE")
+        self.assertEqual(bootstrap._model_d_generation_state(
+            root, git(root, "rev-parse", "HEAD")), "CONSUMED")
         self._validate(candidate=root)
+
+        # The old protected CLI cannot run the new candidate-only operation.
+        old_bootstrap = self.base / "protected-base-bootstrap.py"
+        old_bootstrap.write_bytes(subprocess.run(
+            ["git", "-C", str(self.protected), "show",
+             f"{self.protected_sha}:protected_policy_bootstrap.py"],
+            check=True, capture_output=True).stdout)
+        candidate_sha = git(root, "rev-parse", "HEAD")
+        old_output = self.base / "protected-base-output"
+        old_output.write_bytes(b"")
+        old_evaluate = subprocess.run([
+            os.sys.executable, "-I", "-S", str(old_bootstrap), "evaluate",
+            "--event-name", "pull_request",
+            "--repository", bootstrap.REPOSITORY,
+            "--base-repository", bootstrap.REPOSITORY,
+            "--base-branch", "main",
+            "--candidate-sha", candidate_sha,
+            "--protected-sha", self.protected_sha,
+            "--candidate-root", str(root),
+            "--protected-root", str(self.protected),
+            "--event-ref", "refs/pull/1/merge",
+            "--default-branch", "main",
+            "--workflow-ref", (bootstrap.REPOSITORY +
+                               "/.github/workflows/security-workflows-policy.yml@refs/pull/1/merge"),
+        ], env={**os.environ, "GITHUB_OUTPUT": str(old_output)},
+           capture_output=True, text=True)
+        self.assertEqual(old_evaluate.returncode, 0, old_evaluate.stderr)
+        self.assertEqual(len(old_output.read_text(encoding="utf-8").splitlines()), 5)
+        old_admission = subprocess.run([
+            os.sys.executable, "-I", "-S", str(old_bootstrap), "admit-maintenance",
+            "--maintenance-operation", bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+            "--maintenance-generation", bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+            "--candidate-sha", candidate_sha,
+            "--protected-sha", self.protected_sha,
+            "--candidate-root", str(root),
+            "--protected-root", str(self.protected),
+        ], capture_output=True, text=True)
+        self.assertEqual(old_admission.returncode, 0, old_admission.stderr)
+        first_landing = subprocess.run(
+            [os.sys.executable, "-I", "-S", str(old_bootstrap), "run-model-d"],
+            capture_output=True, text=True)
+        self.assertNotEqual(first_landing.returncode, 0)
+        self.assertIn("invalid choice: 'run-model-d'", first_landing.stderr)
+
+        git(self.protected, "checkout", "-b", "comprehensive-model-d")
+        git(self.protected, "fetch", str(root), git(root, "rev-parse", "HEAD"))
+        git(self.protected, "merge", "--no-ff", "FETCH_HEAD",
+            "-m", "Consume exact comprehensive Model D candidate")
+        consumed_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", consumed_sha)
+        self.assertEqual(bootstrap._model_d_generation_state(
+            self.protected, consumed_sha), "CONSUMED")
+        self.assertTrue(bootstrap._model_d_generation_was_consumed(
+            self.protected, consumed_sha))
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._validate(candidate=root, protected=self.protected)
+
+        proof_candidate = self.base / "protected-proof-candidate"
+        subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout",
+                        str(self.protected), str(proof_candidate)],
+                       check=True, capture_output=True, text=True)
+        git(proof_candidate, "checkout", "-B", "main", consumed_sha)
+        self._configure(proof_candidate)
+        output = self.base / "protected-proof-output"
+        output.write_bytes(b"")
+        proof = subprocess.run([
+            os.sys.executable, "-I", "-S",
+            str(self.protected / "protected_policy_bootstrap.py"), "run-model-d",
+            "--event-name", "workflow_dispatch",
+            "--repository", bootstrap.REPOSITORY,
+            "--base-repository", bootstrap.REPOSITORY,
+            "--base-branch", "main",
+            "--candidate-sha", consumed_sha,
+            "--protected-sha", consumed_sha,
+            "--candidate-root", str(proof_candidate),
+            "--protected-root", str(self.protected),
+            "--event-ref", "refs/heads/main",
+            "--default-branch", "main",
+            "--workflow-ref", (bootstrap.REPOSITORY +
+                               "/.github/workflows/security-workflows-policy.yml@refs/heads/main"),
+        ], env={**os.environ, "GITHUB_OUTPUT": str(output)},
+           capture_output=True, text=True)
+        self.assertEqual(proof.returncode, 0, proof.stderr)
+        self.assertEqual(len(output.read_text(encoding="utf-8").splitlines()), 11)
 
     def test_workflow_uses_only_protected_bridge_and_preserves_outputs(self) -> None:
         workflow = yaml.load(
