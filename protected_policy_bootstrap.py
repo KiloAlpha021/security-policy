@@ -8,6 +8,7 @@ post-merge protected proof are required for the first landing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import stat
@@ -27,9 +28,10 @@ TRANSITION_PROTECTED_BASE = "76a811e76edbefc76ab1baf20795e2755f5bb794"
 OWNER_AUTHORIZATION = "REQUIRED"
 POST_MERGE_PROOF = "REQUIRED"
 MODEL_D_MAINTENANCE_OPERATION = "MODEL_D_ORCHESTRATION_V1"
+MODEL_D_PLAN_OPERATION = "MODEL_D_PLAN_V1"
 MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_1"
 MODEL_D_MAINTENANCE_HISTORY_ANCHOR = "2784fc943f9eebcab4e468980ad0040499eadc52"
-MODEL_D_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE"
+MODEL_D_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED"
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
     "protected_policy_bootstrap.py",
@@ -58,6 +60,10 @@ _OUTPUT_KEYS = (
     "version-disposition",
     "owner-authorization",
     "post-merge-proof",
+)
+_MODEL_D_OUTPUT_KEYS = (
+    "normalization-roots", "policy-lock-source", "audit-lock-source",
+    "candidate-evidence", "protected-evidence", "downstream-validation",
 )
 
 
@@ -88,6 +94,27 @@ class PolicySource(str, Enum):
 class VersionDisposition(str, Enum):
     SAME_VERSION = "SAME_VERSION"
     IMMEDIATE_SUCCESSOR = "IMMEDIATE_SUCCESSOR"
+
+
+class NormalizationRoot(str, Enum):
+    CANDIDATE = "candidate"
+    POLICY = "policy"
+
+
+class CandidateEvidenceDisposition(str, Enum):
+    RUN_STAGE_A = "RUN_CANDIDATE_STAGE_A_EVIDENCE"
+    SKIP = "SKIP"
+
+
+class ProtectedEvidenceDisposition(str, Enum):
+    RUN_LEGACY_HEALTH = "RUN_LEGACY_PROTECTED_HEALTH"
+    APPLY_STAGE_A_TO_CANDIDATE = "APPLY_PROTECTED_STAGE_A_TO_CANDIDATE"
+    TEST_INDEPENDENT_POLICY = "TEST_INDEPENDENT_ROOT_POLICY"
+
+
+class DownstreamValidationDisposition(str, Enum):
+    RUN = "RUN_DOWNSTREAM_VALIDATION"
+    SKIP = "SKIP"
 
 
 @dataclass(frozen=True)
@@ -126,6 +153,196 @@ class BootstrapResult:
             _clean(key, "output key")
             _clean(value, "output value")
         return values
+
+
+@dataclass(frozen=True, slots=True)
+class ModelDOrchestrationPlan:
+    normalization_roots: tuple[NormalizationRoot, ...]
+    policy_lock_source: PolicySource
+    audit_lock_source: PolicySource
+    candidate_evidence: CandidateEvidenceDisposition
+    protected_evidence: ProtectedEvidenceDisposition
+    downstream_validation: DownstreamValidationDisposition
+
+    def __post_init__(self) -> None:
+        if (type(self.normalization_roots) is not tuple or
+                self.normalization_roots != (
+                    NormalizationRoot.CANDIDATE, NormalizationRoot.POLICY) or
+                any(type(root) is not NormalizationRoot
+                    for root in self.normalization_roots) or
+                type(self.policy_lock_source) is not PolicySource or
+                type(self.audit_lock_source) is not PolicySource or
+                type(self.candidate_evidence) is not CandidateEvidenceDisposition or
+                type(self.protected_evidence) is not ProtectedEvidenceDisposition or
+                type(self.downstream_validation) is not DownstreamValidationDisposition):
+            raise BootstrapError("Invalid MODEL_D_PLAN_V1 value")
+
+
+def derive_model_d_plan(result: BootstrapResult) -> ModelDOrchestrationPlan:
+    """Map a result value to a plan value; neither object proves provenance."""
+    if type(result) is not BootstrapResult:
+        raise BootstrapError("Invalid MODEL_D_PLAN_V1 input")
+    if set(vars(result)) != {
+            "evaluation_context", "policy_source", "version_disposition",
+            "owner_authorization", "post_merge_proof"}:
+        raise BootstrapError("Invalid MODEL_D_PLAN_V1 input schema")
+    _validated_outputs(result)
+
+    authority = (
+        result.evaluation_context,
+        result.policy_source,
+        result.version_disposition,
+    )
+    supported = {
+        (EvaluationContext.SELF_PR_BOOTSTRAP,
+         PolicySource.CANDIDATE,
+         VersionDisposition.SAME_VERSION): (
+            CandidateEvidenceDisposition.RUN_STAGE_A,
+            ProtectedEvidenceDisposition.RUN_LEGACY_HEALTH,
+            DownstreamValidationDisposition.SKIP,
+        ),
+        (EvaluationContext.SELF_PR_BOOTSTRAP,
+         PolicySource.POLICY,
+         VersionDisposition.IMMEDIATE_SUCCESSOR): (
+            CandidateEvidenceDisposition.RUN_STAGE_A,
+            ProtectedEvidenceDisposition.RUN_LEGACY_HEALTH,
+            DownstreamValidationDisposition.SKIP,
+        ),
+        (EvaluationContext.STAGE_A_PROTECTED_PROOF,
+         PolicySource.POLICY,
+         VersionDisposition.SAME_VERSION): (
+            CandidateEvidenceDisposition.RUN_STAGE_A,
+            ProtectedEvidenceDisposition.APPLY_STAGE_A_TO_CANDIDATE,
+            DownstreamValidationDisposition.SKIP,
+        ),
+        (EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS,
+         PolicySource.POLICY,
+         VersionDisposition.SAME_VERSION): (
+            CandidateEvidenceDisposition.SKIP,
+            ProtectedEvidenceDisposition.TEST_INDEPENDENT_POLICY,
+            DownstreamValidationDisposition.RUN,
+        ),
+    }
+    try:
+        candidate_evidence, protected_evidence, downstream_validation = supported[authority]
+    except KeyError as error:
+        raise BootstrapError("Unsupported MODEL_D_PLAN_V1 authority combination") from error
+    return ModelDOrchestrationPlan(
+        normalization_roots=(NormalizationRoot.CANDIDATE, NormalizationRoot.POLICY),
+        policy_lock_source=result.policy_source,
+        audit_lock_source=result.policy_source,
+        candidate_evidence=candidate_evidence,
+        protected_evidence=protected_evidence,
+        downstream_validation=downstream_validation,
+    )
+
+
+def evaluate_model_d_plan(
+        inputs: BootstrapInputs) -> tuple[BootstrapResult, ModelDOrchestrationPlan]:
+    """Authoritative D1 entry point: evaluate once, then apply the sole plan map."""
+    result = evaluate(inputs)
+    return result, derive_model_d_plan(result)
+
+
+def validate_model_d_plan_correspondence(
+        inputs: BootstrapInputs, result: BootstrapResult,
+        plan: ModelDOrchestrationPlan,
+) -> tuple[BootstrapResult, ModelDOrchestrationPlan]:
+    """Recompute before accepting supplied values; equality, not identity, binds them."""
+    canonical_result, canonical_plan = evaluate_model_d_plan(inputs)
+    if (type(result) is not BootstrapResult or
+            type(plan) is not ModelDOrchestrationPlan or
+            result != canonical_result or plan != canonical_plan):
+        raise BootstrapError("MODEL_D_PLAN_V1 correspondence mismatch")
+    return canonical_result, canonical_plan
+
+
+_LOCK_ENTRY = re.compile(
+    r"([A-Za-z0-9_.-]+)==([^\s]+) --hash=sha256:([0-9a-f]{64})\Z")
+_PROTECTED_LOCK_BLOBS = {
+    "requirements-policy.lock": "b11e8ca274a5426789be10d24919679c8da0aa4f",
+    "requirements-audit.lock": "dbfa6a4d8ef8c344009ad3a15007b2b1c98511fe",
+}
+
+
+def _validate_model_d_lock(root: Path, revision: str, name: str,
+                           source: PolicySource) -> None:
+    """Verify exact committed and worktree bytes of one plan-selected lock."""
+    record = _git_bytes(root, "ls-tree", "-z", revision, "--", name)
+    try:
+        identity, raw_path = record.removesuffix(b"\0").split(b"\t", 1)
+        mode, kind, object_id = identity.decode("ascii").split(" ")
+        if (raw_path != name.encode("ascii") or mode != "100644" or
+                kind != "blob" or _SHA.fullmatch(object_id) is None):
+            raise ValueError("Invalid lock tree entry")
+    except (UnicodeError, ValueError) as error:
+        raise BootstrapError("Invalid Model D lock Git identity") from error
+    if source is PolicySource.POLICY and object_id != _PROTECTED_LOCK_BLOBS[name]:
+        raise BootstrapError("Protected Model D lock identity changed")
+    path = root / name
+    try:
+        metadata = path.lstat()
+        data = path.read_bytes()
+    except OSError as error:
+        raise BootstrapError("Model D lock is unavailable") from error
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise BootstrapError("Model D lock must be a regular file")
+    if (hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data)
+            .hexdigest() != object_id):
+        raise BootstrapError("Model D lock raw bytes differ from committed bytes")
+    if (b"\0" in data or b"\r" in data or data.startswith(b"\xef\xbb\xbf") or
+            not data.endswith(b"\n")):
+        raise BootstrapError("Invalid Model D lock representation")
+    try:
+        lines = data.decode("utf-8", errors="strict").splitlines()
+    except UnicodeError as error:
+        raise BootstrapError("Invalid Model D lock encoding") from error
+    entries = [line for line in lines if line and not line.startswith("#")]
+    if (not entries or entries[0] != "--only-binary=:all:" or
+            len(entries) < 2 or any(_LOCK_ENTRY.fullmatch(line) is None
+                                    for line in entries[1:])):
+        raise BootstrapError("Malformed Model D lock")
+    names = [_LOCK_ENTRY.fullmatch(line).group(1).lower() for line in entries[1:]]
+    if len(names) != len(set(names)):
+        raise BootstrapError("Duplicate Model D lock package")
+    required = "pyyaml" if name == "requirements-policy.lock" else "pip-audit"
+    if required not in names:
+        raise BootstrapError("Model D lock has the wrong role")
+
+
+def normalize_and_validate_model_d_bytes(
+        inputs: BootstrapInputs) -> tuple[BootstrapResult, ModelDOrchestrationPlan]:
+    """D2 mechanics: use only canonical D1 decisions, return only after validation.
+
+    Workflow invocation and external failure propagation belong to D3.
+    """
+    result, plan = evaluate_model_d_plan(inputs)
+    roots = {
+        NormalizationRoot.CANDIDATE: _root(inputs.candidate_root, "candidate root"),
+        NormalizationRoot.POLICY: _root(inputs.protected_root, "protected root"),
+    }
+    revisions = {
+        NormalizationRoot.CANDIDATE: _sha(inputs.candidate_sha, "candidate SHA"),
+        NormalizationRoot.POLICY: _sha(inputs.protected_sha, "protected SHA"),
+    }
+    for selected in plan.normalization_roots:
+        root = roots[selected]
+        revision = revisions[selected]
+        _git_bytes(root, "config", "--local", "core.autocrlf", "false")
+        if _git(root, "config", "--local", "--get", "core.autocrlf") != "false":
+            raise BootstrapError("Model D normalization policy did not take effect")
+        _git_bytes(root, "reset", "--hard", revision)
+        if _git(root, "rev-parse", "HEAD") != revision:
+            raise BootstrapError("Model D normalization changed checkout identity")
+    sources = (
+        ("requirements-policy.lock", plan.policy_lock_source),
+        ("requirements-audit.lock", plan.audit_lock_source),
+    )
+    for name, source in sources:
+        selected = (NormalizationRoot.CANDIDATE if source is PolicySource.CANDIDATE
+                    else NormalizationRoot.POLICY)
+        _validate_model_d_lock(roots[selected], revisions[selected], name, source)
+    return result, plan
 
 
 def extract_candidate_baseline(candidate_root: Path) -> str:
@@ -425,6 +642,45 @@ def emit_github_output(
         candidate_root: Path, protected_root: Path) -> None:
     """Atomically replace a trusted empty output file with validated outputs."""
     values = _validated_outputs(result)
+    _emit_fixed_outputs(values, destination, candidate_root, protected_root)
+
+
+def _validated_model_d_outputs(
+        plan: ModelDOrchestrationPlan) -> tuple[tuple[str, str], ...]:
+    if type(plan) is not ModelDOrchestrationPlan:
+        raise BootstrapError("Invalid Model D output plan")
+    plan.__post_init__()
+    values = (
+        ("normalization-roots", ",".join(root.value for root in plan.normalization_roots)),
+        ("policy-lock-source", plan.policy_lock_source.value),
+        ("audit-lock-source", plan.audit_lock_source.value),
+        ("candidate-evidence", plan.candidate_evidence.value),
+        ("protected-evidence", plan.protected_evidence.value),
+        ("downstream-validation", plan.downstream_validation.value),
+    )
+    if tuple(key for key, _ in values) != _MODEL_D_OUTPUT_KEYS:
+        raise BootstrapError("Invalid Model D output schema")
+    for key, value in values:
+        _clean(key, "Model D output key")
+        _clean(value, "Model D output value")
+    return values
+
+
+def emit_model_d_output(
+        inputs: BootstrapInputs, result: BootstrapResult,
+        plan: ModelDOrchestrationPlan, destination: Path) -> None:
+    """Emit a fixed plan only after canonical correspondence is re-established."""
+    canonical_result, canonical_plan = validate_model_d_plan_correspondence(
+        inputs, result, plan)
+    values = (_validated_outputs(canonical_result) +
+              _validated_model_d_outputs(canonical_plan))
+    _emit_fixed_outputs(values, destination, inputs.candidate_root,
+                        inputs.protected_root)
+
+
+def _emit_fixed_outputs(
+        values: tuple[tuple[str, str], ...], destination: Path,
+        candidate_root: Path, protected_root: Path) -> None:
     candidate = _root(candidate_root, "candidate root")
     protected = _root(protected_root, "protected root")
     if not isinstance(destination, Path) or not destination.is_absolute():
@@ -600,12 +856,14 @@ def evaluate(inputs: BootstrapInputs) -> BootstrapResult:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="protected_policy_bootstrap.py")
     commands = parser.add_subparsers(dest="operation", required=True)
-    evaluate_parser = commands.add_parser("evaluate")
-    for name in (
-            "event-name", "repository", "base-repository", "base-branch",
-            "candidate-sha", "protected-sha", "candidate-root", "protected-root",
-            "event-ref", "default-branch", "workflow-ref"):
-        evaluate_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
+    for operation in ("evaluate", "run-model-d"):
+        operation_parser = commands.add_parser(operation)
+        for name in (
+                "event-name", "repository", "base-repository", "base-branch",
+                "candidate-sha", "protected-sha", "candidate-root", "protected-root",
+                "event-ref", "default-branch", "workflow-ref"):
+            operation_parser.add_argument(
+                f"--{name}", required=True, default=None, action=_Once)
     maintenance_parser = commands.add_parser("admit-maintenance")
     for name in (
             "maintenance-operation", "maintenance-generation",
@@ -648,16 +906,22 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.candidate_sha, arguments.protected_sha,
             )
             return 0
-        if arguments.operation != "evaluate":
+        if arguments.operation not in {"evaluate", "run-model-d"}:
             raise BootstrapError("Unsupported bootstrap operation")
         inputs = _cli_inputs(arguments)
-        result = evaluate(inputs)
+        if arguments.operation == "run-model-d":
+            result, plan = normalize_and_validate_model_d_bytes(inputs)
+        else:
+            result = evaluate(inputs)
         validate_protected_universe(inputs.protected_root, inputs.protected_sha)
         raw_destination = os.environ.get("GITHUB_OUTPUT")
         if raw_destination is None:
             raise BootstrapError("GITHUB_OUTPUT is required")
-        emit_github_output(
-            result, Path(raw_destination), inputs.candidate_root, inputs.protected_root)
+        if arguments.operation == "run-model-d":
+            emit_model_d_output(inputs, result, plan, Path(raw_destination))
+        else:
+            emit_github_output(
+                result, Path(raw_destination), inputs.candidate_root, inputs.protected_root)
     except BootstrapError as error:
         print(f"bootstrap error: {error}", file=sys.stderr)
         return 2
