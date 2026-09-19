@@ -16,7 +16,8 @@ from unittest import mock
 
 import yaml
 
-from verify_security_workflows import action_references, validate_verifier, verify
+from verify_security_workflows import (action_references, validate_tests,
+                                       validate_verifier, validate_workflow, verify)
 import protected_policy_bootstrap as bootstrap
 
 
@@ -63,19 +64,25 @@ jobs:
     steps:
       - uses: actions/checkout@1111111111111111111111111111111111111111
         with:
-          repository: ${{ github.repository }}
+          repository: KiloAlpha021/automated-trading-bot
           ref: ${{ github.sha }}
           path: candidate
+          fetch-depth: 0
       - uses: actions/checkout@1111111111111111111111111111111111111111
         with:
           repository: KiloAlpha021/security-workflows
           ref: main
           path: trusted
-      - name: verify
+      - uses: actions/setup-python@1111111111111111111111111111111111111111
+      - name: Enforce separate candidate and trusted identities
         env:
           EVENT_REPOSITORY: ${{ github.repository }}
           CANDIDATE_SHA: ${{ github.sha }}
-        run: python trusted/verify_candidate.py
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python trusted/verify_candidate.py --candidate candidate --trusted trusted --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --event-name $env:EVENT_NAME
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: checks
         working-directory: candidate
         run: |
@@ -88,12 +95,20 @@ jobs:
 '''
         verifier = '''CANDIDATE_REPOSITORY = "KiloAlpha021/automated-trading-bot"
 TRUSTED_REPOSITORY = "KiloAlpha021/security-workflows"
-SUPPORTED_REPOSITORIES = {CANDIDATE_REPOSITORY, TRUSTED_REPOSITORY}
-def verify(candidate, trusted, event_repository, candidate_sha):
-    if event_repository not in SUPPORTED_REPOSITORIES: raise ValueError()
-    if repository(candidate) != event_repository: raise ValueError()
-    if head(candidate) != candidate_sha: raise ValueError("Candidate checkout does not match event SHA")
-    if candidate == trusted: raise ValueError("Candidate and trusted roots must be separate")
+TRUSTED_REF = "refs/remotes/origin/main"
+def verify(candidate, trusted, event_repository, candidate_sha, event_name):
+    candidate = candidate.resolve(strict=True)
+    trusted = trusted.resolve(strict=True)
+    if candidate == trusted or candidate in trusted.parents or trusted in candidate.parents: raise ValueError("Candidate and trusted roots must be separate")
+    if event_repository != CANDIDATE_REPOSITORY: raise ValueError("Wrong target repository")
+    if event_name not in {"pull_request", "merge_group"}: raise ValueError("Unsupported required-workflow event")
+    if not SHA.fullmatch(candidate_sha): raise ValueError("Invalid candidate SHA")
+    if repository(candidate) != CANDIDATE_REPOSITORY: raise ValueError("Wrong candidate checkout")
+    if git(candidate, "rev-parse", "HEAD") != candidate_sha: raise ValueError("Candidate checkout does not match event SHA")
+    if git(candidate, "rev-parse", "--is-shallow-repository") != "false": raise ValueError("Required candidate history is unavailable")
+    if repository(trusted) != TRUSTED_REPOSITORY: raise ValueError("Wrong trusted checkout")
+    if git(trusted, "rev-parse", "HEAD") != git(trusted, "rev-parse", TRUSTED_REF): raise ValueError("Trusted checkout is not protected main")
+    if actual_lock != expected_lock: raise ValueError("Candidate dependency lock differs from trusted lock")
     raise ValueError("Trusted M1 control mismatch")
 def identities(line):
     raise ValueError("Malformed trusted identity")
@@ -102,8 +117,8 @@ def duplicate():
 '''
         tests = "\n".join(f"def {name}(): pass" for name in (
             "test_valid_candidate_and_protected_controls", "test_reversed_roots_fail",
-            "test_wrong_candidate_sha_fails", "test_unknown_repository_fails",
-            "test_malformed_identity_fails"))
+            "test_wrong_candidate_sha_fails", "test_malformed_identity_fails"))
+        tests += "\ndef test_wrong_target_repository_fails():\n    with self.assertRaisesRegex(ValueError, 'target repository'):\n        self.check(repository='KiloAlpha021/security-workflows')\n"
         identities = "\n".join((
             "1" * 40 + "  pyproject.toml",
             "2" * 40 + "  tests/test_architecture.py",
@@ -144,20 +159,93 @@ def duplicate():
     def test_good_candidate(self) -> None:
         self.check()
 
+    def test_current_fixed_target_static_contract(self) -> None:
+        workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text(encoding="utf-8")
+        validate_workflow(workflow)
+        cases = {
+            "wrong_trading_repository": ("repository: KiloAlpha021/automated-trading-bot",
+                                         "repository: Other/trading-bot"),
+            "mutable_repository": ("repository: KiloAlpha021/automated-trading-bot",
+                                   "repository: ${{ inputs.repository }}"),
+            "wrong_candidate_path": ("path: candidate", "path: other"),
+            "mutable_ref": ("ref: ${{ github.sha }}", "ref: main"),
+            "wrong_trusted_repository": ("repository: KiloAlpha021/security-workflows",
+                                         "repository: Other/security-workflows"),
+            "wrong_trusted_ref": ("ref: main", "ref: develop"),
+            "wrong_trusted_path": ("path: trusted", "path: other"),
+            "wrong_event": ("EVENT_REPOSITORY: ${{ github.repository }}",
+                            "EVENT_REPOSITORY: ${{ inputs.repository }}"),
+            "wrong_sha": ("CANDIDATE_SHA: ${{ github.sha }}",
+                          "CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}"),
+            "substituted_verifier": ("python trusted/verify_candidate.py",
+                                     "python candidate/verify_candidate.py"),
+            "missing_verifier": ("python trusted/verify_candidate.py", "Write-Host accepted"),
+            "ignored_exit": ("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+                             "Write-Host accepted"),
+            "malformed_yaml": ("jobs:", "jobs: ["),
+            "duplicate_key": ("          path: candidate", "          path: candidate\n          path: candidate"),
+            "hidden_checkout": ("      - name: Enforce separate candidate and trusted identities",
+                                "      - uses: actions/checkout@" + "1" * 40 +
+                                "\n      - name: Enforce separate candidate and trusted identities"),
+        }
+        for name, (old, new) in cases.items():
+            with self.subTest(name=name):
+                self.assertIn(old, workflow)
+                changed = workflow.replace(old, new, 1)
+                with self.assertRaises(ValueError):
+                    validate_workflow(changed)
+        decoy = workflow.replace("repository: KiloAlpha021/automated-trading-bot",
+                                 "repository: Other/trading-bot", 1)
+        decoy += "\n# repository: KiloAlpha021/automated-trading-bot\n"
+        with self.assertRaises(ValueError):
+            validate_workflow(decoy)
+
+    def test_current_fixed_target_runtime_and_adversarial_contract(self) -> None:
+        verifier = (self.candidate / "verify_candidate.py").read_text(encoding="utf-8")
+        tests = (self.candidate / "test_verify_candidate.py").read_text(encoding="utf-8")
+        validate_verifier(verifier)
+        validate_tests(tests)
+        for old, new in (
+            ('KiloAlpha021/automated-trading-bot', 'Other/trading-bot'),
+            ('if event_repository != CANDIDATE_REPOSITORY', 'if False'),
+            ('if event_name not in {"pull_request", "merge_group"}', 'if False'),
+            ('if candidate == trusted or candidate in trusted.parents or trusted in candidate.parents', 'if False'),
+            ('if repository(candidate) != CANDIDATE_REPOSITORY', 'if False'),
+            ('if git(candidate, "rev-parse", "HEAD") != candidate_sha', 'if False'),
+            ('if repository(trusted) != TRUSTED_REPOSITORY', 'if False'),
+            ('if actual_lock != expected_lock', 'if False'),
+        ):
+            with self.subTest(guard=old):
+                self.assertIn(old, verifier)
+                changed = verifier.replace(old, new, 1) + "\n# " + old + "\n"
+                with self.assertRaises(ValueError):
+                    validate_verifier(changed)
+        missing_test = tests.replace("def test_wrong_target_repository_fails", "def renamed_test")
+        with self.assertRaises(ValueError):
+            validate_tests(missing_test + "\n# test_wrong_target_repository_fails\n")
+        ineffective_test = tests.replace("repository='KiloAlpha021/security-workflows'",
+                                         "repository='KiloAlpha021/automated-trading-bot'")
+        with self.assertRaises(ValueError):
+            validate_tests(ineffective_test)
+
     def test_structural_action_references(self) -> None:
         workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text()
         sha = "1" * 40
         refs = action_references(workflow)
-        self.assertEqual([ref for _, ref in refs], [f"actions/checkout@{sha}"] * 2)
+        self.assertEqual([ref for _, ref in refs],
+                         [f"actions/checkout@{sha}"] * 2 + [f"actions/setup-python@{sha}"])
         named = workflow.replace("- uses: actions/checkout@", "- name: checkout\n        uses: actions/checkout@")
-        self.assertEqual([ref for _, ref in action_references(named)], [f"actions/checkout@{sha}"] * 2)
-        quoted = workflow.replace("- uses: actions/checkout@", "- uses: \"actions/checkout@")
-        quoted = quoted.replace(sha + "\n", sha + "\"\n")
-        self.assertEqual([ref for _, ref in action_references(quoted)], [f"actions/checkout@{sha}"] * 2)
+        self.assertEqual([ref for _, ref in action_references(named)],
+                         [f"actions/checkout@{sha}"] * 2 + [f"actions/setup-python@{sha}"])
+        quoted = workflow.replace("- uses: actions/checkout@" + sha,
+                                  '- uses: "actions/checkout@' + sha + '"')
+        self.assertEqual([ref for _, ref in action_references(quoted)],
+                         [f"actions/checkout@{sha}"] * 2 + [f"actions/setup-python@{sha}"])
         escaped_key = workflow.replace("- uses:", '- "\\u0075ses":', 1)
-        self.assertEqual([ref for _, ref in action_references(escaped_key)], [f"actions/checkout@{sha}"] * 2)
+        self.assertEqual([ref for _, ref in action_references(escaped_key)],
+                         [f"actions/checkout@{sha}"] * 2 + [f"actions/setup-python@{sha}"])
         reusable = workflow.replace("    steps:\n", f"    uses: KiloAlpha021/security-policy/.github/workflows/evaluator.yml@{sha}\n    steps:\n", 1)
-        self.assertEqual(len(action_references(reusable)), 3)
+        self.assertEqual(len(action_references(reusable)), 4)
         block = f"jobs:\n  audit:\n    steps:\n      - uses: >-\n          actions/checkout@{sha}\n"
         self.assertEqual(action_references(block)[0][1], f"actions/checkout@{sha}")
         flow = f"jobs: {{audit: {{steps: [{{uses: actions/checkout@{sha}}}]}}}}"
@@ -188,7 +276,7 @@ def duplicate():
 
         assert root is not None
         walk(root, ())
-        self.assertEqual(len(observed), 3)
+        self.assertEqual(len(observed), 4)
         self.assertCountEqual(action_references(workflow), observed)
 
     def _stage_a_contract(self, root: Path) -> None:
@@ -478,7 +566,19 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         self.assertIn('POLICY = "KiloAlpha021/security-policy"', validator)
         self.assertNotIn("candidate/test_verify_security_workflows.py", validator)
         self.assertNotIn("POLICY_PROTECTED_ROOT", validator)
-        validate_verifier(validator)
+        syntax = ast.parse(validator)
+        functions = {node.name for node in syntax.body if isinstance(node, ast.FunctionDef)}
+        self.assertTrue({"verify", "validate_workflow", "validate_verifier",
+                         "validate_identities", "validate_tests"} <= functions)
+        for fragment in (
+            "KiloAlpha021/automated-trading-bot",
+            "if event_repository != CANDIDATE_REPOSITORY",
+            "repository(candidate) != CANDIDATE_REPOSITORY",
+            "Candidate checkout does not match event SHA",
+            "Candidate and trusted roots must be separate",
+            "Trusted M1 control mismatch",
+        ):
+            self.assertIn(fragment, validator)
 
     def test_stage_a_candidate_invariants(self) -> None:
         candidate, protected = self._bound_roots()
@@ -599,10 +699,9 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
             validator_original = validator_path.read_text(encoding="utf-8")
             validator_mutations = (
                 ('POLICY = "KiloAlpha021/security-policy"', 'POLICY = "KiloAlpha021/other"'),
-                ('CANDIDATE_REPOSITORY = "KiloAlpha021/automated-trading-bot"',
-                 'CANDIDATE_REPOSITORY = "KiloAlpha021/other"'),
-                ("if event_repository not in SUPPORTED_REPOSITORIES", "if False"),
-                ("repository(candidate) != event_repository", "False"),
+                ("KiloAlpha021/automated-trading-bot", "KiloAlpha021/other"),
+                ("if event_repository != CANDIDATE_REPOSITORY", "if False"),
+                ("repository(candidate) != CANDIDATE_REPOSITORY", "False"),
                 ("Candidate checkout does not match event SHA", "candidate accepted"),
                 ("Candidate and trusted roots must be separate", "roots may overlap"),
                 ("Trusted M1 control mismatch", "trusted mismatch ignored"),
@@ -862,7 +961,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         cases = json.loads((Path(__file__).parent / "fixtures/mutations/cases.json").read_text())
         mutations = {
             "removed_trusted_blob_validation": ("verify_candidate.py", "Trusted M1 control mismatch", "ignored"),
-            "unknown_repository_accepted": ("verify_candidate.py", "if event_repository not in SUPPORTED_REPOSITORIES", "if False"),
+            "unknown_repository_accepted": ("verify_candidate.py", "if event_repository != CANDIDATE_REPOSITORY", "if False"),
             "floating_action_ref": (".github/workflows/m1-trusted.yml", "@1111111111111111111111111111111111111111", "@v4"),
             "write_capable_permissions": (".github/workflows/m1-trusted.yml", "contents: read", "contents: write"),
             "candidate_sha_verification_removed": ("verify_candidate.py", "Candidate checkout does not match event SHA", "ignored"),
@@ -874,7 +973,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
             "security_provenance_removed": (".github/workflows/m1-trusted.yml", "tests/test_closure_security.py", "tests/test_smoke.py"),
             "critical_step_conditional": (".github/workflows/m1-trusted.yml", "      - name: checks", "      - name: checks\n        if: false"),
             "workflow_identity_replaced": (".github/workflows/m1-trusted.yml", "name: trusted-m1-evaluator", "name: trivial-success"),
-            "repository_dispatch_weakened": ("verify_candidate.py", "if event_repository not in SUPPORTED_REPOSITORIES", "if False"),
+            "repository_dispatch_weakened": ("verify_candidate.py", "if event_repository != CANDIDATE_REPOSITORY", "if False"),
             "malformed_trusted_identity_accepted": ("trusted-git-blobs.txt", "1" * 40 + "  pyproject.toml", "invalid"),
         }
         self.assertEqual(set(cases), set(mutations))

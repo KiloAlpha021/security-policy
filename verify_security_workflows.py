@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -161,16 +162,55 @@ def validate_workflow(text: str) -> None:
     if re.search(r"(?mi)^\s*[a-z_-]+:\s*write\s*$", text):
         raise ValueError("Write-capable workflow permission")
     action_references(text)
+    workflow = yaml.load(text, Loader=RestrictedLoader)
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
+        raise ValueError("Unsupported workflow structure")
+    if workflow.get("name") != "trusted-m1-evaluator" or not isinstance(workflow.get("on"), dict) \
+            or set(workflow["on"]) != {"pull_request", "merge_group"} \
+            or workflow.get("permissions") != {"contents": "read"}:
+        raise ValueError("Trusted workflow authority declaration changed")
+    jobs = workflow["jobs"]
+    if set(jobs) != {"trusted-m1-evaluator"}:
+        raise ValueError("Unexpected trusted workflow job")
+    job = jobs["trusted-m1-evaluator"]
+    if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+        raise ValueError("Unsupported trusted workflow steps")
+    steps = job["steps"]
+    actions = [(index, step) for index, step in enumerate(steps) if "uses" in step]
+    if len(actions) != 3 or [step["uses"].split("@")[0] for _, step in actions] != [
+        "actions/checkout", "actions/checkout", "actions/setup-python"
+    ]:
+        raise ValueError("Unexpected or duplicate workflow action")
+    candidate_checkout, trusted_checkout = actions[0][1], actions[1][1]
+    if actions[0][0] != 0 or actions[1][0] != 1:
+        raise ValueError("Checkout order changed")
+    if candidate_checkout.get("with") != {
+        "repository": "KiloAlpha021/automated-trading-bot",
+        "ref": "${{ github.sha }}",
+        "path": "candidate",
+        "fetch-depth": "0",
+    }:
+        raise ValueError("Exact trading candidate checkout changed")
+    if trusted_checkout.get("with") != {
+        "repository": TARGET, "ref": "main", "path": "trusted"
+    }:
+        raise ValueError("Independent trusted checkout changed")
+    if len(steps) < 4 or steps[3].get("name") != "Enforce separate candidate and trusted identities":
+        raise ValueError("Trusted verifier step changed")
+    verifier_step = steps[3]
+    if not isinstance(verifier_step.get("run"), str):
+        raise ValueError("Protected verifier invocation changed")
+    if verifier_step.get("env") != {
+        "EVENT_REPOSITORY": "${{ github.repository }}",
+        "CANDIDATE_SHA": "${{ github.sha }}",
+        "EVENT_NAME": "${{ github.event_name }}",
+    } or verifier_step.get("run", "").strip().splitlines() != [
+        "$ErrorActionPreference = 'Stop'",
+        "python trusted/verify_candidate.py --candidate candidate --trusted trusted --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --event-name $env:EVENT_NAME",
+        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+    ]:
+        raise ValueError("Protected verifier invocation changed")
     for fragment, message in (
-        ("repository: ${{ github.repository }}", "Event repository candidate checkout removed"),
-        ("ref: ${{ github.sha }}", "Exact candidate checkout removed"),
-        ("path: candidate", "Candidate root removed"),
-        ("repository: KiloAlpha021/security-workflows", "Independent trusted checkout removed"),
-        ("ref: main", "Protected trusted ref removed"),
-        ("path: trusted", "Trusted root removed"),
-        ("EVENT_REPOSITORY: ${{ github.repository }}", "Repository dispatch input removed"),
-        ("CANDIDATE_SHA: ${{ github.sha }}", "Candidate SHA input removed"),
-        ("python trusted/verify_candidate.py", "Independent validator execution removed"),
         ("working-directory: candidate", "Candidate-scoped validation removed"),
         ("python -m pip check", "Dependency identity check removed"),
         ("python -m ruff check", "Ruff check removed"),
@@ -185,12 +225,48 @@ def validate_workflow(text: str) -> None:
 
 
 def validate_verifier(text: str) -> None:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        raise ValueError("Malformed trusted verifier") from exc
+    constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    if constants.get("CANDIDATE_REPOSITORY") != "KiloAlpha021/automated-trading-bot" or \
+            constants.get("TRUSTED_REPOSITORY") != TARGET or \
+            constants.get("TRUSTED_REF") != "refs/remotes/origin/main":
+        raise ValueError("Trusted verifier target constants changed")
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "verify"]
+    if len(functions) != 1:
+        raise ValueError("Trusted verifier entry changed")
+    body = functions[0].body
+    required_guards = (
+        'candidate = candidate.resolve(strict=True)',
+        'trusted = trusted.resolve(strict=True)',
+        'if candidate == trusted or candidate in trusted.parents or trusted in candidate.parents: raise ValueError("Candidate and trusted roots must be separate")',
+        'if event_repository != CANDIDATE_REPOSITORY: raise ValueError("Wrong target repository")',
+        'if event_name not in {"pull_request", "merge_group"}: raise ValueError("Unsupported required-workflow event")',
+        'if not SHA.fullmatch(candidate_sha): raise ValueError("Invalid candidate SHA")',
+        'if repository(candidate) != CANDIDATE_REPOSITORY: raise ValueError("Wrong candidate checkout")',
+        'if git(candidate, "rev-parse", "HEAD") != candidate_sha: raise ValueError("Candidate checkout does not match event SHA")',
+        'if git(candidate, "rev-parse", "--is-shallow-repository") != "false": raise ValueError("Required candidate history is unavailable")',
+        'if repository(trusted) != TRUSTED_REPOSITORY: raise ValueError("Wrong trusted checkout")',
+        'if git(trusted, "rev-parse", "HEAD") != git(trusted, "rev-parse", TRUSTED_REF): raise ValueError("Trusted checkout is not protected main")',
+        'if actual_lock != expected_lock: raise ValueError("Candidate dependency lock differs from trusted lock")',
+    )
+    guard_shapes = [ast.dump(ast.parse(guard).body[0], include_attributes=False)
+                    for guard in required_guards]
+    observed = [ast.dump(node, include_attributes=False) for node in body]
+    positions = [observed.index(shape) if shape in observed else -1 for shape in guard_shapes]
+    if -1 in positions or positions != sorted(positions) or any(
+        isinstance(node, (ast.Return, ast.Try)) for node in ast.walk(functions[0])
+    ):
+        raise ValueError("Trusted verifier event, origin, or HEAD guard changed")
     for fragment, message in (
-        ('CANDIDATE_REPOSITORY = "KiloAlpha021/automated-trading-bot"', "Trading target removed"),
-        ('TRUSTED_REPOSITORY = "KiloAlpha021/security-workflows"', "Trusted target removed"),
-        ("SUPPORTED_REPOSITORIES", "Explicit repository dispatch removed"),
-        ("if event_repository not in SUPPORTED_REPOSITORIES", "Unknown repository is not fail closed"),
-        ("repository(candidate) != event_repository", "Candidate repository binding removed"),
         ("Candidate checkout does not match event SHA", "Candidate SHA verification removed"),
         ("Candidate and trusted roots must be separate", "Root separation removed"),
         ("Trusted M1 control mismatch", "Trusted blob mismatch rejection removed"),
@@ -221,10 +297,35 @@ def validate_tests(text: str) -> None:
         "test_valid_candidate_and_protected_controls",
         "test_reversed_roots_fail",
         "test_wrong_candidate_sha_fails",
-        "test_unknown_repository_fails",
+        "test_wrong_target_repository_fails",
         "test_malformed_identity_fails",
     ):
         require(text, fragment, "Critical adversarial verifier test removed")
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        raise ValueError("Malformed adversarial verifier tests") from exc
+    wrong_target = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                    and node.name == "test_wrong_target_repository_fails"]
+    if len(wrong_target) != 1 or not any(
+        isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Attribute)
+            and item.context_expr.func.attr in {"assertRaises", "assertRaisesRegex"}
+            and any(isinstance(arg, ast.Name) and arg.id == "ValueError"
+                    for arg in item.context_expr.args)
+            for item in node.items
+        ) and any(
+            isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "check"
+            and any(keyword.arg == "repository" and
+                    isinstance(keyword.value, ast.Constant) and
+                    keyword.value.value == TARGET
+                    for keyword in call.keywords)
+            for statement in node.body for call in ast.walk(statement)
+        ) for node in wrong_target[0].body
+    ):
+        raise ValueError("Wrong trading target rejection test removed")
 
 
 def main() -> None:
