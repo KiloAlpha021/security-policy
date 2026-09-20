@@ -291,6 +291,7 @@ def duplicate():
             "POLICY_BASELINE_VERSION": self.BASELINE_VERSION,
             "MODEL_D_MAINTENANCE_GENERATION":
                 bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+            "G2_MAINTENANCE_GENERATION": bootstrap.G2_MAINTENANCE_GENERATION,
         })
         self.assertNotIn("continue-on-error", text)
         self.assertNotIn("GITHUB_ENV", text)
@@ -384,6 +385,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         for fragment in (
             'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py"',
             "admit-maintenance", "--maintenance-operation MODEL_D_ORCHESTRATION_V1",
+            '--maintenance-generation "${{ env.G2_MAINTENANCE_GENERATION }}"',
             '--candidate-sha "${{ github.sha }}"',
             '--protected-sha "${{ steps.protected-git.outputs.protected-sha }}"',
             '--candidate-root "${{ github.workspace }}/candidate"',
@@ -2101,7 +2103,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _EXPRESSION_DIGESTS = {
         "Acquire protected Git identity": "837295a19625c7f7bacd0c82e6bfe4238723e8266b416182ada72993d5b20023",
         "Resolve protected bootstrap authority": "d10fe55d40daab7b732dc2414601063a036a64f8fd75abe71ecfa089546a4ff2",
-        "Enforce exact Model D maintenance admission": "29db63d8930ddf1d99aec626572563076a3f2c429d6c7b4e6c23889c7b4484aa",
+        "Enforce exact Model D maintenance admission": "244ee8225afbae50176f170eadf00b1e403fcc339a10ed5a59a70cb5434bac83",
         "Resolve protected Model D orchestration": "3b75d73c87092e553ff4a60922371a26049cb145e72d34863a65df263987a6c7",
         "Install isolated hash-locked policy environment": "6d079a592228d8f8d41be75c44f12aadbf9c7a04a268939af4f9ab330c84ed45",
         "Install isolated hash-locked audit environment": "14db3625de27e1630df2c448364e8b26521bb169aecceac851a270172d6ffa61",
@@ -2241,6 +2243,7 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
         self.assertEqual(workflow["env"], {
             "POLICY_BASELINE_VERSION": bootstrap.CURRENT_BASELINE,
             "MODEL_D_MAINTENANCE_GENERATION": bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+            "G2_MAINTENANCE_GENERATION": bootstrap.G2_MAINTENANCE_GENERATION,
         })
         self.assertEqual(tuple(workflow["jobs"]), ("security-workflows-policy",))
         job = workflow["jobs"]["security-workflows-policy"]
@@ -3049,13 +3052,16 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         self._configure(root)
         git(root, "checkout", "-b", "accumulated-model-d")
         source = Path(__file__).parent.resolve()
+        historical_model_d = "2c1ea96e13e480cd13b4f6185c3763539d865400"
         for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
-            (root / name).write_bytes((source / name).read_bytes())
+            (root / name).write_bytes(subprocess.run(
+                ["git", "-C", str(source), "show", f"{historical_model_d}:{name}"],
+                check=True, capture_output=True).stdout)
         git(root, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
         git(root, "commit", "-m", "Comprehensive D1-D4 Model D candidate")
         for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
             self.assertEqual(git(root, "rev-parse", f"HEAD:{name}"),
-                             git(source, "hash-object", "--no-filters", name))
+                              git(source, "rev-parse", f"{historical_model_d}:{name}"))
         self.assertEqual(bootstrap._model_d_generation_state(
             self.protected, self.protected_sha), "ACTIVE")
         self.assertEqual(bootstrap._model_d_generation_state(
@@ -3157,7 +3163,7 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         run = admission["run"]
         self.assertEqual(run.count("admit-maintenance"), 1)
         self.assertIn(
-            '--maintenance-generation "${{ env.MODEL_D_MAINTENANCE_GENERATION }}"', run)
+            '--maintenance-generation "${{ env.G2_MAINTENANCE_GENERATION }}"', run)
         self.assertIn("policy/protected_policy_bootstrap.py", run)
         self.assertNotIn("candidate/protected_policy_bootstrap.py", run)
         self.assertNotIn("1211595f9b0b5d1e76dd892bb210fece54f24b53", run)
@@ -3165,6 +3171,224 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
             "evaluation-context", "policy-source", "version-disposition",
             "owner-authorization", "post-merge-proof",
         ))
+
+
+class G2SeedAdmissionTests(unittest.TestCase):
+    """Exercise proposed G2 authority only after a synthetic protected seed merge."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.source = Path(__file__).parent.resolve()
+        self.protected = Path(temporary.name).resolve() / "protected"
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.source),
+                        str(self.protected)], check=True, capture_output=True)
+        self._configure(self.protected)
+        self.base_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "checkout", "-b", "seed")
+        for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
+            destination = self.protected / name
+            data = (self.source / name).read_bytes()
+            if name == "protected_policy_bootstrap.py":
+                consumed = (f'G2_MAINTENANCE_LIFECYCLE = "'
+                            f'{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED"').encode()
+                active = (f'G2_MAINTENANCE_LIFECYCLE = "'
+                          f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND"').encode()
+                data = data.replace(consumed, active)
+                if data.count(active) != 1:
+                    raise AssertionError("Synthetic G2 seed lifecycle is ambiguous")
+            destination.write_bytes(data)
+        git(self.protected, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        git(self.protected, "commit", "-m", "Synthetic G2 seed proposal")
+        self.seed_proposal = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "checkout", "-B", "main", self.base_sha)
+        git(self.protected, "merge", "--no-ff", "seed", "-m", "Synthetic protected seed")
+        self.seed_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.seed_sha)
+        self.candidate = Path(temporary.name).resolve() / "candidate"
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
+                        str(self.candidate)], check=True, capture_output=True)
+        self._configure(self.candidate)
+        git(self.candidate, "checkout", "-b", "g2-use")
+
+    @staticmethod
+    def _configure(root: Path) -> None:
+        head = git(root, "rev-parse", "HEAD")
+        git(root, "config", "user.name", "G2 Seed Test")
+        git(root, "config", "user.email", "g2@example.invalid")
+        git(root, "config", "core.autocrlf", "false")
+        git(root, "reset", "--hard", head)
+        git(root, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+
+    def _proposal(self, paths: tuple[str, ...]) -> str:
+        active = f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND"'.encode()
+        consumed = f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED"'.encode()
+        for name in paths:
+            path = self.candidate / name
+            original = path.read_bytes()
+            path.write_bytes(original.replace(active, consumed) if name ==
+                             "protected_policy_bootstrap.py" else original + b"\n# synthetic-g2-test\n")
+        git(self.candidate, "add", "-A")
+        git(self.candidate, "commit", "-m", "Synthetic G2 proposal")
+        return git(self.candidate, "rev-parse", "HEAD")
+
+    def _admit(self, candidate_sha: str | None = None,
+               protected_sha: str | None = None,
+               generation: str | None = None) -> None:
+        bootstrap.validate_g2_maintenance(
+            generation or bootstrap.G2_MAINTENANCE_GENERATION,
+            self.candidate, self.protected,
+            candidate_sha or git(self.candidate, "rev-parse", "HEAD"),
+            protected_sha or git(self.protected, "rev-parse", "HEAD"))
+
+    def test_seed_proposal_does_not_admit_itself(self) -> None:
+        git(self.protected, "checkout", "-B", "main", self.base_sha)
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.base_sha)
+        git(self.candidate, "fetch", str(self.protected), self.seed_proposal)
+        git(self.candidate, "checkout", "--detach", "FETCH_HEAD")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
+        self.assertEqual(bootstrap.MODEL_D_MAINTENANCE_LIFECYCLE,
+                         bootstrap.MODEL_D_MAINTENANCE_GENERATION + ":CONSUMED")
+
+    def test_unbound_rejects_exact_scope_and_fail_closed_inputs(self) -> None:
+        self._proposal(bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "no independently bound"):
+            self._admit()
+        command = [
+            os.sys.executable, "-I", "-S", str(Path(bootstrap.__file__).resolve()),
+            "admit-maintenance", "--maintenance-operation",
+            bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+            "--maintenance-generation", bootstrap.G2_MAINTENANCE_GENERATION,
+            "--candidate-sha", git(self.candidate, "rev-parse", "HEAD"),
+            "--protected-sha", self.seed_sha,
+            "--candidate-root", str(self.candidate),
+            "--protected-root", str(self.protected),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no independently bound", result.stderr)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_model_d_maintenance(
+                bootstrap.MODEL_D_MAINTENANCE_OPERATION,
+                bootstrap.MODEL_D_MAINTENANCE_GENERATION,
+                self.candidate, self.protected,
+                git(self.candidate, "rev-parse", "HEAD"), self.seed_sha)
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit(generation="MODEL_D_ORCHESTRATION_V1_GENERATION_3")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit(protected_sha=self.base_sha)
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        git(self.protected, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
+
+    def test_lifecycle_only_revocation_and_replay_reject(self) -> None:
+        self._proposal(("protected_policy_bootstrap.py",))
+        self._admit()
+        git(self.protected, "fetch", str(self.candidate), "HEAD")
+        git(self.protected, "merge", "--no-ff", "FETCH_HEAD", "-m", "Consume G2")
+        git(self.protected, "update-ref", "refs/remotes/origin/main",
+            git(self.protected, "rev-parse", "HEAD"))
+        self.assertTrue(bootstrap._g2_generation_was_consumed(
+            self.protected, git(self.protected, "rev-parse", "HEAD")))
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
+
+    def test_consumed_history_rejects_removed_and_reintroduced_g2(self) -> None:
+        self._proposal(("protected_policy_bootstrap.py",))
+        self._admit()
+        git(self.protected, "fetch", str(self.candidate), "HEAD")
+        git(self.protected, "merge", "--no-ff", "FETCH_HEAD", "-m", "Consume G2")
+        source = self.protected / "protected_policy_bootstrap.py"
+        consumed_source = source.read_bytes()
+        declarations = (
+            f'G2_MAINTENANCE_GENERATION = "{bootstrap.G2_MAINTENANCE_GENERATION}"',
+            f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED"',
+            f'G2_MAINTENANCE_PURPOSE = "{bootstrap.G2_MAINTENANCE_PURPOSE}"',
+        )
+        removed_source = consumed_source
+        for declaration in declarations:
+            line = (declaration + "\n").encode()
+            self.assertEqual(removed_source.count(line), 1)
+            removed_source = removed_source.replace(line, b"")
+        source.write_bytes(removed_source)
+        git(self.protected, "add", "protected_policy_bootstrap.py")
+        git(self.protected, "commit", "-m", "Remove G2 declarations")
+        removed_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "checkout", "-b", "reintroduce")
+        active = (f'G2_MAINTENANCE_LIFECYCLE = "'
+                  f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND"').encode()
+        consumed = (f'G2_MAINTENANCE_LIFECYCLE = "'
+                    f'{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED"').encode()
+        source.write_bytes(consumed_source.replace(consumed, active))
+        git(self.protected, "add", "protected_policy_bootstrap.py")
+        git(self.protected, "commit", "-m", "Reintroduce G2")
+        git(self.protected, "checkout", "main")
+        self.assertEqual(git(self.protected, "rev-parse", "HEAD"), removed_sha)
+        git(self.protected, "merge", "--no-ff", "reintroduce", "-m", "Reintroduce G2 merge")
+        reintroduced_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", reintroduced_sha)
+        self.assertTrue(bootstrap._g2_generation_was_consumed(
+            self.protected, reintroduced_sha))
+        git(self.candidate, "fetch", str(self.protected), "main")
+        git(self.candidate, "checkout", "-B", "g2-replay", "FETCH_HEAD")
+        self._proposal(("protected_policy_bootstrap.py",))
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "permanently consumed"):
+            self._admit()
+
+    def test_fourth_path_and_protected_drift_reject(self) -> None:
+        self._proposal(bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        extra = self.candidate / "verify_security_workflows.py"
+        extra.write_bytes(extra.read_bytes() + b"\n# unauthorized\n")
+        git(self.candidate, "add", "verify_security_workflows.py")
+        git(self.candidate, "commit", "--amend", "--no-edit")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
+        git(self.protected, "commit", "--allow-empty", "-m", "Protected drift")
+        git(self.protected, "update-ref", "refs/remotes/origin/main",
+            git(self.protected, "rev-parse", "HEAD"))
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
+
+    def test_candidate_cannot_widen_g2_purpose(self) -> None:
+        self._proposal(bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        source = self.candidate / "protected_policy_bootstrap.py"
+        source.write_bytes(source.read_bytes().replace(
+            bootstrap.G2_MAINTENANCE_PURPOSE.encode(),
+            b"general policy maintenance"))
+        git(self.candidate, "add", "protected_policy_bootstrap.py")
+        git(self.candidate, "commit", "--amend", "--no-edit")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
+
+    def test_candidate_claimed_approval_cannot_bind_unbound_g2(self) -> None:
+        self._proposal(bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        source = self.candidate / "protected_policy_bootstrap.py"
+        source.write_bytes(source.read_bytes() +
+                           b'\nG2_APPROVED_CANDIDATE_SHA = "0000000000000000000000000000000000000000"\n')
+        git(self.candidate, "add", "protected_policy_bootstrap.py")
+        git(self.candidate, "commit", "--amend", "--no-edit")
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "no independently bound"):
+            self._admit()
+
+    def test_candidate_cannot_relabel_consumed_g1(self) -> None:
+        self._proposal(bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        source = self.candidate / "protected_policy_bootstrap.py"
+        source.write_bytes(source.read_bytes().replace(
+            b'MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_1"',
+            b'MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_3"'))
+        git(self.candidate, "add", "protected_policy_bootstrap.py")
+        git(self.candidate, "commit", "--amend", "--no-edit")
+        with self.assertRaises(bootstrap.BootstrapError):
+            self._admit()
 
 
 if __name__ == "__main__":

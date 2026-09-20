@@ -32,6 +32,9 @@ MODEL_D_PLAN_OPERATION = "MODEL_D_PLAN_V1"
 MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_1"
 MODEL_D_MAINTENANCE_HISTORY_ANCHOR = "2784fc943f9eebcab4e468980ad0040499eadc52"
 MODEL_D_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED"
+G2_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_2"
+G2_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_UNBOUND"
+G2_MAINTENANCE_PURPOSE = "PUB-01A/PUB-01B/PUB-01C protected routing correction"
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
     "protected_policy_bootstrap.py",
@@ -548,6 +551,17 @@ def _model_d_generation_was_consumed(
     return bool(output.strip())
 
 
+def _g2_generation_was_consumed(root: Path, revision: str) -> bool:
+    """A protected G2 terminal record cannot be erased by later declarations."""
+    declaration = (f'G2_MAINTENANCE_LIFECYCLE = '
+                   f'"{G2_MAINTENANCE_GENERATION}:CONSUMED"')
+    output = _git_bytes(
+        root, "log", "--format=%H", "-S" + declaration,
+        f"{MODEL_D_MAINTENANCE_HISTORY_ANCHOR}..{revision}",
+        "--", "protected_policy_bootstrap.py")
+    return bool(output.strip())
+
+
 def validate_model_d_maintenance(
         operation: str, generation: str,
         candidate_root: Path, protected_root: Path,
@@ -594,12 +608,113 @@ def validate_model_d_maintenance(
         raise BootstrapError("Model D maintenance candidate must consume the generation")
 
     for root, revision in ((protected, protected_revision),
-                           (candidate, candidate_revision)):
+                            (candidate, candidate_revision)):
         entries = _tree_entries(root, revision, MODEL_D_MAINTENANCE_PATHS)
         if tuple(entries) != MODEL_D_MAINTENANCE_PATHS:
             raise BootstrapError("Model D maintenance tree paths do not match protected scope")
         if any(identity != ("100644", "blob") for identity in entries.values()):
             raise BootstrapError("Model D maintenance paths must be regular 100644 blobs")
+
+
+def validate_g2_maintenance(
+        generation: str, candidate_root: Path, protected_root: Path,
+        candidate_sha: str, protected_sha: str) -> None:
+    """Reject substantive use while unbound; allow lifecycle-only revocation.
+
+    The seed PR is established by protected branch governance, never this method.
+    The protected checkout must be the merge that first established G2 UNBOUND;
+    any subsequent protected-main movement expires this admission surface.
+    """
+    if generation != G2_MAINTENANCE_GENERATION:
+        raise BootstrapError("Unsupported G2 generation")
+    candidate_revision = _sha(candidate_sha, "candidate SHA")
+    protected_revision = _sha(protected_sha, "protected SHA")
+    candidate = _root(candidate_root, "candidate root")
+    protected = _root(protected_root, "protected root")
+    if (candidate == protected or candidate.is_relative_to(protected)
+            or protected.is_relative_to(candidate)):
+        raise BootstrapError("Candidate and protected roots must be separate")
+    for root, revision, repository in (
+            (candidate, candidate_revision, REPOSITORY),
+            (protected, protected_revision, REPOSITORY)):
+        if _git(root, "rev-parse", "HEAD") != revision:
+            raise BootstrapError("G2 checkout does not match authorized SHA")
+        if _canonical_remote(_git(root, "remote", "get-url", "origin")) != repository:
+            raise BootstrapError("G2 checkout repository mismatch")
+    if _git(protected, "rev-parse", "refs/remotes/origin/main") != protected_revision:
+        raise BootstrapError("G2 protected checkout is not protected main")
+    _require_model_d_history(protected, protected_revision)
+    if _g2_generation_was_consumed(protected, protected_revision):
+        raise BootstrapError("G2 maintenance generation was permanently consumed")
+    validate_protected_universe(protected, protected_revision)
+    validate_protected_universe(candidate, candidate_revision)
+
+    active = f'{G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND'
+    consumed = f'{G2_MAINTENANCE_GENERATION}:CONSUMED'
+    protected_source = _git_bytes(
+        protected, "show", f"{protected_revision}:protected_policy_bootstrap.py")
+    candidate_source = _git_bytes(
+        candidate, "show", f"{candidate_revision}:protected_policy_bootstrap.py")
+    declaration = f'G2_MAINTENANCE_LIFECYCLE = "{active}"'.encode()
+    replacement = f'G2_MAINTENANCE_LIFECYCLE = "{consumed}"'.encode()
+    identity = f'G2_MAINTENANCE_GENERATION = "{generation}"'.encode()
+    purpose = f'G2_MAINTENANCE_PURPOSE = "{G2_MAINTENANCE_PURPOSE}"'.encode()
+    g1_identity = f'MODEL_D_MAINTENANCE_GENERATION = "{MODEL_D_MAINTENANCE_GENERATION}"'.encode()
+    g1 = (f'MODEL_D_MAINTENANCE_LIFECYCLE = '
+          f'"{MODEL_D_MAINTENANCE_GENERATION}:CONSUMED"').encode()
+    for source in (protected_source, candidate_source):
+        lines = source.split(b"\n")
+        if (lines.count(identity) != 1 or lines.count(purpose) != 1
+                or lines.count(g1_identity) != 1 or lines.count(g1) != 1):
+            raise BootstrapError("G2 or consumed G1 identity changed")
+    g1_workflow = (f"  MODEL_D_MAINTENANCE_GENERATION: "
+                   f"{MODEL_D_MAINTENANCE_GENERATION}").encode()
+    for root, revision in ((protected, protected_revision),
+                           (candidate, candidate_revision)):
+        workflow_source = _git_bytes(
+            root, "show", f"{revision}:.github/workflows/security-workflows-policy.yml")
+        if workflow_source.split(b"\n").count(g1_workflow) != 1:
+            raise BootstrapError("Consumed G1 workflow identity changed")
+    if protected_source.split(b"\n").count(declaration) != 1:
+        raise BootstrapError("G2 is not active in protected source")
+    if (candidate_source.split(b"\n").count(replacement) != 1
+            or declaration in candidate_source.split(b"\n")):
+        raise BootstrapError("G2 candidate must consume the generation")
+
+    parents = _git(protected, "rev-list", "--parents", "-n", "1", protected_revision).split()
+    if len(parents) != 3 or parents[0] != protected_revision:
+        raise BootstrapError("G2 protected seed must be a merge commit")
+    before_seed = _git_bytes(
+        protected, "show", f"{parents[1]}:protected_policy_bootstrap.py")
+    if (declaration in before_seed or identity in before_seed
+            or purpose in before_seed):
+        raise BootstrapError("G2 protected seed state has drifted")
+    if _git(candidate, "merge-base", protected_revision, candidate_revision) != protected_revision:
+        raise BootstrapError("G2 candidate is not based on exact seed state")
+    if _git(candidate, "rev-list", "--count", f"{protected_revision}..{candidate_revision}") != "1":
+        raise BootstrapError("G2 candidate must contain one commit")
+
+    output = _git_bytes(candidate, "diff", "--name-status", "-z", "--no-renames",
+                        protected_revision, candidate_revision)
+    try:
+        fields = output.removesuffix(b"\0").split(b"\0")
+        records = tuple((fields[index].decode("ascii"), fields[index + 1].decode("utf-8"))
+                        for index in range(0, len(fields), 2))
+    except (IndexError, UnicodeError) as error:
+        raise BootstrapError("Malformed G2 maintenance diff") from error
+    if not output.endswith(b"\0") or any(status != "M" for status, _ in records):
+        raise BootstrapError("G2 maintenance requires modified regular files")
+    paths = tuple(path for _, path in records)
+    revocation = paths == ("protected_policy_bootstrap.py",)
+    if not revocation and paths != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError(f"G2 maintenance exceeds exact PUB-01 scope: {paths!r}")
+    if revocation and candidate_source != protected_source.replace(declaration, replacement):
+        raise BootstrapError("G2 revocation may change only lifecycle state")
+    entries = _tree_entries(candidate, candidate_revision, paths)
+    if tuple(entries) != paths or any(value != ("100644", "blob") for value in entries.values()):
+        raise BootstrapError("G2 maintenance paths must be regular files")
+    if not revocation:
+        raise BootstrapError("G2 has no independently bound candidate identity")
 
 
 def _validated_outputs(result: BootstrapResult) -> tuple[tuple[str, str], ...]:
@@ -899,12 +1014,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
         if arguments.operation == "admit-maintenance":
-            validate_model_d_maintenance(
-                arguments.maintenance_operation,
-                arguments.maintenance_generation,
-                Path(arguments.candidate_root), Path(arguments.protected_root),
-                arguments.candidate_sha, arguments.protected_sha,
-            )
+            if arguments.maintenance_generation == G2_MAINTENANCE_GENERATION:
+                if arguments.maintenance_operation != MODEL_D_MAINTENANCE_OPERATION:
+                    raise BootstrapError("Unsupported G2 maintenance operation")
+                validate_g2_maintenance(
+                    arguments.maintenance_generation,
+                    Path(arguments.candidate_root), Path(arguments.protected_root),
+                    arguments.candidate_sha, arguments.protected_sha,
+                )
+            else:
+                validate_model_d_maintenance(
+                    arguments.maintenance_operation,
+                    arguments.maintenance_generation,
+                    Path(arguments.candidate_root), Path(arguments.protected_root),
+                    arguments.candidate_sha, arguments.protected_sha,
+                )
             return 0
         if arguments.operation not in {"evaluate", "run-model-d"}:
             raise BootstrapError("Unsupported bootstrap operation")
