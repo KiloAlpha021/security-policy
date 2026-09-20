@@ -11,6 +11,7 @@ permissions:
 env:
   POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1
   MODEL_D_MAINTENANCE_GENERATION: MODEL_D_ORCHESTRATION_V1_GENERATION_1
+  G2_MAINTENANCE_GENERATION: MODEL_D_ORCHESTRATION_V1_GENERATION_2
 
 jobs:
   security-workflows-policy:
@@ -101,7 +102,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" admit-maintenance --maintenance-operation MODEL_D_ORCHESTRATION_V1 --maintenance-generation "${{ env.MODEL_D_MAINTENANCE_GENERATION }}" --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy"
+          python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" admit-maintenance --maintenance-operation MODEL_D_ORCHESTRATION_V1 --maintenance-generation "${{ env.G2_MAINTENANCE_GENERATION }}" --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Resolve protected Model D orchestration
