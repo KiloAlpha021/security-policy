@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -33,7 +33,7 @@ MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_1"
 MODEL_D_MAINTENANCE_HISTORY_ANCHOR = "2784fc943f9eebcab4e468980ad0040499eadc52"
 MODEL_D_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED"
 G2_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_2"
-G2_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_UNBOUND"
+G2_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED"
 G2_MAINTENANCE_PURPOSE = "PUB-01A/PUB-01B/PUB-01C protected routing correction"
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
@@ -992,8 +992,7 @@ def _parser() -> argparse.ArgumentParser:
 def _cli_inputs(arguments: argparse.Namespace) -> BootstrapInputs:
     candidate_root = Path(arguments.candidate_root)
     protected_root = Path(arguments.protected_root)
-    baseline = extract_candidate_baseline(candidate_root)
-    return BootstrapInputs(
+    inputs = BootstrapInputs(
         event_name=arguments.event_name,
         repository=arguments.repository,
         base_repository=arguments.base_repository,
@@ -1002,11 +1001,22 @@ def _cli_inputs(arguments: argparse.Namespace) -> BootstrapInputs:
         protected_sha=arguments.protected_sha,
         candidate_root=candidate_root,
         protected_root=protected_root,
-        candidate_baseline=baseline,
+        candidate_baseline=CURRENT_BASELINE,
         event_ref=arguments.event_ref,
         default_branch=arguments.default_branch,
         workflow_ref=arguments.workflow_ref,
     )
+    context = _context(inputs)
+    baseline_root = (protected_root if context is EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS
+                     else candidate_root)
+    baseline = extract_candidate_baseline(baseline_root)
+    if context is EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS:
+        committed = _git_bytes(
+            _root(protected_root, "protected root"), "show",
+            f"{_sha(arguments.protected_sha, 'protected SHA')}:{CANDIDATE_BASELINE_PATH}")
+        if (protected_root / CANDIDATE_BASELINE_PATH).read_bytes() != committed:
+            raise BootstrapError("Protected baseline bytes differ from protected SHA")
+    return replace(inputs, candidate_baseline=baseline)
 
 
 def main(argv: list[str] | None = None) -> int:

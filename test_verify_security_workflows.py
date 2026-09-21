@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -342,14 +343,24 @@ $observedHead = (git -C $candidateRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from authorized candidate SHA' }
 $workflowPath = '.github/workflows/security-workflows-policy.yml'
-$expectedBlob = (git -C $candidateRoot rev-parse "${candidateSha}:$workflowPath").Trim()
+$workflowRoot = $candidateRoot
+$workflowSha = $candidateSha
+if ("${{ github.repository }}" -eq 'KiloAlpha021/security-workflows') {
+  $workflowRoot = "${{ github.workspace }}/policy"
+  $workflowSha = "${{ steps.protected-git.outputs.protected-sha }}"
+  git -C $workflowRoot config core.autocrlf false
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  git -C $workflowRoot reset --hard $workflowSha
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+$expectedBlob = (git -C $workflowRoot rev-parse "${workflowSha}:$workflowPath").Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($expectedBlob -notmatch '^[0-9a-f]{40}$') { throw 'Malformed committed candidate workflow blob' }
-$actualBlob = (git -C $candidateRoot hash-object --no-filters $workflowPath).Trim()
+$actualBlob = (git -C $workflowRoot hash-object --no-filters $workflowPath).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from exact committed Git blob' }
 """)
-        self.assertNotIn('${{ github.workspace }}/policy', preparation_run)
+        self.assertIn('$workflowRoot = "${{ github.workspace }}/policy"', preparation_run)
         self.assertTrue(invocation.startswith(" evaluate "))
         self.assertEqual(names.index("Resolve protected bootstrap authority"),
                          names.index("Acquire protected Git identity") + 1)
@@ -853,6 +864,8 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                 'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py"', 1)[0]
             rendered = preparation.replace("${{ github.workspace }}", workspace.as_posix())
             rendered = rendered.replace("${{ github.sha }}", merge_sha)
+            rendered = rendered.replace("${{ github.repository }}", "KiloAlpha021/security-policy")
+            rendered = rendered.replace("${{ steps.protected-git.outputs.protected-sha }}", head_sha)
             completed = subprocess.run(
                 ["pwsh", "-NoProfile", "-NonInteractive", "-Command", rendered],
                 cwd=workspace, capture_output=True, text=True,
@@ -2066,7 +2079,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _COMMANDS = {
         "Assert exact CPython runtime": ("python",),
         "Acquire protected Git identity": ("git", "Out-File"),
-        "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "python"),
+        "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "git", "git", "python"),
         "Assert protected bootstrap outputs": (),
         "Enforce exact Model D maintenance admission": ("python",),
         "Resolve protected Model D orchestration": ("python",),
@@ -2088,7 +2101,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _COMMAND_DIGESTS = {
         "Assert exact CPython runtime": "ff4765d5070a8f20c672195931f3296bd7f98d025cc603a3253336a1909ef10a",
         "Acquire protected Git identity": "c46b07aa33fec226c61a81e56ac420d8ca2d7335557f1098132ba9a518dd3de4",
-        "Resolve protected bootstrap authority": "1033bc372e862723b7301df8269c8d55268af0263a4049e665c44a2bd491e9d1",
+        "Resolve protected bootstrap authority": "abc9d2cac96e4ce78ab0649cbcd3c2f6711fffc29030b6f0b01dda8fbad29c0c",
         "Enforce exact Model D maintenance admission": "a27a6cb21b57491d4f10396fcd1e05d9f1db6cc2e3570a5b6c28b2828c6fab66",
         "Resolve protected Model D orchestration": "55508070002061086a43cc0996f426eda44cb46106fb1094c77bcb7cd3885713",
         "Install isolated hash-locked policy environment": "ee8dac9367b0f079fcccfb636cceee965b4802e963649a1645a5da2be9fb3520",
@@ -2102,7 +2115,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     }
     _EXPRESSION_DIGESTS = {
         "Acquire protected Git identity": "837295a19625c7f7bacd0c82e6bfe4238723e8266b416182ada72993d5b20023",
-        "Resolve protected bootstrap authority": "d10fe55d40daab7b732dc2414601063a036a64f8fd75abe71ecfa089546a4ff2",
+        "Resolve protected bootstrap authority": "baeda08c00209b5226e8b333d045c1a7e54432329b31ce8d35ff38df765febda",
         "Enforce exact Model D maintenance admission": "244ee8225afbae50176f170eadf00b1e403fcc339a10ed5a59a70cb5434bac83",
         "Resolve protected Model D orchestration": "3b75d73c87092e553ff4a60922371a26049cb145e72d34863a65df263987a6c7",
         "Install isolated hash-locked policy environment": "6d079a592228d8f8d41be75c44f12aadbf9c7a04a268939af4f9ab330c84ed45",
@@ -2112,7 +2125,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _ASSIGNMENT_DIGESTS = {
         "Assert exact CPython runtime": "d28dad29c037f617afecde27704bef3d358314acff79e6e0dc6e838ef68ddbab",
         "Acquire protected Git identity": "a7957a942a016cffc750015c04cc690d6976cd3094083d8b79f364380ba25791",
-        "Resolve protected bootstrap authority": "7345417463fdbf2b043e1c7a229cc9ce631efc2c8de8348111022a2d6e8df5d6",
+        "Resolve protected bootstrap authority": "ac088b6c587a0d18c242f08519745f174c7c4253c74280fa0f7d95f02cf5b58b",
     }
     _STOP_ASSIGNMENT_DIGEST = "a6ff9ace77f1623d434a131b94c045ea59228ca4c1afaffe3900356c386bb1a5"
     _IF = {
@@ -2134,6 +2147,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Acquire protected Git identity": ("$protectedSha -notmatch '^[0-9a-f]{40}$'",),
         "Resolve protected bootstrap authority": (
             "$observedHead -ne $candidateSha",
+            '"BOUND" -eq \'KiloAlpha021/security-workflows\'',
             "$expectedBlob -notmatch '^[0-9a-f]{40}$'",
             "$actualBlob -ne $expectedBlob",
         ),
@@ -2158,7 +2172,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _VARIABLES = frozenset({
         "actualBlob", "candidateRoot", "candidateSha", "ErrorActionPreference",
         "expectedBlob", "LASTEXITCODE", "observedHead", "protectedSha",
-        "pythonVersion", "workflowPath", "env:GITHUB_OUTPUT",
+        "pythonVersion", "workflowPath", "workflowRoot", "workflowSha", "env:GITHUB_OUTPUT",
         "env:AUDIT_LOCK_SOURCE", "env:CANDIDATE_EVIDENCE", "env:D0_CONTEXT",
         "env:D0_SOURCE", "env:D0_VERSION", "env:DOWNSTREAM_VALIDATION",
         "env:EVALUATION_CONTEXT", "env:MODEL_D_CONTEXT", "env:MODEL_D_OWNER",
@@ -2170,6 +2184,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _ASSIGNMENTS = frozenset({
         "$ErrorActionPreference", "$pythonVersion", "$protectedSha",
         "$candidateRoot", "$candidateSha", "$observedHead", "$workflowPath",
+        "$workflowRoot", "$workflowSha",
         "$expectedBlob", "$actualBlob",
     })
     _INSPECTOR = r'''
@@ -2362,6 +2377,10 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
             for condition, body in zip(report["conditions"], report["bodies"]):
                 if condition == "$LASTEXITCODE -ne 0":
                     self.assertEqual(body, "{ exit $LASTEXITCODE }", name)
+                elif condition == '"BOUND" -eq \'KiloAlpha021/security-workflows\'':
+                    self.assertIn('$workflowRoot = "BOUND/policy"', body)
+                    self.assertIn('$workflowSha = "BOUND"', body)
+                    self.assertIn('git -C $workflowRoot reset --hard $workflowSha', body)
                 else:
                     self.assertRegex(body, r"^\{ throw '[^'\r\n]+' \}$", name)
 
@@ -3173,6 +3192,141 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         ))
 
 
+class B1ProtectedRoutingTests(unittest.TestCase):
+    """Use separate Git identities and a downstream candidate with no policy file."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.candidate = self.root / "candidate"
+        self.protected = self.root / "policy"
+        for root, repository in ((self.candidate, bootstrap.DOWNSTREAM_REPOSITORY),
+                                 (self.protected, bootstrap.REPOSITORY)):
+            root.mkdir()
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "B1 Test")
+            git(root, "config", "user.email", "b1@example.invalid")
+            git(root, "config", "core.autocrlf", "false")
+            git(root, "remote", "add", "origin", f"https://github.com/{repository}.git")
+        (self.candidate / ".github/workflows").mkdir(parents=True)
+        (self.candidate / ".github/workflows/m1-trusted.yml").write_text(
+            "name: downstream candidate\n", encoding="utf-8")
+        (self.protected / ".github/workflows").mkdir(parents=True)
+        self.policy_file = self.protected / bootstrap.CANDIDATE_BASELINE_PATH
+        self.policy_file.write_bytes((
+            "name: protected policy\nenv:\n  POLICY_BASELINE_VERSION: " +
+            bootstrap.CURRENT_BASELINE + "\n").encode())
+        for root in (self.candidate, self.protected):
+            git(root, "add", ".")
+            git(root, "commit", "-m", "fixture")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.protected_sha)
+
+    def arguments(self, **changes: object) -> argparse.Namespace:
+        values: dict[str, object] = dict(
+            event_name="pull_request", repository=bootstrap.DOWNSTREAM_REPOSITORY,
+            base_repository=bootstrap.DOWNSTREAM_REPOSITORY, base_branch="main",
+            candidate_sha=self.candidate_sha, protected_sha=self.protected_sha,
+            candidate_root=str(self.candidate), protected_root=str(self.protected),
+            event_ref="refs/pull/5/merge", default_branch="main", workflow_ref="")
+        values.update(changes)
+        return argparse.Namespace(**values)
+
+    def workflow_preparation(self) -> subprocess.CompletedProcess[str]:
+        workflow = yaml.load(
+            (Path(__file__).parent / bootstrap.CANDIDATE_BASELINE_PATH).read_text(
+                encoding="utf-8"), Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        run = next(step["run"] for step in steps
+                   if step["name"] == "Resolve protected bootstrap authority")
+        preparation = run.split('python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate', 1)[0]
+        for expression, value in (
+                ("${{ github.workspace }}", str(self.root)),
+                ("${{ github.sha }}", self.candidate_sha),
+                ("${{ github.repository }}", bootstrap.DOWNSTREAM_REPOSITORY),
+                ("${{ steps.protected-git.outputs.protected-sha }}", self.protected_sha)):
+            preparation = preparation.replace(expression, value)
+        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                               preparation], capture_output=True, text=True)
+
+    def test_downstream_workflow_preparation_uses_protected_policy(self) -> None:
+        self.assertFalse((self.candidate / bootstrap.CANDIDATE_BASELINE_PATH).exists())
+        result = self.workflow_preparation()
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        fake = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        fake.write_text("name: candidate substitute\n", encoding="utf-8")
+        git(self.candidate, "add", ".")
+        git(self.candidate, "commit", "-m", "fake policy workflow")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        result = self.workflow_preparation()
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        git(self.protected, "rm", bootstrap.CANDIDATE_BASELINE_PATH)
+        git(self.protected, "commit", "-m", "remove protected policy")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        result = self.workflow_preparation()
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_real_downstream_baseline_and_fake_candidate_policy(self) -> None:
+        self.assertFalse((self.candidate / bootstrap.CANDIDATE_BASELINE_PATH).exists())
+        inputs = bootstrap._cli_inputs(self.arguments())
+        result = bootstrap.evaluate(inputs)
+        self.assertEqual(inputs.candidate_baseline, bootstrap.CURRENT_BASELINE)
+        self.assertIs(result.evaluation_context,
+                      bootstrap.EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS)
+        self.assertIs(result.policy_source, bootstrap.PolicySource.POLICY)
+        candidate_policy = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        candidate_policy.write_bytes(
+            b"name: fake policy\nenv:\n  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-9\n")
+        git(self.candidate, "add", ".")
+        git(self.candidate, "commit", "-m", "fake policy")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        self.assertEqual(bootstrap._cli_inputs(self.arguments()).candidate_baseline,
+                         bootstrap.CURRENT_BASELINE)
+
+    def test_missing_or_changed_protected_baseline_has_no_candidate_fallback(self) -> None:
+        fake = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        fake.write_bytes(
+            b"name: fake\nenv:\n  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n")
+        self.policy_file.unlink()
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._cli_inputs(self.arguments())
+        self.policy_file.write_bytes(
+            b"name: changed\nenv:\n  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n")
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "Protected baseline bytes differ"):
+            bootstrap._cli_inputs(self.arguments())
+
+    def test_wrong_roots_shas_repository_and_context_reject(self) -> None:
+        inputs = bootstrap._cli_inputs(self.arguments())
+        for changed in (
+                dict(candidate_root=self.protected, protected_root=self.candidate),
+                dict(candidate_sha=self.protected_sha),
+                dict(protected_sha=self.candidate_sha),
+                dict(repository=bootstrap.REPOSITORY)):
+            with self.subTest(changed=changed), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.evaluate(replace(inputs, **changed))
+        for changed in (dict(repository="Other/repository", base_repository="Other/repository"),
+                        dict(base_repository=bootstrap.REPOSITORY),
+                        dict(event_name="workflow_dispatch")):
+            with self.subTest(changed=changed), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._cli_inputs(self.arguments(**changed))
+
+    def test_self_policy_still_reads_candidate_baseline(self) -> None:
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        candidate_policy = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        candidate_policy.write_bytes((
+            "name: self proposal\nenv:\n  POLICY_BASELINE_VERSION: " +
+            bootstrap.CURRENT_BASELINE + "\n").encode())
+        git(self.candidate, "add", ".")
+        git(self.candidate, "commit", "-m", "self proposal")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        inputs = bootstrap._cli_inputs(self.arguments(
+            repository=bootstrap.REPOSITORY, base_repository=bootstrap.REPOSITORY))
+        self.assertIs(bootstrap.evaluate(inputs).policy_source, bootstrap.PolicySource.CANDIDATE)
+
+
 class G2SeedAdmissionTests(unittest.TestCase):
     """Exercise proposed G2 authority only after a synthetic protected seed merge."""
 
@@ -3184,19 +3338,15 @@ class G2SeedAdmissionTests(unittest.TestCase):
         subprocess.run(["git", "clone", "--no-hardlinks", str(self.source),
                         str(self.protected)], check=True, capture_output=True)
         self._configure(self.protected)
-        self.base_sha = git(self.protected, "rev-parse", "HEAD")
+        self.base_sha = git(self.protected, "rev-parse", "HEAD^1")
+        seed_candidate_sha = git(self.protected, "rev-parse", "HEAD^2")
+        git(self.protected, "checkout", "-B", "main", self.base_sha)
         git(self.protected, "checkout", "-b", "seed")
         for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
             destination = self.protected / name
-            data = (self.source / name).read_bytes()
-            if name == "protected_policy_bootstrap.py":
-                consumed = (f'G2_MAINTENANCE_LIFECYCLE = "'
-                            f'{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED"').encode()
-                active = (f'G2_MAINTENANCE_LIFECYCLE = "'
-                          f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND"').encode()
-                data = data.replace(consumed, active)
-                if data.count(active) != 1:
-                    raise AssertionError("Synthetic G2 seed lifecycle is ambiguous")
+            data = subprocess.run(
+                ["git", "-C", str(self.source), "show", f"{seed_candidate_sha}:{name}"],
+                check=True, capture_output=True).stdout
             destination.write_bytes(data)
         git(self.protected, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
         git(self.protected, "commit", "-m", "Synthetic G2 seed proposal")
