@@ -33,10 +33,25 @@ MODEL_D_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_1"
 MODEL_D_MAINTENANCE_HISTORY_ANCHOR = "2784fc943f9eebcab4e468980ad0040499eadc52"
 MODEL_D_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED"
 G2_MAINTENANCE_GENERATION = "MODEL_D_ORCHESTRATION_V1_GENERATION_2"
-G2_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_UNBOUND"
+G2_MAINTENANCE_LIFECYCLE = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND"
 G2_MAINTENANCE_PURPOSE = "PUB-01A/PUB-01B/PUB-01C protected routing correction"
+G2_BOUND_ORIGIN = "985bdf2801f07d8f2447d1bcde96c7a7a59669ad"
+G2_BOUND_CANDIDATE_TREE = "4272cb4707345a1a3da41382525e9833e0f1a7e1"
+G2_BOUND_WORKFLOW_BLOB = "e8a2ff5957c77f03f1c5b8b16ae707820f11159f"
+G2_BOUND_BOOTSTRAP_BLOB = "7edbdf8c216aa336bae95af44fef8b9e4a582731"
+G2_BOUND_TEST_BLOB = "cd5ce5f194cef50dd016ca529f2857cf8c7a6082"
+G2_BOUND_EXPECTED_TERMINAL = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED"
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
+    "protected_policy_bootstrap.py",
+    "test_verify_security_workflows.py",
+)
+G2_EXPECTED_CANDIDATE_BLOBS = (
+    (MODEL_D_MAINTENANCE_PATHS[0], G2_BOUND_WORKFLOW_BLOB),
+    (MODEL_D_MAINTENANCE_PATHS[1], G2_BOUND_BOOTSTRAP_BLOB),
+    (MODEL_D_MAINTENANCE_PATHS[2], G2_BOUND_TEST_BLOB),
+)
+G2_BINDING_PATHS = (
     "protected_policy_bootstrap.py",
     "test_verify_security_workflows.py",
 )
@@ -562,6 +577,134 @@ def _g2_generation_was_consumed(root: Path, revision: str) -> bool:
     return bool(output.strip())
 
 
+def _g2_lifecycle(source: bytes) -> str:
+    """Return one closed G2 lifecycle declaration from protected bytes."""
+    try:
+        text = source.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise BootstrapError("Invalid G2 source encoding") from error
+    if b"\r" in source or b"\0" in source:
+        raise BootstrapError("Invalid G2 source bytes")
+    name = "G2_MAINTENANCE_LIFECYCLE"
+    lines = re.findall(rf"^{name}[^\n]*$", text, re.MULTILINE)
+    pattern = re.compile(
+        rf'^{name} = "{re.escape(G2_MAINTENANCE_GENERATION)}:'
+        r'(ACTIVE_UNBOUND|ACTIVE_BOUND|CONSUMED)"$')
+    if len(lines) != 1:
+        raise BootstrapError("Missing or malformed G2 lifecycle record")
+    match = pattern.fullmatch(lines[0])
+    if match is None:
+        raise BootstrapError("Missing or malformed G2 lifecycle record")
+    return match.group(1)
+
+
+def _require_g2_bound_declarations(source: bytes) -> None:
+    """Require exactly one immutable protected expectation and no alternatives."""
+    declarations = (
+        f'G2_BOUND_ORIGIN = "{G2_BOUND_ORIGIN}"',
+        f'G2_BOUND_CANDIDATE_TREE = "{G2_BOUND_CANDIDATE_TREE}"',
+        f'G2_BOUND_WORKFLOW_BLOB = "{G2_BOUND_WORKFLOW_BLOB}"',
+        f'G2_BOUND_BOOTSTRAP_BLOB = "{G2_BOUND_BOOTSTRAP_BLOB}"',
+        f'G2_BOUND_TEST_BLOB = "{G2_BOUND_TEST_BLOB}"',
+        f'G2_BOUND_EXPECTED_TERMINAL = "{G2_BOUND_EXPECTED_TERMINAL}"',
+    )
+    try:
+        text = source.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise BootstrapError("Invalid G2 binding source encoding") from error
+    binding_lines = tuple(re.findall(r"^G2_BOUND_[A-Z_]+ = .*?$", text, re.MULTILINE))
+    if binding_lines != declarations:
+        raise BootstrapError("G2 protected binding is missing, duplicated, or replaced")
+
+
+def _exact_modified_paths(root: Path, before: str, after: str) -> tuple[str, ...]:
+    output = _git_bytes(root, "diff", "--name-status", "-z", "--no-renames",
+                        before, after)
+    if not output.endswith(b"\0"):
+        raise BootstrapError("Malformed exact-path diff")
+    fields = output.removesuffix(b"\0").split(b"\0")
+    try:
+        records = tuple((fields[index].decode("ascii"), fields[index + 1].decode("utf-8"))
+                        for index in range(0, len(fields), 2))
+    except (IndexError, UnicodeError) as error:
+        raise BootstrapError("Malformed exact-path diff") from error
+    if any(status != "M" for status, _path in records):
+        raise BootstrapError("Exact binding requires modified regular files")
+    return tuple(path for _status, path in records)
+
+
+def validate_g2_bound_authority(protected_root: Path, protected_sha: str) -> None:
+    """Recognize only the immediate protected S0-to-S1 binding merge."""
+    protected = _root(protected_root, "protected root")
+    revision = _sha(protected_sha, "protected SHA")
+    if _git(protected, "rev-parse", "HEAD") != revision:
+        raise BootstrapError("G2 bound checkout does not match protected SHA")
+    if _git(protected, "rev-parse", "refs/remotes/origin/main") != revision:
+        raise BootstrapError("G2 bound checkout is not protected main")
+    if _canonical_remote(_git(protected, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("G2 bound protected repository mismatch")
+    _require_model_d_history(protected, revision)
+    if _g2_generation_was_consumed(protected, revision):
+        raise BootstrapError("G2 maintenance generation was permanently consumed")
+    validate_protected_universe(protected, revision)
+    source = _git_bytes(protected, "show", f"{revision}:protected_policy_bootstrap.py")
+    if _g2_lifecycle(source) != "ACTIVE_BOUND":
+        raise BootstrapError("G2 protected authority is not ACTIVE_BOUND")
+    _require_g2_bound_declarations(source)
+    parents = _git(protected, "rev-list", "--parents", "-n", "1", revision).split()
+    if len(parents) != 3 or parents[0] != revision or parents[1] != G2_BOUND_ORIGIN:
+        raise BootstrapError("G2 S1 is not the exact protected binding merge from S0")
+    proposal = parents[2]
+    proposal_parents = _git(
+        protected, "rev-list", "--parents", "-n", "1", proposal).split()
+    if proposal_parents != [proposal, G2_BOUND_ORIGIN]:
+        raise BootstrapError("G2 binding proposal is not based directly on S0")
+    if (_git(protected, "rev-parse", f"{proposal}^{{tree}}")
+            != _git(protected, "rev-parse", f"{revision}^{{tree}}")):
+        raise BootstrapError("G2 binding merge tree differs from its proposal")
+    before = _git_bytes(protected, "show", f"{G2_BOUND_ORIGIN}:protected_policy_bootstrap.py")
+    if _g2_lifecycle(before) != "ACTIVE_UNBOUND" or b"G2_BOUND_ORIGIN = " in before:
+        raise BootstrapError("G2 binding was present before S1")
+    if _exact_modified_paths(protected, G2_BOUND_ORIGIN, revision) != G2_BINDING_PATHS:
+        raise BootstrapError("G2 S1 exceeds the exact binding scope")
+
+
+def validate_g2_bound_candidate_identity(
+        candidate_root: Path, candidate_sha: str,
+        protected_root: Path, protected_sha: str) -> None:
+    """Validate the frozen B1 identity without granting B3 admission."""
+    validate_g2_bound_authority(protected_root, protected_sha)
+    candidate = _root(candidate_root, "candidate root")
+    revision = _sha(candidate_sha, "candidate SHA")
+    if _git(candidate, "rev-parse", "HEAD") != revision:
+        raise BootstrapError("Bound candidate checkout does not match candidate SHA")
+    if _canonical_remote(_git(candidate, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("Bound candidate repository mismatch")
+    parents = _git(candidate, "rev-list", "--parents", "-n", "1", revision).split()
+    if len(parents) != 2 or parents != [revision, G2_BOUND_ORIGIN]:
+        raise BootstrapError("Bound candidate must have sole parent S0")
+    if _git(candidate, "rev-parse", f"{revision}^{{tree}}") != G2_BOUND_CANDIDATE_TREE:
+        raise BootstrapError("Bound candidate tree mismatch")
+    if _exact_modified_paths(candidate, G2_BOUND_ORIGIN, revision) != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError("Bound candidate paths mismatch")
+    entries = _tree_entries(candidate, revision, MODEL_D_MAINTENANCE_PATHS)
+    if tuple(entries) != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError("Bound candidate tree paths mismatch")
+    for path, expected_blob in G2_EXPECTED_CANDIDATE_BLOBS:
+        mode, kind = entries[path]
+        if (mode, kind) != ("100644", "blob"):
+            raise BootstrapError("Bound candidate paths must be regular blobs")
+        if _git(candidate, "rev-parse", f"{revision}:{path}") != expected_blob:
+            raise BootstrapError("Bound candidate blob mismatch")
+    candidate_source = _git_bytes(
+        candidate, "show", f"{revision}:protected_policy_bootstrap.py")
+    if _g2_lifecycle(candidate_source) != "CONSUMED":
+        raise BootstrapError("Bound candidate must propose terminal CONSUMED")
+    if G2_BOUND_EXPECTED_TERMINAL.encode() not in candidate_source:
+        raise BootstrapError("Bound candidate terminal disposition mismatch")
+    validate_protected_universe(candidate, revision)
+
+
 def validate_model_d_maintenance(
         operation: str, generation: str,
         candidate_root: Path, protected_root: Path,
@@ -655,6 +798,24 @@ def validate_g2_maintenance(
         protected, "show", f"{protected_revision}:protected_policy_bootstrap.py")
     candidate_source = _git_bytes(
         candidate, "show", f"{candidate_revision}:protected_policy_bootstrap.py")
+    protected_lifecycle = _g2_lifecycle(protected_source)
+    if protected_lifecycle == "ACTIVE_BOUND":
+        validate_g2_bound_authority(protected, protected_revision)
+        parents = _git(candidate, "rev-list", "--parents", "-n", "1",
+                       candidate_revision).split()
+        bound = f'{G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND'.encode()
+        consumed_value = f'{G2_MAINTENANCE_GENERATION}:CONSUMED'.encode()
+        expected_revocation = protected_source.replace(bound, consumed_value)
+        paths = _exact_modified_paths(candidate, protected_revision, candidate_revision)
+        if (parents == [candidate_revision, protected_revision]
+                and paths == ("protected_policy_bootstrap.py",)
+                and candidate_source == expected_revocation):
+            return
+        validate_g2_bound_candidate_identity(
+            candidate, candidate_revision, protected, protected_revision)
+        raise BootstrapError("B3 admission is not implemented")
+    if protected_lifecycle != "ACTIVE_UNBOUND":
+        raise BootstrapError("G2 protected authority is not ACTIVE_UNBOUND")
     declaration = f'G2_MAINTENANCE_LIFECYCLE = "{active}"'.encode()
     replacement = f'G2_MAINTENANCE_LIFECYCLE = "{consumed}"'.encode()
     identity = f'G2_MAINTENANCE_GENERATION = "{generation}"'.encode()

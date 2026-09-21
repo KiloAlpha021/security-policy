@@ -3173,6 +3173,239 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         ))
 
 
+class B2BindingTests(unittest.TestCase):
+    """Exercise one protected S0-to-S1 binding without implementing B3."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.source = Path(__file__).parent.resolve()
+        self.protected = self.root / "protected"
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.source),
+                        str(self.protected)], check=True, capture_output=True)
+        git(self.protected, "config", "user.name", "B2 Test")
+        git(self.protected, "config", "user.email", "b2@example.invalid")
+        git(self.protected, "config", "core.autocrlf", "false")
+        git(self.protected, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        git(self.protected, "checkout", "-B", "main", bootstrap.G2_BOUND_ORIGIN)
+        git(self.protected, "checkout", "-b", "b2-binding")
+        for name in bootstrap.G2_BINDING_PATHS:
+            (self.protected / name).write_bytes((self.source / name).read_bytes())
+        git(self.protected, "add", *bootstrap.G2_BINDING_PATHS)
+        git(self.protected, "commit", "-m", "Synthetic B2 binding proposal")
+        self.binding_proposal = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "checkout", "main")
+        git(self.protected, "merge", "--no-ff", "b2-binding", "-m",
+            "Synthetic protected B2 binding")
+        self.s1 = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.s1)
+
+    def test_exact_s1_binding_introduction(self) -> None:
+        bootstrap.validate_g2_bound_authority(self.protected, self.s1)
+        self.assertEqual(bootstrap.G2_MAINTENANCE_LIFECYCLE,
+                         bootstrap.G2_MAINTENANCE_GENERATION + ":ACTIVE_BOUND")
+        self.assertEqual(bootstrap.G2_BOUND_ORIGIN,
+                         "985bdf2801f07d8f2447d1bcde96c7a7a59669ad")
+        self.assertEqual(bootstrap.G2_BOUND_CANDIDATE_TREE,
+                         "4272cb4707345a1a3da41382525e9833e0f1a7e1")
+        self.assertEqual(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS, (
+            (bootstrap.MODEL_D_MAINTENANCE_PATHS[0],
+             "e8a2ff5957c77f03f1c5b8b16ae707820f11159f"),
+            (bootstrap.MODEL_D_MAINTENANCE_PATHS[1],
+             "7edbdf8c216aa336bae95af44fef8b9e4a582731"),
+            (bootstrap.MODEL_D_MAINTENANCE_PATHS[2],
+             "cd5ce5f194cef50dd016ca529f2857cf8c7a6082"),
+        ))
+
+    def test_wrong_s0_structure_and_protected_drift_reject(self) -> None:
+        with mock.patch.object(bootstrap, "G2_BOUND_ORIGIN", "0" * 40), \
+             self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_g2_bound_authority(self.protected, self.s1)
+        git(self.protected, "commit", "--allow-empty", "-m", "Unrelated S2 drift")
+        drift = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", drift)
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "exact protected binding merge"):
+            bootstrap.validate_g2_bound_authority(self.protected, drift)
+
+        nested = self.root / "nested-binding"
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.source),
+                        str(nested)], check=True, capture_output=True)
+        git(nested, "config", "user.name", "B2 Test")
+        git(nested, "config", "user.email", "b2@example.invalid")
+        git(nested, "config", "core.autocrlf", "false")
+        git(nested, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        git(nested, "checkout", "-B", "main", bootstrap.G2_BOUND_ORIGIN)
+        git(nested, "checkout", "-b", "nested-proposal")
+        git(nested, "commit", "--allow-empty", "-m", "Unrelated proposal parent")
+        for name in bootstrap.G2_BINDING_PATHS:
+            (nested / name).write_bytes((self.source / name).read_bytes())
+        git(nested, "add", *bootstrap.G2_BINDING_PATHS)
+        git(nested, "commit", "-m", "Nested B2 binding proposal")
+        git(nested, "checkout", "main")
+        git(nested, "merge", "--no-ff", "nested-proposal", "-m", "Nested binding")
+        nested_s1 = git(nested, "rev-parse", "HEAD")
+        git(nested, "update-ref", "refs/remotes/origin/main", nested_s1)
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "directly on S0"):
+            bootstrap.validate_g2_bound_authority(nested, nested_s1)
+
+    def test_binding_declarations_are_unique_and_candidate_cannot_replace_them(self) -> None:
+        source = (self.source / "protected_policy_bootstrap.py").read_bytes()
+        bootstrap._require_g2_bound_declarations(source)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._require_g2_bound_declarations(
+                source + b'\nG2_BOUND_CANDIDATE_TREE = "0000000000000000000000000000000000000000"\n')
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._require_g2_bound_declarations(
+                source.replace(bootstrap.G2_BOUND_CANDIDATE_TREE.encode(), b"0" * 40))
+
+    def _mock_bound_candidate(self, **changes: object) -> None:
+        candidate = self.root / "candidate"
+        candidate.mkdir(exist_ok=True)
+        revision = "1" * 40
+        parent = str(changes.get("parent", bootstrap.G2_BOUND_ORIGIN))
+        tree = str(changes.get("tree", bootstrap.G2_BOUND_CANDIDATE_TREE))
+        paths = changes.get("paths", bootstrap.MODEL_D_MAINTENANCE_PATHS)
+        blobs = dict(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS)
+        blobs.update(changes.get("blobs", {}))
+        remote = str(changes.get("remote", "https://github.com/KiloAlpha021/security-policy.git"))
+        source = str(changes.get(
+            "source",
+            f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_BOUND_EXPECTED_TERMINAL}"\n'))
+
+        def identity(root: Path, *arguments: str) -> str:
+            if arguments == ("rev-parse", "HEAD"):
+                return revision
+            if arguments == ("remote", "get-url", "origin"):
+                return remote
+            if arguments == ("rev-list", "--parents", "-n", "1", revision):
+                return f"{revision} {parent}"
+            if arguments == ("rev-parse", f"{revision}^{{tree}}"):
+                return tree
+            if len(arguments) == 2 and arguments[0] == "rev-parse" and \
+                    arguments[1].startswith(revision + ":"):
+                return blobs[arguments[1].split(":", 1)[1]]
+            raise AssertionError(arguments)
+
+        diff = b"".join(b"M\0" + path.encode() + b"\0" for path in paths)
+
+        def raw(root: Path, *arguments: str) -> bytes:
+            if arguments[:4] == ("diff", "--name-status", "-z", "--no-renames"):
+                return diff
+            if arguments == ("show", f"{revision}:protected_policy_bootstrap.py"):
+                return source.encode()
+            raise AssertionError(arguments)
+
+        entries = {path: ("100644", "blob") for path in bootstrap.MODEL_D_MAINTENANCE_PATHS}
+        with mock.patch.object(bootstrap, "validate_g2_bound_authority"), \
+             mock.patch.object(bootstrap, "_git", side_effect=identity), \
+             mock.patch.object(bootstrap, "_git_bytes", side_effect=raw), \
+             mock.patch.object(bootstrap, "_tree_entries", return_value=entries), \
+             mock.patch.object(bootstrap, "validate_protected_universe"):
+            bootstrap.validate_g2_bound_candidate_identity(
+                candidate, revision, self.protected, self.s1)
+
+    def test_exact_future_b1_identity_model(self) -> None:
+        self._mock_bound_candidate()
+
+    def test_wrong_tree_parent_paths_blobs_repository_and_rebase_reject(self) -> None:
+        cases = (
+            {"tree": "0" * 40},
+            {"parent": "2" * 40},
+            {"parent": self.s1},
+            {"paths": bootstrap.MODEL_D_MAINTENANCE_PATHS[:-1]},
+            {"blobs": {bootstrap.MODEL_D_MAINTENANCE_PATHS[1]: "0" * 40}},
+            {"remote": "https://github.com/KiloAlpha021/security-workflows.git"},
+            {"source": (f'G2_MAINTENANCE_LIFECYCLE = "'
+                        f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND"\n')},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes), self.assertRaises(bootstrap.BootstrapError):
+                self._mock_bound_candidate(**changes)
+
+    def test_exact_s1_abandonment_is_terminal(self) -> None:
+        candidate = self.root / "abandonment"
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
+                        str(candidate)], check=True, capture_output=True)
+        git(candidate, "config", "user.name", "B2 Test")
+        git(candidate, "config", "user.email", "b2@example.invalid")
+        git(candidate, "config", "core.autocrlf", "false")
+        git(candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        source = candidate / "protected_policy_bootstrap.py"
+        protected_source = bootstrap._git_bytes(
+            self.protected, "show", f"{self.s1}:protected_policy_bootstrap.py")
+        source.write_bytes(protected_source.replace(
+            f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND'.encode(),
+            f'{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED'.encode()))
+        git(candidate, "add", "protected_policy_bootstrap.py")
+        git(candidate, "commit", "-m", "Abandon bound G2")
+        candidate_sha = git(candidate, "rev-parse", "HEAD")
+        bootstrap.validate_g2_maintenance(
+            bootstrap.G2_MAINTENANCE_GENERATION, candidate, self.protected,
+            candidate_sha, self.s1)
+        git(self.protected, "fetch", str(candidate), candidate_sha)
+        git(self.protected, "merge", "--no-ff", "FETCH_HEAD", "-m", "Expire bound G2")
+        terminal = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", terminal)
+        self.assertTrue(bootstrap._g2_generation_was_consumed(self.protected, terminal))
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "permanently consumed"):
+            bootstrap.validate_g2_bound_authority(self.protected, terminal)
+
+    def test_bound_rollback_and_ordinary_rebinding_reject(self) -> None:
+        for replacement in (
+                f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND',
+                'G2_BOUND_CANDIDATE_TREE = "' + "0" * 40 + '"'):
+            with self.subTest(replacement=replacement):
+                candidate = self.root / ("mutation-" + str(len(list(self.root.iterdir()))))
+                subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
+                                str(candidate)], check=True, capture_output=True)
+                git(candidate, "config", "user.name", "B2 Test")
+                git(candidate, "config", "user.email", "b2@example.invalid")
+                git(candidate, "config", "core.autocrlf", "false")
+                git(candidate, "remote", "set-url", "origin",
+                    "https://github.com/KiloAlpha021/security-policy.git")
+                source = candidate / "protected_policy_bootstrap.py"
+                data = bootstrap._git_bytes(
+                    self.protected, "show", f"{self.s1}:protected_policy_bootstrap.py")
+                if replacement.endswith("ACTIVE_UNBOUND"):
+                    data = data.replace(
+                        f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND'.encode(),
+                        replacement.encode())
+                else:
+                    declaration = (f'G2_BOUND_CANDIDATE_TREE = "'
+                                   f'{bootstrap.G2_BOUND_CANDIDATE_TREE}"').encode()
+                    data = data.replace(declaration, replacement.encode())
+                source.write_bytes(data)
+                git(candidate, "add", "protected_policy_bootstrap.py")
+                git(candidate, "commit", "-m", "Attempt bound authority mutation")
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_g2_maintenance(
+                        bootstrap.G2_MAINTENANCE_GENERATION, candidate, self.protected,
+                        git(candidate, "rev-parse", "HEAD"), self.s1)
+
+    def test_public_admission_does_not_implement_b3(self) -> None:
+        with mock.patch.object(bootstrap, "validate_g2_bound_candidate_identity"), \
+             self.assertRaisesRegex(bootstrap.BootstrapError, "B3 admission is not implemented"):
+            candidate = self.root / "synthetic-b1"
+            subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
+                            str(candidate)], check=True, capture_output=True)
+            git(candidate, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            git(candidate, "checkout", "-b", "candidate")
+            marker = candidate / "README.md"
+            marker.write_bytes(marker.read_bytes() + b"\n")
+            git(candidate, "config", "user.name", "B2 Test")
+            git(candidate, "config", "user.email", "b2@example.invalid")
+            git(candidate, "add", "README.md")
+            git(candidate, "commit", "-m", "Synthetic B1")
+            bootstrap.validate_g2_maintenance(
+                bootstrap.G2_MAINTENANCE_GENERATION, candidate, self.protected,
+                git(candidate, "rev-parse", "HEAD"), self.s1)
+
+
 class G2SeedAdmissionTests(unittest.TestCase):
     """Exercise proposed G2 authority only after a synthetic protected seed merge."""
 
@@ -3184,20 +3417,15 @@ class G2SeedAdmissionTests(unittest.TestCase):
         subprocess.run(["git", "clone", "--no-hardlinks", str(self.source),
                         str(self.protected)], check=True, capture_output=True)
         self._configure(self.protected)
+        git(self.protected, "checkout", "-B", "main",
+            "9b78dcb50df2e7ae89cfb32733e37f88659e12ab")
         self.base_sha = git(self.protected, "rev-parse", "HEAD")
         git(self.protected, "checkout", "-b", "seed")
         for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
             destination = self.protected / name
-            data = (self.source / name).read_bytes()
-            if name == "protected_policy_bootstrap.py":
-                consumed = (f'G2_MAINTENANCE_LIFECYCLE = "'
-                            f'{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED"').encode()
-                active = (f'G2_MAINTENANCE_LIFECYCLE = "'
-                          f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND"').encode()
-                data = data.replace(consumed, active)
-                if data.count(active) != 1:
-                    raise AssertionError("Synthetic G2 seed lifecycle is ambiguous")
-            destination.write_bytes(data)
+            destination.write_bytes(bootstrap._git_bytes(
+                self.source, "show",
+                f"bb0e4279954ed7b0600d71091e69d369516e5d75:{name}"))
         git(self.protected, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
         git(self.protected, "commit", "-m", "Synthetic G2 seed proposal")
         self.seed_proposal = git(self.protected, "rev-parse", "HEAD")
