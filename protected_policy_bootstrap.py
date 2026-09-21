@@ -8,6 +8,7 @@ post-merge protected proof are required for the first landing.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import os
 import re
@@ -41,6 +42,8 @@ G2_BOUND_WORKFLOW_BLOB = "e8a2ff5957c77f03f1c5b8b16ae707820f11159f"
 G2_BOUND_BOOTSTRAP_BLOB = "7edbdf8c216aa336bae95af44fef8b9e4a582731"
 G2_BOUND_TEST_BLOB = "cd5ce5f194cef50dd016ca529f2857cf8c7a6082"
 G2_BOUND_EXPECTED_TERMINAL = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED"
+B3_AUTHORITY_ORIGIN = "9393099a9060f90689341611457c9b9032959b88"
+B3_ENABLEMENT = "DESIGN_B_FINITE_V1"
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
     "protected_policy_bootstrap.py",
@@ -617,6 +620,49 @@ def _require_g2_bound_declarations(source: bytes) -> None:
         raise BootstrapError("G2 protected binding is missing, duplicated, or replaced")
 
 
+def _module_authority_declarations(source: bytes) -> dict[str, str]:
+    """Return the closed module-level uppercase declaration schema."""
+    try:
+        tree = ast.parse(source.decode("utf-8", errors="strict"))
+    except (UnicodeError, SyntaxError) as error:
+        raise BootstrapError("Invalid B3 declaration source") from error
+    declarations: dict[str, str] = {}
+    for statement in tree.body:
+        name: str | None = None
+        value: ast.expr | None = None
+        if (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)):
+            name, value = statement.targets[0].id, statement.value
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            name, value = statement.target.id, statement.value
+        if name is None or value is None or not name.isupper():
+            continue
+        if name in declarations:
+            raise BootstrapError("Duplicate B3 authority declaration")
+        declarations[name] = ast.dump(value, annotate_fields=True,
+                                      include_attributes=False)
+    return declarations
+
+
+def _require_b3_enablement_declaration_schema(
+        s1_source: bytes, enablement_source: bytes) -> None:
+    """Allow exactly the S1 declarations plus the two frozen B3 declarations."""
+    baseline = _module_authority_declarations(s1_source)
+    observed = _module_authority_declarations(enablement_source)
+    expected = dict(baseline)
+    expected.update({
+        "B3_AUTHORITY_ORIGIN": ast.dump(
+            ast.Constant(B3_AUTHORITY_ORIGIN), annotate_fields=True,
+            include_attributes=False),
+        "B3_ENABLEMENT": ast.dump(
+            ast.Constant(B3_ENABLEMENT), annotate_fields=True,
+            include_attributes=False),
+    })
+    if observed != expected:
+        raise BootstrapError(
+            "B3 enablement authority declarations differ from the closed S1 schema")
+
+
 def _exact_modified_paths(root: Path, before: str, after: str) -> tuple[str, ...]:
     output = _git_bytes(root, "diff", "--name-status", "-z", "--no-renames",
                         before, after)
@@ -703,6 +749,177 @@ def validate_g2_bound_candidate_identity(
     if G2_BOUND_EXPECTED_TERMINAL.encode() not in candidate_source:
         raise BootstrapError("Bound candidate terminal disposition mismatch")
     validate_protected_universe(candidate, revision)
+
+
+def _validate_b1_candidate(candidate: Path, revision: str) -> None:
+    """Validate one exact S0-parented B1 object without granting authority."""
+    if _git(candidate, "rev-parse", "HEAD") != revision:
+        raise BootstrapError("B3 P checkout does not match selected P SHA")
+    if _canonical_remote(_git(candidate, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("B3 P repository mismatch")
+    if _git(candidate, "cat-file", "-t", revision) != "commit":
+        raise BootstrapError("B3 P is not a commit")
+    attribution = _git(candidate, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", revision).split("\0")
+    if len(attribution) != 4 or any(not value.strip() for value in attribution):
+        raise BootstrapError("B3 P attribution is missing")
+    parents = _git(candidate, "rev-list", "--parents", "-n", "1", revision).split()
+    if parents != [revision, G2_BOUND_ORIGIN]:
+        raise BootstrapError("B3 P must have sole parent S0")
+    if _git(candidate, "rev-parse", f"{revision}^{{tree}}") != G2_BOUND_CANDIDATE_TREE:
+        raise BootstrapError("B3 P tree mismatch")
+    if _exact_modified_paths(candidate, G2_BOUND_ORIGIN, revision) != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError("B3 P paths mismatch")
+    entries = _tree_entries(candidate, revision, MODEL_D_MAINTENANCE_PATHS)
+    if tuple(entries) != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError("B3 P tree paths mismatch")
+    for path, expected_blob in G2_EXPECTED_CANDIDATE_BLOBS:
+        mode, kind = entries[path]
+        if (mode, kind) != ("100644", "blob"):
+            raise BootstrapError("B3 P paths must be regular 100644 blobs")
+        if _git(candidate, "rev-parse", f"{revision}:{path}") != expected_blob:
+            raise BootstrapError("B3 P blob mismatch")
+    source = _git_bytes(candidate, "show", f"{revision}:protected_policy_bootstrap.py")
+    if _g2_lifecycle(source) != "CONSUMED":
+        raise BootstrapError("B3 P must propose terminal CONSUMED")
+    if G2_BOUND_EXPECTED_TERMINAL.encode() not in source:
+        raise BootstrapError("B3 P terminal disposition mismatch")
+    validate_protected_universe(candidate, revision)
+
+
+def validate_b3_enablement_candidate(
+        candidate_root: Path, candidate_sha: str,
+        protected_root: Path, protected_sha: str) -> None:
+    """Validate one proposal that only enables finite DESIGN-B validation."""
+    if _sha(protected_sha, "protected SHA") != B3_AUTHORITY_ORIGIN:
+        raise BootstrapError("B3 enablement authority must be exact S1")
+    validate_g2_bound_authority(protected_root, protected_sha)
+    candidate = _root(candidate_root, "B3 enablement candidate root")
+    revision = _sha(candidate_sha, "B3 enablement candidate SHA")
+    if _git(candidate, "rev-parse", "HEAD") != revision:
+        raise BootstrapError("B3 enablement checkout mismatch")
+    if _canonical_remote(_git(candidate, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("B3 enablement repository mismatch")
+    parents = _git(candidate, "rev-list", "--parents", "-n", "1", revision).split()
+    if parents != [revision, B3_AUTHORITY_ORIGIN]:
+        raise BootstrapError("B3 enablement must be based directly on exact S1")
+    if _exact_modified_paths(candidate, B3_AUTHORITY_ORIGIN, revision) != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError("B3 enablement exceeds the exact three-file scope")
+    source = _git_bytes(candidate, "show", f"{revision}:protected_policy_bootstrap.py")
+    s1_source = _git_bytes(
+        _root(protected_root, "B3 S1 authority root"), "show",
+        f"{B3_AUTHORITY_ORIGIN}:protected_policy_bootstrap.py")
+    _require_b3_enablement_declaration_schema(s1_source, source)
+    if _g2_lifecycle(source) != "ACTIVE_BOUND":
+        raise BootstrapError("B3 enablement must remain ACTIVE_BOUND")
+    _require_g2_bound_declarations(source)
+    marker = f'B3_ENABLEMENT = "{B3_ENABLEMENT}"'.encode()
+    if source.split(b"\n").count(marker) != 1:
+        raise BootstrapError("B3 enablement marker is missing or duplicated")
+    if re.search(rb'^G2_SELECTED_P_SHA\s*=', source, re.MULTILINE):
+        raise BootstrapError("B3 enablement must not select P")
+    validate_protected_universe(candidate, revision)
+
+
+def validate_b3_enabled_authority(protected_root: Path, protected_sha: str) -> None:
+    """Recognize exactly one protected DESIGN-B enablement merge after S1."""
+    protected = _root(protected_root, "B3 protected root")
+    revision = _sha(protected_sha, "B3 protected SHA")
+    if _git(protected, "rev-parse", "HEAD") != revision:
+        raise BootstrapError("B3 protected checkout mismatch")
+    if _git(protected, "rev-parse", "refs/remotes/origin/main") != revision:
+        raise BootstrapError("B3 validator is not protected main")
+    if _canonical_remote(_git(protected, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("B3 protected repository mismatch")
+    parents = _git(protected, "rev-list", "--parents", "-n", "1", revision).split()
+    if len(parents) != 3 or parents[1] != B3_AUTHORITY_ORIGIN:
+        raise BootstrapError("B3 validator is not the finite S1 enablement merge")
+    proposal = parents[2]
+    if _git(protected, "rev-list", "--parents", "-n", "1", proposal).split() != [proposal, B3_AUTHORITY_ORIGIN]:
+        raise BootstrapError("B3 enablement proposal is not based directly on S1")
+    if _git(protected, "rev-parse", f"{proposal}^{{tree}}") != _git(protected, "rev-parse", f"{revision}^{{tree}}"):
+        raise BootstrapError("B3 enablement merge tree differs from proposal")
+    source = _git_bytes(protected, "show", f"{revision}:protected_policy_bootstrap.py")
+    s1_source = _git_bytes(
+        protected, "show", f"{B3_AUTHORITY_ORIGIN}:protected_policy_bootstrap.py")
+    _require_b3_enablement_declaration_schema(s1_source, source)
+    if _g2_lifecycle(source) != "ACTIVE_BOUND":
+        raise BootstrapError("B3 validator must remain ACTIVE_BOUND")
+    _require_g2_bound_declarations(source)
+    marker = f'B3_ENABLEMENT = "{B3_ENABLEMENT}"'.encode()
+    if source.split(b"\n").count(marker) != 1:
+        raise BootstrapError("B3 validator marker is missing or duplicated")
+    if _exact_modified_paths(protected, B3_AUTHORITY_ORIGIN, revision) != MODEL_D_MAINTENANCE_PATHS:
+        raise BootstrapError("B3 validator exceeds the finite enablement scope")
+    validate_protected_universe(protected, revision)
+
+
+def validate_b3_establishment(
+        protected_root: Path, protected_sha: str,
+        p_root: Path, p_sha: str, e_root: Path, e_sha: str) -> None:
+    """Admit one exact P through one deterministic terminal-tree proposal E."""
+    validate_b3_enabled_authority(protected_root, protected_sha)
+    protected_revision = _sha(protected_sha, "B3 protected SHA")
+    selected_p = _sha(p_sha, "selected P SHA")
+    proposal = _sha(e_sha, "E SHA")
+    p = _root(p_root, "P root")
+    e = _root(e_root, "E root")
+    protected = _root(protected_root, "B3 protected root")
+    roots = (protected, p, e)
+    if len(set(roots)) != 3 or any(a.is_relative_to(b) for a in roots for b in roots if a != b):
+        raise BootstrapError("B3 protected, P, and E roots must be separate")
+    _validate_b1_candidate(p, selected_p)
+    if _git(e, "rev-parse", "HEAD") != proposal:
+        raise BootstrapError("B3 E checkout does not match E SHA")
+    if _canonical_remote(_git(e, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("B3 E repository mismatch")
+    if _git(e, "cat-file", "-t", proposal) != "commit":
+        raise BootstrapError("B3 E is not a commit")
+    attribution = _git(e, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", proposal).split("\0")
+    if len(attribution) != 4 or any(not value.strip() for value in attribution):
+        raise BootstrapError("B3 E attribution is missing")
+    parents = _git(e, "rev-list", "--parents", "-n", "1", proposal).split()
+    if parents != [proposal, protected_revision, selected_p]:
+        raise BootstrapError("B3 E ordered parents must be exact S2 and selected P")
+    if _git(e, "rev-parse", f"{proposal}^{{tree}}") != G2_BOUND_CANDIDATE_TREE:
+        raise BootstrapError("B3 E terminal tree mismatch")
+    for path, expected_blob in G2_EXPECTED_CANDIDATE_BLOBS:
+        if _git(e, "rev-parse", f"{proposal}:{path}") != expected_blob:
+            raise BootstrapError("B3 E terminal blob mismatch")
+    source = _git_bytes(e, "show", f"{proposal}:protected_policy_bootstrap.py")
+    if _g2_lifecycle(source) != "CONSUMED":
+        raise BootstrapError("B3 E must be terminal CONSUMED")
+    validate_protected_universe(e, proposal)
+
+
+def validate_b3_terminal(
+        terminal_root: Path, terminal_sha: str, protected_sha: str,
+        p_sha: str, e_sha: str) -> None:
+    """Prove the actual protected two-parent terminal checkpoint T."""
+    terminal = _root(terminal_root, "terminal root")
+    revision = _sha(terminal_sha, "terminal SHA")
+    enabled = _sha(protected_sha, "B3 protected SHA")
+    selected_p = _sha(p_sha, "selected P SHA")
+    proposal = _sha(e_sha, "E SHA")
+    if (_git(terminal, "rev-parse", "HEAD") != revision
+            or _git(terminal, "rev-parse", "refs/remotes/origin/main") != revision):
+        raise BootstrapError("B3 terminal checkpoint is not protected main")
+    if _git(terminal, "cat-file", "-t", revision) != "commit":
+        raise BootstrapError("B3 terminal checkpoint is not a commit")
+    if _git(terminal, "rev-list", "--parents", "-n", "1", revision).split() != [revision, enabled, proposal]:
+        raise BootstrapError("B3 T ordered parents must be exact S2 and E")
+    if _git(terminal, "rev-list", "--parents", "-n", "1", proposal).split() != [proposal, enabled, selected_p]:
+        raise BootstrapError("B3 T does not retain exact E and P ancestry")
+    ancestry = subprocess.run(
+        ["git", "-C", str(terminal), "merge-base", "--is-ancestor",
+         B3_AUTHORITY_ORIGIN, enabled], capture_output=True, check=False)
+    if ancestry.returncode != 0:
+        raise BootstrapError("B3 S1 ancestry check failed")
+    if _git(terminal, "rev-parse", f"{revision}^{{tree}}") != G2_BOUND_CANDIDATE_TREE:
+        raise BootstrapError("B3 T terminal tree mismatch")
+    source = _git_bytes(terminal, "show", f"{revision}:protected_policy_bootstrap.py")
+    if _g2_lifecycle(source) != "CONSUMED":
+        raise BootstrapError("B3 T must be terminal CONSUMED")
+    validate_protected_universe(terminal, revision)
 
 
 def validate_model_d_maintenance(
@@ -1147,6 +1364,12 @@ def _parser() -> argparse.ArgumentParser:
             "candidate-root", "protected-root"):
         maintenance_parser.add_argument(
             f"--{name}", required=True, default=None, action=_Once)
+    b3_parser = commands.add_parser("admit-b3")
+    for name in ("protected-sha", "protected-root", "p-sha", "p-root", "e-sha", "e-root"):
+        b3_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
+    terminal_parser = commands.add_parser("prove-b3-terminal")
+    for name in ("terminal-sha", "terminal-root", "protected-sha", "p-sha", "e-sha"):
+        terminal_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
     return parser
 
 
@@ -1174,6 +1397,17 @@ def main(argv: list[str] | None = None) -> int:
     """Run one closed protected bootstrap operation and fail closed."""
     try:
         arguments = _parser().parse_args(argv)
+        if arguments.operation == "admit-b3":
+            validate_b3_establishment(
+                Path(arguments.protected_root), arguments.protected_sha,
+                Path(arguments.p_root), arguments.p_sha,
+                Path(arguments.e_root), arguments.e_sha)
+            return 0
+        if arguments.operation == "prove-b3-terminal":
+            validate_b3_terminal(
+                Path(arguments.terminal_root), arguments.terminal_sha,
+                arguments.protected_sha, arguments.p_sha, arguments.e_sha)
+            return 0
         if arguments.operation == "admit-maintenance":
             if arguments.maintenance_generation == G2_MAINTENANCE_GENERATION:
                 if arguments.maintenance_operation != MODEL_D_MAINTENANCE_OPERATION:

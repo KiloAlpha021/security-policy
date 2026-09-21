@@ -56,6 +56,44 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($protectedSha -notmatch '^[0-9a-f]{40}$') { throw 'Malformed protected-policy SHA' }
           "protected-sha=$protectedSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $bootstrap = Get-Content -Raw -LiteralPath "${{ github.workspace }}/policy/protected_policy_bootstrap.py"
+          $b3Enabled = ($bootstrap -match '(?m)^B3_ENABLEMENT = "DESIGN_B_FINITE_V1"$')
+          "b3-enabled=$($b3Enabled.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Resolve exact B3 proposal identities
+        if: steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'
+        id: b3-identities
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $eSha = "${{ github.event.pull_request.head.sha }}"
+          if ($eSha -notmatch '^[0-9a-f]{40}$') { throw 'Missing or malformed E SHA' }
+          $parents = @(git -C "${{ github.workspace }}/candidate" rev-list --parents -n 1 $eSha)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $fields = $parents.Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          if ($fields.Count -ne 3 -or $fields[0] -ne $eSha) { throw 'E must have exactly two parents' }
+          $pSha = $fields[2]
+          if ($pSha -notmatch '^[0-9a-f]{40}$') { throw 'Malformed P SHA derived from E' }
+          "e-sha=$eSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "p-sha=$pSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Check out exact B3 establishment proposal E
+        if: steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: KiloAlpha021/security-policy
+          ref: ${{ steps.b3-identities.outputs.e-sha }}
+          fetch-depth: 0
+          path: e-candidate
+
+      - name: Check out exact selected B1 provenance P
+        if: steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: KiloAlpha021/security-policy
+          ref: ${{ steps.b3-identities.outputs.p-sha }}
+          fetch-depth: 0
+          path: p-candidate
 
       - name: Resolve protected bootstrap authority
         id: protected-bootstrap
@@ -98,11 +136,19 @@ jobs:
           if ($env:POST_MERGE_PROOF -ne 'REQUIRED') { throw 'Post-merge proof output is not REQUIRED' }
 
       - name: Enforce exact Model D maintenance admission
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'
+        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" admit-maintenance --maintenance-operation MODEL_D_ORCHESTRATION_V1 --maintenance-generation "${{ env.G2_MAINTENANCE_GENERATION }}" --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Enforce exact DESIGN-B terminal admission
+        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" admit-b3 --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --protected-root "${{ github.workspace }}/policy" --p-sha "${{ steps.b3-identities.outputs.p-sha }}" --p-root "${{ github.workspace }}/p-candidate" --e-sha "${{ steps.b3-identities.outputs.e-sha }}" --e-root "${{ github.workspace }}/e-candidate"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Resolve protected Model D orchestration
