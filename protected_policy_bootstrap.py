@@ -52,6 +52,13 @@ B3_CORRECTION_PATHS = (
     "protected_policy_bootstrap.py",
     "test_verify_security_workflows.py",
 )
+B3_P_SELECTION_BASE = "c7041b6802c9196c491d63977cdc6f81a3566b01"
+EXPECTED_P_SHA = "f8f41127efe2c27cc7ba8f3132754b5c363636a1"
+B3_P_SELECTION_PATHS = (
+    ".github/workflows/security-workflows-policy.yml",
+    "protected_policy_bootstrap.py",
+    "test_verify_security_workflows.py",
+)
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
     "protected_policy_bootstrap.py",
@@ -913,13 +920,90 @@ def validate_b3_corrected_authority(protected_root: Path, protected_sha: str) ->
     validate_protected_universe(protected, revision)
 
 
+def _require_b3_selected_history(root: Path, revision: str) -> None:
+    """Recognize one exact-S2C successor that binds the real P once."""
+    if _git(root, "cat-file", "-t", revision) != "commit":
+        raise BootstrapError("B3 P selection checkpoint is not a commit")
+    parents = _git(root, "rev-list", "--parents", "-n", "1", revision).split()
+    if len(parents) != 3 or parents[1] != B3_P_SELECTION_BASE:
+        raise BootstrapError("B3 P selection must have exact S2C first parent")
+    _require_b3_corrected_history(root, B3_P_SELECTION_BASE)
+    proposal = parents[2]
+    if _git(root, "cat-file", "-t", proposal) != "commit":
+        raise BootstrapError("B3 P selection proposal is not a commit")
+    if _git(root, "rev-list", "--parents", "-n", "1", proposal).split() != [
+            proposal, B3_P_SELECTION_BASE]:
+        raise BootstrapError("B3 P selection proposal must be a direct S2C child")
+    if (_git(root, "rev-parse", f"{proposal}^{{tree}}") !=
+            _git(root, "rev-parse", f"{revision}^{{tree}}")):
+        raise BootstrapError("B3 P selection merge tree differs from proposal")
+    if _exact_modified_paths(root, B3_P_SELECTION_BASE, revision) != B3_P_SELECTION_PATHS:
+        raise BootstrapError("B3 P selection exceeds its three-file scope")
+    entries = _tree_entries(root, revision, B3_P_SELECTION_PATHS)
+    if tuple(entries) != B3_P_SELECTION_PATHS or any(
+            entry != ("100644", "blob") for entry in entries.values()):
+        raise BootstrapError("B3 P selection paths must be regular 100644 blobs")
+    before = _git_bytes(root, "show", f"{B3_P_SELECTION_BASE}:protected_policy_bootstrap.py")
+    source = _git_bytes(root, "show", f"{revision}:protected_policy_bootstrap.py")
+    expected = _module_authority_declarations(before)
+    for name, value in (
+            ("B3_P_SELECTION_BASE", B3_P_SELECTION_BASE),
+            ("EXPECTED_P_SHA", EXPECTED_P_SHA),
+            ("B3_P_SELECTION_PATHS", B3_P_SELECTION_PATHS)):
+        expected[name] = ast.dump(ast.parse(repr(value), mode="eval").body,
+                                  annotate_fields=True, include_attributes=False)
+    if _module_authority_declarations(source) != expected:
+        raise BootstrapError("B3 P selection authority declarations differ from S2C")
+    try:
+        module = ast.parse(source.decode("utf-8", errors="strict"))
+    except (UnicodeError, SyntaxError) as error:
+        raise BootstrapError("Invalid B3 P selection source") from error
+    baseline = ast.parse(before.decode("utf-8", errors="strict"))
+    def assigned_names(statements: list[ast.stmt]) -> list[str]:
+        names: list[str] = []
+        for statement in statements:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                names.extend(target.id for target in targets if isinstance(target, ast.Name))
+        return names
+    previous_names = assigned_names(baseline.body)
+    selected_names = assigned_names(module.body)
+    allowed_new = {"B3_P_SELECTION_BASE", "EXPECTED_P_SHA", "B3_P_SELECTION_PATHS"}
+    if (len(selected_names) != len(set(selected_names)) or
+            set(selected_names) != set(previous_names) | allowed_new):
+        raise BootstrapError("Alternate or duplicate P selection declaration")
+    if _sha(EXPECTED_P_SHA, "protected expected P SHA") != EXPECTED_P_SHA:
+        raise BootstrapError("Invalid protected expected P SHA")
+    if _g2_lifecycle(source) != "ACTIVE_BOUND":
+        raise BootstrapError("B3 P selection must remain ACTIVE_BOUND")
+    _require_g2_bound_declarations(source)
+    marker = f'EXPECTED_P_SHA = "{EXPECTED_P_SHA}"'.encode()
+    if source.split(b"\n").count(marker) != 1:
+        raise BootstrapError("Exact protected P binding is missing or duplicated")
+
+
+def validate_b3_selected_authority(protected_root: Path, protected_sha: str) -> None:
+    """Require the actual protected main to be the unique P selection merge."""
+    protected = _root(protected_root, "B3 protected root")
+    revision = _sha(protected_sha, "B3 protected SHA")
+    if (_git(protected, "rev-parse", "HEAD") != revision or
+            _git(protected, "rev-parse", "refs/remotes/origin/main") != revision):
+        raise BootstrapError("B3 P selector is not protected main")
+    if _canonical_remote(_git(protected, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("B3 P selector repository mismatch")
+    _require_b3_selected_history(protected, revision)
+    validate_protected_universe(protected, revision)
+
+
 def validate_b3_establishment(
         protected_root: Path, protected_sha: str,
         p_root: Path, p_sha: str, e_root: Path, e_sha: str) -> None:
     """Admit one exact P through one deterministic terminal-tree proposal E."""
-    validate_b3_corrected_authority(protected_root, protected_sha)
+    validate_b3_selected_authority(protected_root, protected_sha)
     protected_revision = _sha(protected_sha, "B3 protected SHA")
     selected_p = _sha(p_sha, "selected P SHA")
+    if selected_p != EXPECTED_P_SHA:
+        raise BootstrapError("B3 supplied P differs from protected expected P")
     proposal = _sha(e_sha, "E SHA")
     p = _root(p_root, "P root")
     e = _root(e_root, "E root")
@@ -957,6 +1041,8 @@ def validate_b3_terminal(
     revision = _sha(terminal_sha, "terminal SHA")
     enabled = _sha(protected_sha, "B3 protected SHA")
     selected_p = _sha(p_sha, "selected P SHA")
+    if selected_p != EXPECTED_P_SHA:
+        raise BootstrapError("B3 terminal supplied P differs from protected expected P")
     proposal = _sha(e_sha, "E SHA")
     if (_git(terminal, "rev-parse", "HEAD") != revision
             or _git(terminal, "rev-parse", "refs/remotes/origin/main") != revision):
@@ -967,7 +1053,7 @@ def validate_b3_terminal(
         raise BootstrapError("B3 T ordered parents must be exact S2 and E")
     if _git(terminal, "rev-list", "--parents", "-n", "1", proposal).split() != [proposal, enabled, selected_p]:
         raise BootstrapError("B3 T does not retain exact E and P ancestry")
-    _require_b3_corrected_history(terminal, enabled)
+    _require_b3_selected_history(terminal, enabled)
     ancestry = subprocess.run(
         ["git", "-C", str(terminal), "merge-base", "--is-ancestor",
          B3_AUTHORITY_ORIGIN, enabled], capture_output=True, check=False)
@@ -1445,6 +1531,9 @@ def _parser() -> argparse.ArgumentParser:
     b3_parser = commands.add_parser("admit-b3")
     for name in ("protected-sha", "protected-root", "p-sha", "p-root", "e-sha", "e-root"):
         b3_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
+    selection_parser = commands.add_parser("select-b3-p")
+    for name in ("protected-sha", "protected-root"):
+        selection_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
     terminal_parser = commands.add_parser("prove-b3-terminal")
     for name in ("terminal-sha", "terminal-root", "protected-sha", "p-sha", "e-sha"):
         terminal_parser.add_argument(f"--{name}", required=True, default=None, action=_Once)
@@ -1475,6 +1564,11 @@ def main(argv: list[str] | None = None) -> int:
     """Run one closed protected bootstrap operation and fail closed."""
     try:
         arguments = _parser().parse_args(argv)
+        if arguments.operation == "select-b3-p":
+            validate_b3_selected_authority(
+                Path(arguments.protected_root), arguments.protected_sha)
+            print(EXPECTED_P_SHA)
+            return 0
         if arguments.operation == "admit-b3":
             validate_b3_establishment(
                 Path(arguments.protected_root), arguments.protected_sha,

@@ -315,6 +315,9 @@ def duplicate():
         ]
         self.assertEqual(names, expected)
         by_name = {step["name"]: step for step in steps}
+        self.assertIn(
+            'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" select-b3-p',
+            by_name["Resolve exact B3 proposal identities"]["run"])
 
         candidate = by_name["Check out exact candidate"]
         protected = by_name["Check out independent root policy"]
@@ -2073,7 +2076,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _COMMANDS = {
         "Assert exact CPython runtime": ("python",),
         "Acquire protected Git identity": ("git", "Out-File", "Get-Content", "Out-File"),
-        "Resolve exact B3 proposal identities": ("git", "Out-File", "Out-File"),
+        "Resolve exact B3 proposal identities": ("git", "python", "Out-File", "Out-File"),
         "Enforce exact DESIGN-B terminal admission": ("python",),
         "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "python"),
         "Assert protected bootstrap outputs": (),
@@ -2097,7 +2100,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _COMMAND_DIGESTS = {
         "Assert exact CPython runtime": "ff4765d5070a8f20c672195931f3296bd7f98d025cc603a3253336a1909ef10a",
         "Acquire protected Git identity": "42f84cc61849df6f624e89aec24b79d879613e3ee90093e7419a088f8a99fc9f",
-        "Resolve exact B3 proposal identities": "72a7cd48bfbdaa73c9b6073f0a63f1f76d60e6d4a5db82774146d3c90d1a0445",
+        "Resolve exact B3 proposal identities": "85e9480bc77b27871892d2f6f99f8dda934a59fb798351b1679593c2cbb61dec",
         "Enforce exact DESIGN-B terminal admission": "624d07da700b166d38005a31c72cbb95afe780cf94081748aebb4f5da9b2f8fd",
         "Resolve protected bootstrap authority": "1033bc372e862723b7301df8269c8d55268af0263a4049e665c44a2bd491e9d1",
         "Enforce exact Model D maintenance admission": "a27a6cb21b57491d4f10396fcd1e05d9f1db6cc2e3570a5b6c28b2828c6fab66",
@@ -2113,7 +2116,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     }
     _EXPRESSION_DIGESTS = {
         "Acquire protected Git identity": "626f38d5235646eebb8630cef6a809250712768735127c17c93ea94bcc65fb15",
-        "Resolve exact B3 proposal identities": "662649d4e9fe6e796b216b59ab87d9fd1d5d6a9229d2a76c8b42d32d595d6b7e",
+        "Resolve exact B3 proposal identities": "4bc0bbaf4a3b93b158c80966d4c245a28cb5a621c85bb7d462a38433f6155878",
         "Enforce exact DESIGN-B terminal admission": "d96cbb766649076440ed894b7c091515c566b09a1800d22cd2119d24b27aacbe",
         "Resolve protected bootstrap authority": "d10fe55d40daab7b732dc2414601063a036a64f8fd75abe71ecfa089546a4ff2",
         "Enforce exact Model D maintenance admission": "244ee8225afbae50176f170eadf00b1e403fcc339a10ed5a59a70cb5434bac83",
@@ -2125,7 +2128,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _ASSIGNMENT_DIGESTS = {
         "Assert exact CPython runtime": "d28dad29c037f617afecde27704bef3d358314acff79e6e0dc6e838ef68ddbab",
         "Acquire protected Git identity": "320593180ff57d38faec11febbe67cf71e3b903ef323baf07f8150ce28aec235",
-        "Resolve exact B3 proposal identities": "ac6b9aad880185c66e8c47255c0ac3e40d5089757d1672cfb6a81b8f419f9f1c",
+        "Resolve exact B3 proposal identities": "ea68267ec2ebaa3edb2418ab0e26adf76f576a5fbdf95761535eeb4cd52acf2e",
         "Resolve protected bootstrap authority": "7345417463fdbf2b043e1c7a229cc9ce631efc2c8de8348111022a2d6e8df5d6",
     }
     _STOP_ASSIGNMENT_DIGEST = "a6ff9ace77f1623d434a131b94c045ea59228ca4c1afaffe3900356c386bb1a5"
@@ -2160,7 +2163,9 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Resolve exact B3 proposal identities": (
             "$eSha -notmatch '^[0-9a-f]{40}$'",
             "$fields.Count -ne 3 -or $fields[0] -ne $eSha",
+            "$proposedP -notmatch '^[0-9a-f]{40}$'",
             "$pSha -notmatch '^[0-9a-f]{40}$'",
+            "$proposedP -ne $pSha",
         ),
         "Resolve protected bootstrap authority": (
             "$observedHead -ne $candidateSha",
@@ -2187,7 +2192,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     }
     _VARIABLES = frozenset({
         "actualBlob", "candidateRoot", "candidateSha", "ErrorActionPreference",
-        "bootstrap", "b3Enabled", "eSha", "parents", "fields", "pSha",
+        "bootstrap", "b3Enabled", "eSha", "parents", "fields", "proposedP", "pSha",
         "expectedBlob", "LASTEXITCODE", "observedHead", "protectedSha",
         "pythonVersion", "workflowPath", "env:GITHUB_OUTPUT",
         "env:AUDIT_LOCK_SOURCE", "env:CANDIDATE_EVIDENCE", "env:D0_CONTEXT",
@@ -2200,7 +2205,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     })
     _ASSIGNMENTS = frozenset({
         "$ErrorActionPreference", "$pythonVersion", "$protectedSha", "$bootstrap",
-        "$b3Enabled", "$eSha", "$parents", "$fields", "$pSha",
+        "$b3Enabled", "$eSha", "$parents", "$fields", "$proposedP", "$pSha",
         "$candidateRoot", "$candidateSha", "$observedHead", "$workflowPath",
         "$expectedBlob", "$actualBlob",
     })
@@ -3769,7 +3774,7 @@ class B3DesignBTests(unittest.TestCase):
                 self._mock_p(blobs=blobs)
 
     def test_selected_p_sha_rejects_same_content_alternate_commit(self) -> None:
-        selected, alternate, s2, e_sha = "1" * 40, "9" * 40, "2" * 40, "3" * 40
+        selected, alternate, s2, e_sha = bootstrap.EXPECTED_P_SHA, "9" * 40, "2" * 40, "3" * 40
 
         def identity(root: Path, *arguments: str) -> str:
             values = {
@@ -3784,7 +3789,7 @@ class B3DesignBTests(unittest.TestCase):
             }
             return values[arguments]
 
-        with mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
+        with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
              mock.patch.object(bootstrap, "_validate_b1_candidate"), \
              mock.patch.object(bootstrap, "_git_attribution"), \
              mock.patch.object(bootstrap, "_git", side_effect=identity):
@@ -3793,7 +3798,7 @@ class B3DesignBTests(unittest.TestCase):
                     self.protected, s2, self.p, selected, self.e, e_sha)
 
     def test_e_requires_selected_p_order_and_terminal_tree(self) -> None:
-        s2, p_sha, e_sha = "2" * 40, "1" * 40, "3" * 40
+        s2, p_sha, e_sha = "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
 
         def identity(root: Path, *arguments: str) -> str:
             if root == self.e and arguments == ("rev-parse", "HEAD"):
@@ -3813,7 +3818,7 @@ class B3DesignBTests(unittest.TestCase):
             raise AssertionError((root, arguments))
 
         terminal = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_BOUND_EXPECTED_TERMINAL}"\n').encode()
-        with mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
+        with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
              mock.patch.object(bootstrap, "_validate_b1_candidate"), \
              mock.patch.object(bootstrap, "_git_attribution"), \
              mock.patch.object(bootstrap, "_git", side_effect=identity), \
@@ -3823,7 +3828,7 @@ class B3DesignBTests(unittest.TestCase):
                 self.protected, s2, self.p, p_sha, self.e, e_sha)
 
     def test_e_complete_adversarial_matrix(self) -> None:
-        s2, p_sha, e_sha = "2" * 40, "1" * 40, "3" * 40
+        s2, p_sha, e_sha = "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
 
         def run(*, head: str | None = None, repository: str | None = None,
                 kind: str = "commit", attribution: str | None = None,
@@ -3851,7 +3856,7 @@ class B3DesignBTests(unittest.TestCase):
                 return values[arguments]
 
             raw = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:{lifecycle}"\n').encode()
-            with mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
+            with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
                  mock.patch.object(bootstrap, "_validate_b1_candidate"), \
                  mock.patch.object(bootstrap, "_git_attribution",
                                    side_effect=(bootstrap.BootstrapError("B3 E attribution is malformed")
@@ -3900,14 +3905,14 @@ class B3DesignBTests(unittest.TestCase):
                 (self.protected, self.e), (self.p, self.protected),
                 (self.p, self.p)):
             with self.subTest(p=p_root.name, e=e_root.name), \
-                 mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
+                 mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
                  self.assertRaisesRegex(bootstrap.BootstrapError, "roots must be separate"):
                 bootstrap.validate_b3_establishment(
-                    self.protected, "2" * 40, p_root, "1" * 40,
+                    self.protected, "2" * 40, p_root, bootstrap.EXPECTED_P_SHA,
                     e_root, "3" * 40)
 
     def test_terminal_requires_exact_order_tree_and_protected_main(self) -> None:
-        t, s2, p_sha, e_sha = "4" * 40, "2" * 40, "1" * 40, "3" * 40
+        t, s2, p_sha, e_sha = "4" * 40, "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
 
         def identity(root: Path, *arguments: str) -> str:
             values = {
@@ -3924,13 +3929,13 @@ class B3DesignBTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, b"", b"")
         with mock.patch.object(bootstrap, "_git", side_effect=identity), \
              mock.patch.object(bootstrap, "_git_bytes", return_value=terminal), \
-             mock.patch.object(bootstrap, "_require_b3_corrected_history"), \
+             mock.patch.object(bootstrap, "_require_b3_selected_history"), \
              mock.patch.object(bootstrap, "validate_protected_universe"), \
              mock.patch.object(bootstrap.subprocess, "run", return_value=completed):
             bootstrap.validate_b3_terminal(self.protected, t, s2, p_sha, e_sha)
 
     def test_t_complete_adversarial_matrix(self) -> None:
-        t, s2, p_sha, e_sha = "4" * 40, "2" * 40, "1" * 40, "3" * 40
+        t, s2, p_sha, e_sha = "4" * 40, "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
 
         def run(*, head: str | None = None, main: str | None = None,
                 kind: str = "commit", parents: str | None = None,
@@ -3953,7 +3958,7 @@ class B3DesignBTests(unittest.TestCase):
             completed = subprocess.CompletedProcess([], ancestry, b"", b"")
             with mock.patch.object(bootstrap, "_git", side_effect=identity), \
                  mock.patch.object(bootstrap, "_git_bytes", return_value=raw), \
-                 mock.patch.object(bootstrap, "_require_b3_corrected_history"), \
+                 mock.patch.object(bootstrap, "_require_b3_selected_history"), \
                  mock.patch.object(bootstrap, "validate_protected_universe"), \
                  mock.patch.object(bootstrap.subprocess, "run", return_value=completed):
                 bootstrap.validate_b3_terminal(self.protected, t, s2, p_sha, e_sha)
@@ -3987,12 +3992,12 @@ class B3DesignBTests(unittest.TestCase):
     def test_b3_terminal_state_cannot_be_reused_as_enablement(self) -> None:
         terminal = "4" * 40
         with mock.patch.object(
-                bootstrap, "validate_b3_corrected_authority",
+                bootstrap, "validate_b3_selected_authority",
                 side_effect=bootstrap.BootstrapError(
-                    "B3 validator is not the finite S1 enablement merge")):
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "finite S1"):
+                    "B3 P selector is not protected main")):
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "protected main"):
                 bootstrap.validate_b3_establishment(
-                    self.protected, terminal, self.p, "1" * 40,
+                    self.protected, terminal, self.p, bootstrap.EXPECTED_P_SHA,
                     self.e, "3" * 40)
 
     def test_b3_cli_requires_all_explicit_roots_and_shas(self) -> None:
@@ -4407,7 +4412,9 @@ class S2CCorrectionTests(unittest.TestCase):
             git(repo, "config", "user.name", "S2C Test")
             git(repo, "config", "user.email", "s2c@example.invalid")
             for name in bootstrap.B3_CORRECTION_PATHS:
-                (repo / name).write_bytes((source / name).read_bytes())
+                (repo / name).write_bytes(subprocess.run(
+                    ["git", "-C", str(source), "show", f"{bootstrap.B3_P_SELECTION_BASE}:{name}"],
+                    check=True, capture_output=True).stdout)
             git(repo, "add", "--", *bootstrap.B3_CORRECTION_PATHS)
             git(repo, "commit", "-m", "C")
             proposal = git(repo, "rev-parse", "HEAD")
@@ -4509,6 +4516,143 @@ class S2CCorrectionTests(unittest.TestCase):
             git(repo, "update-ref", "refs/remotes/origin/main", arbitrary)
             with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2 first parent"):
                 bootstrap.validate_b3_corrected_authority(repo, arbitrary)
+
+
+class S2PSelectionTests(unittest.TestCase):
+    """The protected selector is one S2C successor, never E-supplied data."""
+
+    S2C = "c7041b6802c9196c491d63977cdc6f81a3566b01"
+
+    def test_native_one_use_and_closed_selection_schema(self) -> None:
+        source = Path(__file__).parent.resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "policy"
+            subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
+                           check=True, capture_output=True)
+            git(repo, "config", "core.autocrlf", "false")
+            git(repo, "checkout", "--detach", self.S2C)
+            git(repo, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            git(repo, "config", "user.name", "S2P Test")
+            git(repo, "config", "user.email", "s2p@example.invalid")
+            for name in bootstrap.B3_P_SELECTION_PATHS:
+                target = repo / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((source / name).read_bytes())
+            git(repo, "add", "--", *bootstrap.B3_P_SELECTION_PATHS)
+            git(repo, "commit", "-m", "SIMULATION_ONLY selector proposal")
+            proposal = git(repo, "rev-parse", "HEAD")
+            tree = git(repo, "rev-parse", "HEAD^{tree}")
+
+            def make(label: str, tree_sha: str, *parents: str) -> str:
+                command = ["git", "-C", str(repo), "commit-tree", tree_sha]
+                for parent in parents:
+                    command.extend(("-p", parent))
+                return subprocess.run(command, input=label + "\n", text=True,
+                                      check=True, capture_output=True).stdout.strip()
+
+            selected = make("SIMULATION_ONLY S2P", tree, self.S2C, proposal)
+
+            def protected_at(revision: str) -> None:
+                git(repo, "checkout", "--detach", revision)
+                git(repo, "update-ref", "refs/remotes/origin/main", revision)
+
+            protected_at(selected)
+            bootstrap.validate_b3_selected_authority(repo, selected)
+            self.assertEqual(bootstrap.EXPECTED_P_SHA,
+                             "f8f41127efe2c27cc7ba8f3132754b5c363636a1")
+            with mock.patch.object(bootstrap, "_exact_modified_paths",
+                                   return_value=("protected_policy_bootstrap.py",)), \
+                 self.assertRaisesRegex(bootstrap.BootstrapError, "three-file scope"):
+                bootstrap.validate_b3_selected_authority(repo, selected)
+            with mock.patch.object(bootstrap, "_tree_entries",
+                                   return_value={name: ("100755", "blob")
+                                                 for name in bootstrap.B3_P_SELECTION_PATHS}), \
+                 self.assertRaisesRegex(bootstrap.BootstrapError, "100644"):
+                bootstrap.validate_b3_selected_authority(repo, selected)
+            original = bootstrap._git_bytes
+            actual = original(repo, "show", f"{selected}:protected_policy_bootstrap.py")
+            mutations = {
+                "missing": actual.replace(
+                    b'EXPECTED_P_SHA = "f8f41127efe2c27cc7ba8f3132754b5c363636a1"\n', b""),
+                "wrong": actual.replace(bootstrap.EXPECTED_P_SHA.encode(), b"9" * 40),
+                "duplicate": actual + b'\nEXPECTED_P_SHA = "' +
+                    bootstrap.EXPECTED_P_SHA.encode() + b'"\n',
+                "alternate-name": actual + b'\nALTERNATE_P_SHA = "' + b"9" * 40 + b'"\n',
+                "g1-revival": actual.replace(
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED',
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE_BOUND'),
+                "g2-consumed": actual.replace(
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED'),
+                "g2-unbound": actual.replace(
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_UNBOUND'),
+                "binding": actual.replace(
+                    bootstrap.G2_BOUND_CANDIDATE_TREE.encode(), b"0" * 40),
+            }
+            for label, changed in mutations.items():
+                def altered(root: Path, *args: str) -> bytes:
+                    if args == ("show", f"{selected}:protected_policy_bootstrap.py"):
+                        return changed
+                    return original(root, *args)
+                with self.subTest(label=label), \
+                     mock.patch.object(bootstrap, "_git_bytes", side_effect=altered), \
+                     self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_b3_selected_authority(repo, selected)
+            wrong_first = make("wrong first", tree, bootstrap.B3_CORRECTION_BASE,
+                               proposal)
+            protected_at(wrong_first)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2C first parent"):
+                bootstrap.validate_b3_selected_authority(repo, wrong_first)
+            wrong_proposal = make("wrong proposal", tree, self.S2C,
+                                  bootstrap.B3_CORRECTION_BASE)
+            protected_at(wrong_proposal)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "direct S2C child"):
+                bootstrap.validate_b3_selected_authority(repo, wrong_proposal)
+            second_child = make("replay", tree, selected)
+            second = make("second S2P", tree, selected, second_child)
+            protected_at(second)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2C first parent"):
+                bootstrap.validate_b3_selected_authority(repo, second)
+            arbitrary = make("arbitrary ACTIVE_BOUND", tree, selected)
+            protected_at(arbitrary)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2C first parent"):
+                bootstrap.validate_b3_selected_authority(repo, arbitrary)
+
+    def test_supplied_p_cannot_override_protected_expected_p(self) -> None:
+        alternate = "9" * 40
+        with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
+             mock.patch.object(bootstrap, "_validate_b1_candidate") as validate_p, \
+             self.assertRaisesRegex(bootstrap.BootstrapError,
+                                    "differs from protected expected P"):
+            bootstrap.validate_b3_establishment(
+                Path(__file__).parent.resolve(), self.S2C,
+                Path(__file__).parent.resolve(), alternate,
+                Path(__file__).parent.resolve(), "3" * 40)
+        validate_p.assert_not_called()
+        with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                    "differs from protected expected P"):
+            bootstrap.validate_b3_terminal(
+                Path(__file__).parent.resolve(), "4" * 40,
+                self.S2C, alternate, "3" * 40)
+
+    def test_workflow_selects_p_from_protected_code(self) -> None:
+        workflow = yaml.safe_load(
+            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text())
+        steps = {step["name"]: step for step in
+                 workflow["jobs"]["security-workflows-policy"]["steps"]}
+        identity = steps["Resolve exact B3 proposal identities"]["run"]
+        self.assertIn('policy/protected_policy_bootstrap.py" select-b3-p', identity)
+        self.assertIn("$proposedP = $fields[2]", identity)
+        self.assertIn("$proposedP -ne $pSha", identity)
+        self.assertNotIn("$pSha = $fields[2]", identity)
+        self.assertIn("steps.b3-identities.outputs.p-sha",
+                      str(steps["Check out exact selected B1 provenance P"]))
+        parser = bootstrap._parser()
+        self.assertEqual(parser.parse_args([
+            "select-b3-p", "--protected-sha", self.S2C,
+            "--protected-root", "policy"]).operation, "select-b3-p")
 
 
 if __name__ == "__main__":
