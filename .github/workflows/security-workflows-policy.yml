@@ -73,8 +73,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $fields = $parents.Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
           if ($fields.Count -ne 3 -or $fields[0] -ne $eSha) { throw 'E must have exactly two parents' }
-          $pSha = $fields[2]
-          if ($pSha -notmatch '^[0-9a-f]{40}$') { throw 'Malformed P SHA derived from E' }
+          $proposedP = $fields[2]
+          if ($proposedP -notmatch '^[0-9a-f]{40}$') { throw 'Malformed P SHA in E ancestry' }
+          $pSha = (python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" select-b3-p --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --protected-root "${{ github.workspace }}/policy").Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($pSha -notmatch '^[0-9a-f]{40}$') { throw 'Malformed protected expected P SHA' }
+          if ($proposedP -ne $pSha) { throw 'E P ancestry differs from protected expected P' }
           "e-sha=$eSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "p-sha=$pSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
