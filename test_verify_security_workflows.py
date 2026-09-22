@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -301,12 +302,8 @@ def duplicate():
         expected = [
             "Check out exact candidate", "Check out independent root policy", "Set up CPython",
             "Assert exact CPython runtime", "Acquire protected Git identity",
-            "Resolve exact B3 proposal identities",
-            "Check out exact B3 establishment proposal E",
-            "Check out exact selected B1 provenance P",
             "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
             "Enforce exact Model D maintenance admission",
-            "Enforce exact DESIGN-B terminal admission",
             "Resolve protected Model D orchestration", "Assert protected Model D outputs",
             "Install isolated hash-locked policy environment", "Run candidate Stage A evidence",
             "Run legacy protected health", "Apply protected Stage A baseline to candidate target",
@@ -315,9 +312,6 @@ def duplicate():
         ]
         self.assertEqual(names, expected)
         by_name = {step["name"]: step for step in steps}
-        self.assertIn(
-            'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" select-b3-p',
-            by_name["Resolve exact B3 proposal identities"]["run"])
 
         candidate = by_name["Check out exact candidate"]
         protected = by_name["Check out independent root policy"]
@@ -349,17 +343,27 @@ $observedHead = (git -C $candidateRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from authorized candidate SHA' }
 $workflowPath = '.github/workflows/security-workflows-policy.yml'
-$expectedBlob = (git -C $candidateRoot rev-parse "${candidateSha}:$workflowPath").Trim()
+$workflowRoot = $candidateRoot
+$workflowSha = $candidateSha
+if ("${{ github.repository }}" -eq 'KiloAlpha021/security-workflows') {
+  $workflowRoot = "${{ github.workspace }}/policy"
+  $workflowSha = "${{ steps.protected-git.outputs.protected-sha }}"
+  git -C $workflowRoot config core.autocrlf false
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  git -C $workflowRoot reset --hard $workflowSha
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+$expectedBlob = (git -C $workflowRoot rev-parse "${workflowSha}:$workflowPath").Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($expectedBlob -notmatch '^[0-9a-f]{40}$') { throw 'Malformed committed candidate workflow blob' }
-$actualBlob = (git -C $candidateRoot hash-object --no-filters $workflowPath).Trim()
+$actualBlob = (git -C $workflowRoot hash-object --no-filters $workflowPath).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from exact committed Git blob' }
 """)
-        self.assertNotIn('${{ github.workspace }}/policy', preparation_run)
+        self.assertIn('$workflowRoot = "${{ github.workspace }}/policy"', preparation_run)
         self.assertTrue(invocation.startswith(" evaluate "))
         self.assertEqual(names.index("Resolve protected bootstrap authority"),
-                         names.index("Check out exact selected B1 provenance P") + 1)
+                         names.index("Acquire protected Git identity") + 1)
         self.assertIn('python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate', bootstrap_run)
         self.assertNotIn("candidate/protected_policy_bootstrap.py", bootstrap_run)
         for argument in (
@@ -388,9 +392,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
             self.assertIn(fragment, output_step["run"])
 
         admission = by_name["Enforce exact Model D maintenance admission"]
-        self.assertEqual(
-            admission["if"],
-            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'")
+        self.assertEqual(admission["if"], "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'")
         for fragment in (
             'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py"',
             "admit-maintenance", "--maintenance-operation MODEL_D_ORCHESTRATION_V1",
@@ -756,7 +758,7 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                          if step["name"] == "Enforce exact Model D maintenance admission")
         run = admission["run"]
         self.assertEqual(admission["if"],
-                         "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'")
+                         "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'")
         self.assertEqual(run.count("admit-maintenance"), 1)
         self.assertEqual(run.count("--maintenance-operation MODEL_D_ORCHESTRATION_V1"), 1)
         self.assertIn("policy/protected_policy_bootstrap.py", run)
@@ -862,6 +864,8 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                 'python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py"', 1)[0]
             rendered = preparation.replace("${{ github.workspace }}", workspace.as_posix())
             rendered = rendered.replace("${{ github.sha }}", merge_sha)
+            rendered = rendered.replace("${{ github.repository }}", "KiloAlpha021/security-policy")
+            rendered = rendered.replace("${{ steps.protected-git.outputs.protected-sha }}", head_sha)
             completed = subprocess.run(
                 ["pwsh", "-NoProfile", "-NonInteractive", "-Command", rendered],
                 cwd=workspace, capture_output=True, text=True,
@@ -1373,8 +1377,8 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
             if isinstance(node, ast.ImportFrom) and node.module
         }
         self.assertEqual(imported, {
-            "__future__", "argparse", "ast", "hashlib", "os", "re", "stat", "subprocess", "sys",
-            "tempfile", "dataclasses", "enum", "pathlib", "unicodedata"
+            "__future__", "argparse", "hashlib", "os", "re", "stat", "subprocess", "sys",
+            "tempfile", "dataclasses", "enum", "pathlib"
         })
         self.assertNotIn("yaml", imported)
         completed = subprocess.run(
@@ -2070,15 +2074,12 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "ExpandableStringExpressionAst", "IfStatementAst", "InvokeMemberExpressionAst",
         "NamedBlockAst", "ParenExpressionAst", "PipelineAst", "ScriptBlockAst",
         "StatementBlockAst", "StringConstantExpressionAst", "ThrowStatementAst",
-        "VariableExpressionAst", "IndexExpressionAst", "MemberExpressionAst",
-        "SubExpressionAst", "TypeExpressionAst",
+        "VariableExpressionAst",
     })
     _COMMANDS = {
         "Assert exact CPython runtime": ("python",),
-        "Acquire protected Git identity": ("git", "Out-File", "Get-Content", "Out-File"),
-        "Resolve exact B3 proposal identities": ("git", "python", "Out-File", "Out-File"),
-        "Enforce exact DESIGN-B terminal admission": ("python",),
-        "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "python"),
+        "Acquire protected Git identity": ("git", "Out-File"),
+        "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "git", "git", "python"),
         "Assert protected bootstrap outputs": (),
         "Enforce exact Model D maintenance admission": ("python",),
         "Resolve protected Model D orchestration": ("python",),
@@ -2099,10 +2100,8 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     # AST parsing uses BOUND placeholders, so source expressions are pinned separately.
     _COMMAND_DIGESTS = {
         "Assert exact CPython runtime": "ff4765d5070a8f20c672195931f3296bd7f98d025cc603a3253336a1909ef10a",
-        "Acquire protected Git identity": "42f84cc61849df6f624e89aec24b79d879613e3ee90093e7419a088f8a99fc9f",
-        "Resolve exact B3 proposal identities": "85e9480bc77b27871892d2f6f99f8dda934a59fb798351b1679593c2cbb61dec",
-        "Enforce exact DESIGN-B terminal admission": "624d07da700b166d38005a31c72cbb95afe780cf94081748aebb4f5da9b2f8fd",
-        "Resolve protected bootstrap authority": "1033bc372e862723b7301df8269c8d55268af0263a4049e665c44a2bd491e9d1",
+        "Acquire protected Git identity": "c46b07aa33fec226c61a81e56ac420d8ca2d7335557f1098132ba9a518dd3de4",
+        "Resolve protected bootstrap authority": "abc9d2cac96e4ce78ab0649cbcd3c2f6711fffc29030b6f0b01dda8fbad29c0c",
         "Enforce exact Model D maintenance admission": "a27a6cb21b57491d4f10396fcd1e05d9f1db6cc2e3570a5b6c28b2828c6fab66",
         "Resolve protected Model D orchestration": "55508070002061086a43cc0996f426eda44cb46106fb1094c77bcb7cd3885713",
         "Install isolated hash-locked policy environment": "ee8dac9367b0f079fcccfb636cceee965b4802e963649a1645a5da2be9fb3520",
@@ -2115,10 +2114,8 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Validate downstream security workflows": "98622aeb4b2c26df74de7cbcd68750ffebb2ad7de78a6abd1b6df9c7045d8be8",
     }
     _EXPRESSION_DIGESTS = {
-        "Acquire protected Git identity": "626f38d5235646eebb8630cef6a809250712768735127c17c93ea94bcc65fb15",
-        "Resolve exact B3 proposal identities": "4bc0bbaf4a3b93b158c80966d4c245a28cb5a621c85bb7d462a38433f6155878",
-        "Enforce exact DESIGN-B terminal admission": "d96cbb766649076440ed894b7c091515c566b09a1800d22cd2119d24b27aacbe",
-        "Resolve protected bootstrap authority": "d10fe55d40daab7b732dc2414601063a036a64f8fd75abe71ecfa089546a4ff2",
+        "Acquire protected Git identity": "837295a19625c7f7bacd0c82e6bfe4238723e8266b416182ada72993d5b20023",
+        "Resolve protected bootstrap authority": "baeda08c00209b5226e8b333d045c1a7e54432329b31ce8d35ff38df765febda",
         "Enforce exact Model D maintenance admission": "244ee8225afbae50176f170eadf00b1e403fcc339a10ed5a59a70cb5434bac83",
         "Resolve protected Model D orchestration": "3b75d73c87092e553ff4a60922371a26049cb145e72d34863a65df263987a6c7",
         "Install isolated hash-locked policy environment": "6d079a592228d8f8d41be75c44f12aadbf9c7a04a268939af4f9ab330c84ed45",
@@ -2127,22 +2124,13 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     }
     _ASSIGNMENT_DIGESTS = {
         "Assert exact CPython runtime": "d28dad29c037f617afecde27704bef3d358314acff79e6e0dc6e838ef68ddbab",
-        "Acquire protected Git identity": "320593180ff57d38faec11febbe67cf71e3b903ef323baf07f8150ce28aec235",
-        "Resolve exact B3 proposal identities": "ea68267ec2ebaa3edb2418ab0e26adf76f576a5fbdf95761535eeb4cd52acf2e",
-        "Resolve protected bootstrap authority": "7345417463fdbf2b043e1c7a229cc9ce631efc2c8de8348111022a2d6e8df5d6",
+        "Acquire protected Git identity": "a7957a942a016cffc750015c04cc690d6976cd3094083d8b79f364380ba25791",
+        "Resolve protected bootstrap authority": "ac088b6c587a0d18c242f08519745f174c7c4253c74280fa0f7d95f02cf5b58b",
     }
     _STOP_ASSIGNMENT_DIGEST = "a6ff9ace77f1623d434a131b94c045ea59228ca4c1afaffe3900356c386bb1a5"
     _IF = {
         "Enforce exact Model D maintenance admission":
-            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'",
-        "Resolve exact B3 proposal identities":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
-        "Check out exact B3 establishment proposal E":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
-        "Check out exact selected B1 provenance P":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
-        "Enforce exact DESIGN-B terminal admission":
-            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'",
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP'",
         "Run candidate Stage A evidence":
             "steps.protected-model-d.outputs.candidate-evidence == 'RUN_CANDIDATE_STAGE_A_EVIDENCE'",
         "Run legacy protected health":
@@ -2156,19 +2144,10 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     }
     _ASSERTIONS = {
         "Assert exact CPython runtime": ("$pythonVersion -ne '3.12.10'",),
-        "Acquire protected Git identity": (
-            "$protectedSha -notmatch '^[0-9a-f]{40}$'",
-            "[regex]::Matches($bootstrap, '(?m)^[ \\t]*B3_ENABLEMENT[ \\t]*=').Count -gt 1",
-        ),
-        "Resolve exact B3 proposal identities": (
-            "$eSha -notmatch '^[0-9a-f]{40}$'",
-            "$fields.Count -ne 3 -or $fields[0] -ne $eSha",
-            "$proposedP -notmatch '^[0-9a-f]{40}$'",
-            "$pSha -notmatch '^[0-9a-f]{40}$'",
-            "$proposedP -ne $pSha",
-        ),
+        "Acquire protected Git identity": ("$protectedSha -notmatch '^[0-9a-f]{40}$'",),
         "Resolve protected bootstrap authority": (
             "$observedHead -ne $candidateSha",
+            '"BOUND" -eq \'KiloAlpha021/security-workflows\'',
             "$expectedBlob -notmatch '^[0-9a-f]{40}$'",
             "$actualBlob -ne $expectedBlob",
         ),
@@ -2192,9 +2171,8 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     }
     _VARIABLES = frozenset({
         "actualBlob", "candidateRoot", "candidateSha", "ErrorActionPreference",
-        "bootstrap", "b3Enabled", "eSha", "parents", "fields", "proposedP", "pSha",
         "expectedBlob", "LASTEXITCODE", "observedHead", "protectedSha",
-        "pythonVersion", "workflowPath", "env:GITHUB_OUTPUT",
+        "pythonVersion", "workflowPath", "workflowRoot", "workflowSha", "env:GITHUB_OUTPUT",
         "env:AUDIT_LOCK_SOURCE", "env:CANDIDATE_EVIDENCE", "env:D0_CONTEXT",
         "env:D0_SOURCE", "env:D0_VERSION", "env:DOWNSTREAM_VALIDATION",
         "env:EVALUATION_CONTEXT", "env:MODEL_D_CONTEXT", "env:MODEL_D_OWNER",
@@ -2204,9 +2182,9 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "env:PROTECTED_EVIDENCE", "env:VERSION_DISPOSITION",
     })
     _ASSIGNMENTS = frozenset({
-        "$ErrorActionPreference", "$pythonVersion", "$protectedSha", "$bootstrap",
-        "$b3Enabled", "$eSha", "$parents", "$fields", "$proposedP", "$pSha",
+        "$ErrorActionPreference", "$pythonVersion", "$protectedSha",
         "$candidateRoot", "$candidateSha", "$observedHead", "$workflowPath",
+        "$workflowRoot", "$workflowSha",
         "$expectedBlob", "$actualBlob",
     })
     _INSPECTOR = r'''
@@ -2289,26 +2267,13 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
         steps = job["steps"]
         self.assertEqual([step["name"] for step in steps], [
             "Check out exact candidate", "Check out independent root policy",
-            "Set up CPython", "Assert exact CPython runtime",
-            "Acquire protected Git identity", "Resolve exact B3 proposal identities",
-            "Check out exact B3 establishment proposal E",
-            "Check out exact selected B1 provenance P",
-            "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
-            "Enforce exact Model D maintenance admission",
-            "Enforce exact DESIGN-B terminal admission",
-            "Resolve protected Model D orchestration", "Assert protected Model D outputs",
-            "Install isolated hash-locked policy environment",
-            "Run candidate Stage A evidence", "Run legacy protected health",
-            "Apply protected Stage A baseline to candidate target",
-            "Test independent root policy", "Install isolated hash-locked audit environment",
-            "Audit locked policy dependencies", "Validate downstream security workflows",
+            "Set up CPython", *self._COMMANDS,
         ])
         self.assertEqual({step["name"]: step["if"] for step in steps if "if" in step},
                          self._IF)
         self.assertTrue(all("continue-on-error" not in step for step in steps))
         for step in steps:
-            allowed = (({"name", "uses", "with"} |
-                        ({"if"} if "if" in step else set())) if "uses" in step else
+            allowed = ({"name", "uses", "with"} if "uses" in step else
                        {"name", "shell", "run"} |
                        ({"id"} if "id" in step else set()) |
                        ({"if"} if "if" in step else set()) |
@@ -2356,7 +2321,6 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
         })
         self.assertEqual({step["name"]: step["id"] for step in steps if "id" in step}, {
             "Acquire protected Git identity": "protected-git",
-            "Resolve exact B3 proposal identities": "b3-identities",
             "Resolve protected bootstrap authority": "protected-bootstrap",
             "Resolve protected Model D orchestration": "protected-model-d",
         })
@@ -2399,15 +2363,9 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 "\0".join(report["assignmentTexts"]).encode("utf-8")).hexdigest()
             self.assertEqual(assignment_digest, self._ASSIGNMENT_DIGESTS.get(
                 name, self._STOP_ASSIGNMENT_DIGEST), name)
-            expected_pipelines = {
-                "Acquire protected Git identity": [
-                    '"protected-sha=$protectedSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append',
-                    '"b3-enabled=$($b3Enabled.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'],
-                "Resolve exact B3 proposal identities": [
-                    '"e-sha=$eSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append',
-                    '"p-sha=$pSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'],
-            }
-            self.assertEqual(report["outputPipelines"], expected_pipelines.get(name, []), name)
+            self.assertEqual(report["outputPipelines"],
+                             ['"protected-sha=$protectedSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append']
+                             if name == "Acquire protected Git identity" else [], name)
             self.assertEqual(report["elseCount"], 0, name)
             self.assertTrue(run.lstrip().startswith("$ErrorActionPreference = 'Stop'"), name)
             assertions = tuple(condition for condition in report["conditions"]
@@ -2415,11 +2373,14 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
             self.assertEqual(assertions, self._ASSERTIONS.get(name, ()), name)
             guard_count = report["conditions"].count("$LASTEXITCODE -ne 0")
             self.assertEqual(guard_count,
-                             sum(command not in {"Out-File", "Get-Content"}
-                                 for command in commands), name)
+                             len(commands) - (1 if "Out-File" in commands else 0), name)
             for condition, body in zip(report["conditions"], report["bodies"]):
                 if condition == "$LASTEXITCODE -ne 0":
                     self.assertEqual(body, "{ exit $LASTEXITCODE }", name)
+                elif condition == '"BOUND" -eq \'KiloAlpha021/security-workflows\'':
+                    self.assertIn('$workflowRoot = "BOUND/policy"', body)
+                    self.assertIn('$workflowSha = "BOUND"', body)
+                    self.assertIn('git -C $workflowRoot reset --hard $workflowSha', body)
                 else:
                     self.assertRegex(body, r"^\{ throw '[^'\r\n]+' \}$", name)
 
@@ -3231,834 +3192,139 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         ))
 
 
-class B2BindingTests(unittest.TestCase):
-    """Exercise one protected S0-to-S1 binding without implementing B3."""
+class B1ProtectedRoutingTests(unittest.TestCase):
+    """Use separate Git identities and a downstream candidate with no policy file."""
 
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
-        self.source = Path(__file__).parent.resolve()
-        self.protected = self.root / "protected"
-        subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout", str(self.source),
-                        str(self.protected)], check=True, capture_output=True)
-        git(self.protected, "config", "user.name", "B2 Test")
-        git(self.protected, "config", "user.email", "b2@example.invalid")
-        git(self.protected, "config", "core.autocrlf", "false")
-        git(self.protected, "remote", "set-url", "origin",
-            "https://github.com/KiloAlpha021/security-policy.git")
-        git(self.protected, "checkout", "-B", "main", bootstrap.G2_BOUND_ORIGIN)
-        git(self.protected, "checkout", "-b", "b2-binding")
-        for name in bootstrap.G2_BINDING_PATHS:
-            (self.protected / name).write_bytes((self.source / name).read_bytes())
-        git(self.protected, "add", *bootstrap.G2_BINDING_PATHS)
-        git(self.protected, "commit", "-m", "Synthetic B2 binding proposal")
-        self.binding_proposal = git(self.protected, "rev-parse", "HEAD")
-        git(self.protected, "checkout", "main")
-        git(self.protected, "merge", "--no-ff", "b2-binding", "-m",
-            "Synthetic protected B2 binding")
-        self.s1 = git(self.protected, "rev-parse", "HEAD")
-        git(self.protected, "update-ref", "refs/remotes/origin/main", self.s1)
+        self.candidate = self.root / "candidate"
+        self.protected = self.root / "policy"
+        for root, repository in ((self.candidate, bootstrap.DOWNSTREAM_REPOSITORY),
+                                 (self.protected, bootstrap.REPOSITORY)):
+            root.mkdir()
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "B1 Test")
+            git(root, "config", "user.email", "b1@example.invalid")
+            git(root, "config", "core.autocrlf", "false")
+            git(root, "remote", "add", "origin", f"https://github.com/{repository}.git")
+        (self.candidate / ".github/workflows").mkdir(parents=True)
+        (self.candidate / ".github/workflows/m1-trusted.yml").write_text(
+            "name: downstream candidate\n", encoding="utf-8")
+        (self.protected / ".github/workflows").mkdir(parents=True)
+        self.policy_file = self.protected / bootstrap.CANDIDATE_BASELINE_PATH
+        self.policy_file.write_bytes((
+            "name: protected policy\nenv:\n  POLICY_BASELINE_VERSION: " +
+            bootstrap.CURRENT_BASELINE + "\n").encode())
+        for root in (self.candidate, self.protected):
+            git(root, "add", ".")
+            git(root, "commit", "-m", "fixture")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.protected_sha)
 
-    def test_exact_s1_binding_introduction(self) -> None:
-        bootstrap.validate_g2_bound_authority(self.protected, self.s1)
-        self.assertEqual(bootstrap.G2_MAINTENANCE_LIFECYCLE,
-                         bootstrap.G2_MAINTENANCE_GENERATION + ":ACTIVE_BOUND")
-        self.assertEqual(bootstrap.G2_BOUND_ORIGIN,
-                         "985bdf2801f07d8f2447d1bcde96c7a7a59669ad")
-        self.assertEqual(bootstrap.G2_BOUND_CANDIDATE_TREE,
-                         "4272cb4707345a1a3da41382525e9833e0f1a7e1")
-        self.assertEqual(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS, (
-            (bootstrap.MODEL_D_MAINTENANCE_PATHS[0],
-             "e8a2ff5957c77f03f1c5b8b16ae707820f11159f"),
-            (bootstrap.MODEL_D_MAINTENANCE_PATHS[1],
-             "7edbdf8c216aa336bae95af44fef8b9e4a582731"),
-            (bootstrap.MODEL_D_MAINTENANCE_PATHS[2],
-             "cd5ce5f194cef50dd016ca529f2857cf8c7a6082"),
-        ))
+    def arguments(self, **changes: object) -> argparse.Namespace:
+        values: dict[str, object] = dict(
+            event_name="pull_request", repository=bootstrap.DOWNSTREAM_REPOSITORY,
+            base_repository=bootstrap.DOWNSTREAM_REPOSITORY, base_branch="main",
+            candidate_sha=self.candidate_sha, protected_sha=self.protected_sha,
+            candidate_root=str(self.candidate), protected_root=str(self.protected),
+            event_ref="refs/pull/5/merge", default_branch="main", workflow_ref="")
+        values.update(changes)
+        return argparse.Namespace(**values)
 
-    def test_wrong_s0_structure_and_protected_drift_reject(self) -> None:
-        with mock.patch.object(bootstrap, "G2_BOUND_ORIGIN", "0" * 40), \
-             self.assertRaises(bootstrap.BootstrapError):
-            bootstrap.validate_g2_bound_authority(self.protected, self.s1)
-        git(self.protected, "commit", "--allow-empty", "-m", "Unrelated S2 drift")
-        drift = git(self.protected, "rev-parse", "HEAD")
-        git(self.protected, "update-ref", "refs/remotes/origin/main", drift)
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "exact protected binding merge"):
-            bootstrap.validate_g2_bound_authority(self.protected, drift)
-
-        nested = self.root / "nested-binding"
-        subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout", str(self.source),
-                        str(nested)], check=True, capture_output=True)
-        git(nested, "config", "user.name", "B2 Test")
-        git(nested, "config", "user.email", "b2@example.invalid")
-        git(nested, "config", "core.autocrlf", "false")
-        git(nested, "remote", "set-url", "origin",
-            "https://github.com/KiloAlpha021/security-policy.git")
-        git(nested, "checkout", "-B", "main", bootstrap.G2_BOUND_ORIGIN)
-        git(nested, "checkout", "-b", "nested-proposal")
-        git(nested, "commit", "--allow-empty", "-m", "Unrelated proposal parent")
-        for name in bootstrap.G2_BINDING_PATHS:
-            (nested / name).write_bytes((self.source / name).read_bytes())
-        git(nested, "add", *bootstrap.G2_BINDING_PATHS)
-        git(nested, "commit", "-m", "Nested B2 binding proposal")
-        git(nested, "checkout", "main")
-        git(nested, "merge", "--no-ff", "nested-proposal", "-m", "Nested binding")
-        nested_s1 = git(nested, "rev-parse", "HEAD")
-        git(nested, "update-ref", "refs/remotes/origin/main", nested_s1)
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "directly on S0"):
-            bootstrap.validate_g2_bound_authority(nested, nested_s1)
-
-    def test_binding_declarations_are_unique_and_candidate_cannot_replace_them(self) -> None:
-        source = (self.source / "protected_policy_bootstrap.py").read_bytes()
-        bootstrap._require_g2_bound_declarations(source)
-        with self.assertRaises(bootstrap.BootstrapError):
-            bootstrap._require_g2_bound_declarations(
-                source + b'\nG2_BOUND_CANDIDATE_TREE = "0000000000000000000000000000000000000000"\n')
-        with self.assertRaises(bootstrap.BootstrapError):
-            bootstrap._require_g2_bound_declarations(
-                source.replace(bootstrap.G2_BOUND_CANDIDATE_TREE.encode(), b"0" * 40))
-
-    def _mock_bound_candidate(self, **changes: object) -> None:
-        candidate = self.root / "candidate"
-        candidate.mkdir(exist_ok=True)
-        revision = "1" * 40
-        parent = str(changes.get("parent", bootstrap.G2_BOUND_ORIGIN))
-        tree = str(changes.get("tree", bootstrap.G2_BOUND_CANDIDATE_TREE))
-        paths = changes.get("paths", bootstrap.MODEL_D_MAINTENANCE_PATHS)
-        blobs = dict(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS)
-        blobs.update(changes.get("blobs", {}))
-        remote = str(changes.get("remote", "https://github.com/KiloAlpha021/security-policy.git"))
-        source = str(changes.get(
-            "source",
-            f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_BOUND_EXPECTED_TERMINAL}"\n'))
-
-        def identity(root: Path, *arguments: str) -> str:
-            if arguments == ("rev-parse", "HEAD"):
-                return revision
-            if arguments == ("remote", "get-url", "origin"):
-                return remote
-            if arguments == ("rev-list", "--parents", "-n", "1", revision):
-                return f"{revision} {parent}"
-            if arguments == ("rev-parse", f"{revision}^{{tree}}"):
-                return tree
-            if len(arguments) == 2 and arguments[0] == "rev-parse" and \
-                    arguments[1].startswith(revision + ":"):
-                return blobs[arguments[1].split(":", 1)[1]]
-            raise AssertionError(arguments)
-
-        diff = b"".join(b"M\0" + path.encode() + b"\0" for path in paths)
-
-        def raw(root: Path, *arguments: str) -> bytes:
-            if arguments[:4] == ("diff", "--name-status", "-z", "--no-renames"):
-                return diff
-            if arguments == ("show", f"{revision}:protected_policy_bootstrap.py"):
-                return source.encode()
-            raise AssertionError(arguments)
-
-        entries = {path: ("100644", "blob") for path in bootstrap.MODEL_D_MAINTENANCE_PATHS}
-        with mock.patch.object(bootstrap, "validate_g2_bound_authority"), \
-             mock.patch.object(bootstrap, "_git", side_effect=identity), \
-             mock.patch.object(bootstrap, "_git_bytes", side_effect=raw), \
-             mock.patch.object(bootstrap, "_tree_entries", return_value=entries), \
-             mock.patch.object(bootstrap, "validate_protected_universe"):
-            bootstrap.validate_g2_bound_candidate_identity(
-                candidate, revision, self.protected, self.s1)
-
-    def test_exact_future_b1_identity_model(self) -> None:
-        self._mock_bound_candidate()
-
-    def test_wrong_tree_parent_paths_blobs_repository_and_rebase_reject(self) -> None:
-        cases = (
-            {"tree": "0" * 40},
-            {"parent": "2" * 40},
-            {"parent": self.s1},
-            {"paths": bootstrap.MODEL_D_MAINTENANCE_PATHS[:-1]},
-            {"blobs": {bootstrap.MODEL_D_MAINTENANCE_PATHS[1]: "0" * 40}},
-            {"remote": "https://github.com/KiloAlpha021/security-workflows.git"},
-            {"source": (f'G2_MAINTENANCE_LIFECYCLE = "'
-                        f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND"\n')},
-        )
-        for changes in cases:
-            with self.subTest(changes=changes), self.assertRaises(bootstrap.BootstrapError):
-                self._mock_bound_candidate(**changes)
-
-    def test_exact_s1_abandonment_is_terminal(self) -> None:
-        candidate = self.root / "abandonment"
-        subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
-                        str(candidate)], check=True, capture_output=True)
-        git(candidate, "config", "user.name", "B2 Test")
-        git(candidate, "config", "user.email", "b2@example.invalid")
-        git(candidate, "config", "core.autocrlf", "false")
-        git(candidate, "remote", "set-url", "origin",
-            "https://github.com/KiloAlpha021/security-policy.git")
-        source = candidate / "protected_policy_bootstrap.py"
-        protected_source = bootstrap._git_bytes(
-            self.protected, "show", f"{self.s1}:protected_policy_bootstrap.py")
-        source.write_bytes(protected_source.replace(
-            f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND'.encode(),
-            f'{bootstrap.G2_MAINTENANCE_GENERATION}:CONSUMED'.encode()))
-        git(candidate, "add", "protected_policy_bootstrap.py")
-        git(candidate, "commit", "-m", "Abandon bound G2")
-        candidate_sha = git(candidate, "rev-parse", "HEAD")
-        bootstrap.validate_g2_maintenance(
-            bootstrap.G2_MAINTENANCE_GENERATION, candidate, self.protected,
-            candidate_sha, self.s1)
-        git(self.protected, "fetch", str(candidate), candidate_sha)
-        git(self.protected, "merge", "--no-ff", "FETCH_HEAD", "-m", "Expire bound G2")
-        terminal = git(self.protected, "rev-parse", "HEAD")
-        git(self.protected, "update-ref", "refs/remotes/origin/main", terminal)
-        self.assertTrue(bootstrap._g2_generation_was_consumed(self.protected, terminal))
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "permanently consumed"):
-            bootstrap.validate_g2_bound_authority(self.protected, terminal)
-
-    def test_bound_rollback_and_ordinary_rebinding_reject(self) -> None:
-        for replacement in (
-                f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_UNBOUND',
-                'G2_BOUND_CANDIDATE_TREE = "' + "0" * 40 + '"'):
-            with self.subTest(replacement=replacement):
-                candidate = self.root / ("mutation-" + str(len(list(self.root.iterdir()))))
-                subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
-                                str(candidate)], check=True, capture_output=True)
-                git(candidate, "config", "user.name", "B2 Test")
-                git(candidate, "config", "user.email", "b2@example.invalid")
-                git(candidate, "config", "core.autocrlf", "false")
-                git(candidate, "remote", "set-url", "origin",
-                    "https://github.com/KiloAlpha021/security-policy.git")
-                source = candidate / "protected_policy_bootstrap.py"
-                data = bootstrap._git_bytes(
-                    self.protected, "show", f"{self.s1}:protected_policy_bootstrap.py")
-                if replacement.endswith("ACTIVE_UNBOUND"):
-                    data = data.replace(
-                        f'{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND'.encode(),
-                        replacement.encode())
-                else:
-                    declaration = (f'G2_BOUND_CANDIDATE_TREE = "'
-                                   f'{bootstrap.G2_BOUND_CANDIDATE_TREE}"').encode()
-                    data = data.replace(declaration, replacement.encode())
-                source.write_bytes(data)
-                git(candidate, "add", "protected_policy_bootstrap.py")
-                git(candidate, "commit", "-m", "Attempt bound authority mutation")
-                with self.assertRaises(bootstrap.BootstrapError):
-                    bootstrap.validate_g2_maintenance(
-                        bootstrap.G2_MAINTENANCE_GENERATION, candidate, self.protected,
-                        git(candidate, "rev-parse", "HEAD"), self.s1)
-
-    def test_public_admission_does_not_implement_b3(self) -> None:
-        with mock.patch.object(bootstrap, "validate_g2_bound_candidate_identity"), \
-             self.assertRaisesRegex(bootstrap.BootstrapError, "B3 admission is not implemented"):
-            candidate = self.root / "synthetic-b1"
-            subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
-                            str(candidate)], check=True, capture_output=True)
-            git(candidate, "remote", "set-url", "origin",
-                "https://github.com/KiloAlpha021/security-policy.git")
-            git(candidate, "checkout", "-b", "candidate")
-            marker = candidate / "README.md"
-            marker.write_bytes(marker.read_bytes() + b"\n")
-            git(candidate, "config", "user.name", "B2 Test")
-            git(candidate, "config", "user.email", "b2@example.invalid")
-            git(candidate, "add", "README.md")
-            git(candidate, "commit", "-m", "Synthetic B1")
-            bootstrap.validate_g2_maintenance(
-                bootstrap.G2_MAINTENANCE_GENERATION, candidate, self.protected,
-                git(candidate, "rev-parse", "HEAD"), self.s1)
-
-
-class B3DesignBTests(unittest.TestCase):
-    """Exercise finite enablement and separate P/E/T identities."""
-
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name).resolve()
-        self.protected = self.root / "protected"
-        self.p = self.root / "p"
-        self.e = self.root / "e"
-        for path in (self.protected, self.p, self.e):
-            path.mkdir()
-
-    @staticmethod
-    def _s1_declarations() -> bytes:
-        lines = [
-            f'MODEL_D_MAINTENANCE_GENERATION = "{bootstrap.MODEL_D_MAINTENANCE_GENERATION}"',
-            f'MODEL_D_MAINTENANCE_LIFECYCLE = "{bootstrap.MODEL_D_MAINTENANCE_LIFECYCLE}"',
-            f'G2_MAINTENANCE_GENERATION = "{bootstrap.G2_MAINTENANCE_GENERATION}"',
-            f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:ACTIVE_BOUND"',
-            f'G2_MAINTENANCE_PURPOSE = "{bootstrap.G2_MAINTENANCE_PURPOSE}"',
-            f'G2_BOUND_ORIGIN = "{bootstrap.G2_BOUND_ORIGIN}"',
-            f'G2_BOUND_CANDIDATE_TREE = "{bootstrap.G2_BOUND_CANDIDATE_TREE}"',
-            f'G2_BOUND_WORKFLOW_BLOB = "{bootstrap.G2_BOUND_WORKFLOW_BLOB}"',
-            f'G2_BOUND_BOOTSTRAP_BLOB = "{bootstrap.G2_BOUND_BOOTSTRAP_BLOB}"',
-            f'G2_BOUND_TEST_BLOB = "{bootstrap.G2_BOUND_TEST_BLOB}"',
-            f'G2_BOUND_EXPECTED_TERMINAL = "{bootstrap.G2_BOUND_EXPECTED_TERMINAL}"',
-        ]
-        return ("\n".join(lines) + "\n").encode()
-
-    @classmethod
-    def _enablement_source(cls, extra: str = "") -> bytes:
-        source = cls._s1_declarations().decode() + (
-            f'B3_AUTHORITY_ORIGIN = "{bootstrap.B3_AUTHORITY_ORIGIN}"\n'
-            f'B3_ENABLEMENT = "{bootstrap.B3_ENABLEMENT}"\n')
-        return (source + extra).encode()
-
-    def _validate_enablement_candidate_case(
-            self, source: bytes, *, protected_sha: str | None = None,
-            parents: str | None = None,
-            paths: tuple[str, ...] | None = None) -> None:
-        proposal = "2" * 40
-        protected_sha = protected_sha or bootstrap.B3_AUTHORITY_ORIGIN
-        parents = parents or f"{proposal} {bootstrap.B3_AUTHORITY_ORIGIN}"
-
-        def identity(_root: Path, *arguments: str) -> str:
-            values = {
-                ("rev-parse", "HEAD"): proposal,
-                ("remote", "get-url", "origin"):
-                    "https://github.com/KiloAlpha021/security-policy.git",
-                ("rev-list", "--parents", "-n", "1", proposal): parents,
-            }
-            return values[arguments]
-
-        def raw(_root: Path, *arguments: str) -> bytes:
-            if arguments == ("show", f"{bootstrap.B3_AUTHORITY_ORIGIN}:protected_policy_bootstrap.py"):
-                return self._s1_declarations()
-            return source
-
-        with mock.patch.object(bootstrap, "validate_g2_bound_authority"), \
-             mock.patch.object(bootstrap, "_git", side_effect=identity), \
-             mock.patch.object(bootstrap, "_git_bytes", side_effect=raw), \
-             mock.patch.object(bootstrap, "_exact_modified_paths",
-                               return_value=paths or bootstrap.MODEL_D_MAINTENANCE_PATHS), \
-             mock.patch.object(bootstrap, "validate_protected_universe"):
-            bootstrap.validate_b3_enablement_candidate(
-                self.protected, proposal, self.root, protected_sha)
-
-    def test_design_b_constants_are_frozen_without_future_shas(self) -> None:
-        self.assertEqual(bootstrap.B3_AUTHORITY_ORIGIN,
-                         "9393099a9060f90689341611457c9b9032959b88")
-        self.assertEqual(bootstrap.B3_ENABLEMENT, "DESIGN_B_FINITE_V1")
-        source = Path(bootstrap.__file__).read_text(encoding="utf-8")
-        self.assertNotRegex(source, r"G2_SELECTED_P_SHA\s*=")
-
-    def test_enablement_rejects_future_p_sha_under_any_declaration_name(self) -> None:
-        """S2 must not embed a future P identity under an alternate symbol."""
-        selected_p = "a" * 40
-        for name in ("FUTURE_P_SHA", "NEXT_P", "AUTHORIZED_PROVENANCE", "CANDIDATE_COMMIT"):
-            with self.subTest(name=name), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, "closed S1 schema"):
-                self._validate_enablement_candidate_case(
-                    self._enablement_source(f'{name} = "{selected_p}"\n'))
-
-    def test_closed_enablement_schema_accepts_only_frozen_declarations(self) -> None:
-        self._validate_enablement_candidate_case(self._enablement_source(
-            'def helper():\n    historical_sha = "' + "a" * 40 + '"\n'))
-        mutations = {
-            "generation": ("GENERATION_2", "GENERATION_3"),
-            "purpose": (bootstrap.G2_MAINTENANCE_PURPOSE, "replacement purpose"),
-            "g1-revival": (":CONSUMED", ":ACTIVE"),
-            "origin": (bootstrap.G2_BOUND_ORIGIN, "0" * 40),
-            "tree": (bootstrap.G2_BOUND_CANDIDATE_TREE, "0" * 40),
-            "workflow": (bootstrap.G2_BOUND_WORKFLOW_BLOB, "0" * 40),
-            "bootstrap": (bootstrap.G2_BOUND_BOOTSTRAP_BLOB, "0" * 40),
-            "test": (bootstrap.G2_BOUND_TEST_BLOB, "0" * 40),
-        }
-        pristine = self._enablement_source().decode()
-        for name, (before, after) in mutations.items():
-            with self.subTest(name=name), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, "closed S1 schema"):
-                self._validate_enablement_candidate_case(
-                    pristine.replace(before, after, 1).encode())
-        for lifecycle in ("CONSUMED", "ACTIVE_UNBOUND"):
-            changed = pristine.replace(":ACTIVE_BOUND", f":{lifecycle}", 1).encode()
-            with self.subTest(lifecycle=lifecycle), self.assertRaises(bootstrap.BootstrapError):
-                self._validate_enablement_candidate_case(changed)
-        duplicate = pristine + (
-            f'G2_BOUND_ORIGIN = "{bootstrap.G2_BOUND_ORIGIN}"\n')
-        with self.assertRaises(bootstrap.BootstrapError):
-            self._validate_enablement_candidate_case(duplicate.encode())
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S1"):
-            self._validate_enablement_candidate_case(
-                self._enablement_source(), protected_sha="0" * 40)
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "based directly"):
-            self._validate_enablement_candidate_case(
-                self._enablement_source(), parents="2" * 40 + " " + "3" * 40)
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "scope"):
-            self._validate_enablement_candidate_case(
-                self._enablement_source(), paths=("protected_policy_bootstrap.py",))
-
-    def test_actual_candidate_declaration_schema_is_closed(self) -> None:
-        repository = Path(__file__).parent.resolve()
-        s1_equivalent = bootstrap._git_bytes(
-            repository, "show", f"{bootstrap.B3_AUTHORITY_ORIGIN}:protected_policy_bootstrap.py")
-        candidate = bootstrap._git_bytes(
-            repository, "show", f"{bootstrap.B3_CORRECTION_BASE}:protected_policy_bootstrap.py")
-        bootstrap._require_b3_enablement_declaration_schema(
-            s1_equivalent, candidate)
-
-    def test_native_design_b_topology_is_representable(self) -> None:
-        repo = self.root / "topology"
-        repo.mkdir()
-        git(repo, "init", "-b", "main")
-        git(repo, "config", "user.name", "B3 Test")
-        git(repo, "config", "user.email", "b3@example.invalid")
-        (repo / "state").write_text("S0\n", encoding="utf-8")
-        git(repo, "add", "state")
-        git(repo, "commit", "-m", "S0")
-        s0 = git(repo, "rev-parse", "HEAD")
-        git(repo, "commit", "--allow-empty", "-m", "S1")
-        s1 = git(repo, "rev-parse", "HEAD")
-        git(repo, "commit", "--allow-empty", "-m", "S2")
-        s2 = git(repo, "rev-parse", "HEAD")
-        git(repo, "checkout", "--detach", s0)
-        (repo / "state").write_text("terminal\n", encoding="utf-8")
-        git(repo, "add", "state")
-        git(repo, "commit", "-m", "P")
-        p = git(repo, "rev-parse", "HEAD")
-        tree = git(repo, "rev-parse", "HEAD^{tree}")
-
-        def commit_tree(message: str, *parents: str) -> str:
-            command = ["git", "-C", str(repo), "commit-tree", tree]
-            for parent in parents:
-                command.extend(("-p", parent))
-            return subprocess.run(command, input=message + "\n", text=True,
-                                  check=True, capture_output=True).stdout.strip()
-
-        e = commit_tree("E", s2, p)
-        t = commit_tree("T", s2, e)
-        self.assertEqual(git(repo, "rev-list", "--parents", "-n", "1", e).split(),
-                         [e, s2, p])
-        self.assertEqual(git(repo, "rev-list", "--parents", "-n", "1", t).split(),
-                         [t, s2, e])
-        self.assertEqual(git(repo, "rev-parse", f"{e}^{{tree}}"), tree)
-        self.assertEqual(git(repo, "rev-parse", f"{t}^{{tree}}"), tree)
-        self.assertEqual(git(repo, "rev-list", "--count", f"{s2}..{e}"), "2")
-        self.assertEqual(git(repo, "merge-base", s1, s2), s1)
-
-    def test_established_s2_requires_one_exact_protected_enablement(self) -> None:
-        s2, proposal = "3" * 40, "2" * 40
-
-        def run(*, head: str | None = None, main: str | None = None,
-                merge_parents: str | None = None, proposal_parents: str | None = None,
-                proposal_tree: str = "4" * 40, merge_tree: str = "4" * 40,
-                source: bytes | None = None,
-                paths: tuple[str, ...] | None = None) -> None:
-            def identity(_root: Path, *arguments: str) -> str:
-                values = {
-                    ("rev-parse", "HEAD"): head or s2,
-                    ("rev-parse", "refs/remotes/origin/main"): main or s2,
-                    ("remote", "get-url", "origin"):
-                        "https://github.com/KiloAlpha021/security-policy.git",
-                    ("rev-list", "--parents", "-n", "1", s2):
-                        merge_parents or f"{s2} {bootstrap.B3_AUTHORITY_ORIGIN} {proposal}",
-                    ("rev-list", "--parents", "-n", "1", proposal):
-                        proposal_parents or f"{proposal} {bootstrap.B3_AUTHORITY_ORIGIN}",
-                    ("rev-parse", f"{proposal}^{{tree}}"): proposal_tree,
-                    ("rev-parse", f"{s2}^{{tree}}"): merge_tree,
-                }
-                return values[arguments]
-
-            def raw(_root: Path, *arguments: str) -> bytes:
-                if arguments == ("show", f"{bootstrap.B3_AUTHORITY_ORIGIN}:protected_policy_bootstrap.py"):
-                    return self._s1_declarations()
-                return source or self._enablement_source()
-
-            with mock.patch.object(bootstrap, "_git", side_effect=identity), \
-                 mock.patch.object(bootstrap, "_git_bytes", side_effect=raw), \
-                 mock.patch.object(bootstrap, "_exact_modified_paths",
-                                   return_value=paths or bootstrap.MODEL_D_MAINTENANCE_PATHS), \
-                 mock.patch.object(bootstrap, "validate_protected_universe"):
-                bootstrap.validate_b3_enabled_authority(self.protected, s2)
-
-        run()
-        cases = (
-            ("head", {"head": "0" * 40}, "checkout"),
-            ("main", {"main": "0" * 40}, "protected main"),
-            ("one-parent", {"merge_parents": f"{s2} {bootstrap.B3_AUTHORITY_ORIGIN}"}, "finite"),
-            ("wrong-first-parent", {"merge_parents": f"{s2} {'0' * 40} {proposal}"}, "finite"),
-            ("extra-enable", {"proposal_parents": f"{proposal} {'1' * 40}"}, "directly on S1"),
-            ("tree-mismatch", {"merge_tree": "5" * 40}, "tree differs"),
-            ("scope", {"paths": ("protected_policy_bootstrap.py",)}, "scope"),
-            ("closed-schema", {"source": self._enablement_source(
-                'NEXT_P = "' + "a" * 40 + '"\n')}, "closed S1 schema"),
-        )
-        for name, options, message in cases:
-            with self.subTest(name=name), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, message):
-                run(**options)
-
-    def _mock_p(self, *, revision: str = "1" * 40, head: str | None = None,
-                parent: str | None = None, parents: str | None = None,
-                tree: str | None = None, repository: str | None = None,
-                kind: str = "commit", attribution: str | None = None,
-                paths: tuple[str, ...] | None = None,
-                entries: dict[str, tuple[str, str]] | None = None,
-                blobs: dict[str, str] | None = None,
-                lifecycle: str = "CONSUMED", terminal: bool = True) -> None:
-        parent = parent or bootstrap.G2_BOUND_ORIGIN
-        tree = tree or bootstrap.G2_BOUND_CANDIDATE_TREE
-        blobs = blobs or dict(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS)
-
-        def identity(root: Path, *arguments: str) -> str:
-            if arguments == ("rev-parse", "HEAD"):
-                return head or revision
-            if arguments == ("remote", "get-url", "origin"):
-                return repository or "https://github.com/KiloAlpha021/security-policy.git"
-            if arguments == ("cat-file", "-t", revision):
-                return kind
-            if arguments == ("rev-list", "--parents", "-n", "1", revision):
-                return parents or f"{revision} {parent}"
-            if arguments == ("rev-parse", f"{revision}^{{tree}}"):
-                return tree
-            if len(arguments) == 2 and arguments[0] == "rev-parse" and arguments[1].startswith(revision + ":"):
-                return blobs[arguments[1].split(":", 1)[1]]
-            raise AssertionError(arguments)
-
-        disposition = bootstrap.G2_BOUND_EXPECTED_TERMINAL if terminal else "not-terminal"
-        raw = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:{lifecycle}"\n'
-               f'# {disposition}\n').encode()
-        entries = entries or {path: ("100644", "blob") for path in bootstrap.MODEL_D_MAINTENANCE_PATHS}
-        def output(_root: Path, *arguments: str) -> bytes:
-            if arguments[:2] == ("show", "-s"):
-                value = (attribution if attribution is not None else
-                         "B3 Test\0b3@example.invalid\0B3 Test\0b3@example.invalid")
-                return (value + "\n").encode()
-            return raw
-        with mock.patch.object(bootstrap, "_git", side_effect=identity), \
-             mock.patch.object(bootstrap, "_git_bytes", side_effect=output), \
-             mock.patch.object(bootstrap, "_exact_modified_paths",
-                               return_value=paths or bootstrap.MODEL_D_MAINTENANCE_PATHS), \
-             mock.patch.object(bootstrap, "_tree_entries", return_value=entries), \
-             mock.patch.object(bootstrap, "validate_protected_universe"):
-            bootstrap._validate_b1_candidate(self.p, revision)
-
-    def test_exact_p_and_selected_sha_are_required(self) -> None:
-        self._mock_p()
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "selected P SHA"):
-            self._mock_p(head="2" * 40)
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "sole parent S0"):
-            self._mock_p(parent=bootstrap.B3_AUTHORITY_ORIGIN)
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "tree mismatch"):
-            self._mock_p(tree="0" * 40)
-
-    def test_p_complete_adversarial_matrix(self) -> None:
-        cases = (
-            ("repository", {"repository": "https://github.com/KiloAlpha021/security-workflows.git"}, "repository"),
-            ("object", {"kind": "tree"}, "not a commit"),
-            ("attribution", {"attribution": "\0\0\0"}, "attribution"),
-            ("head", {"head": "2" * 40}, "selected P SHA"),
-            ("no-parent", {"parents": "1" * 40}, "sole parent S0"),
-            ("two-parents", {"parents": "1" * 40 + " " + bootstrap.G2_BOUND_ORIGIN + " " + bootstrap.B3_AUTHORITY_ORIGIN}, "sole parent S0"),
-            ("parent-s1", {"parent": bootstrap.B3_AUTHORITY_ORIGIN}, "sole parent S0"),
-            ("parent-s2", {"parent": "2" * 40}, "sole parent S0"),
-            ("retired-tree", {"tree": "c49159c2076c2e1f1ba9681b32d71264e1cb98f9"}, "tree mismatch"),
-            ("forensic-tree", {"tree": "373f05b6fef5e5d2d5e47c45355664d888454c4b"}, "tree mismatch"),
-            ("paths-missing", {"paths": bootstrap.MODEL_D_MAINTENANCE_PATHS[:-1]}, "paths mismatch"),
-            ("paths-extra", {"paths": bootstrap.MODEL_D_MAINTENANCE_PATHS + ("extra",)}, "paths mismatch"),
-            ("active-bound", {"lifecycle": "ACTIVE_BOUND"}, "terminal CONSUMED"),
-            ("active-unbound", {"lifecycle": "ACTIVE_UNBOUND"}, "terminal CONSUMED"),
-        )
-        for name, options, message in cases:
-            with self.subTest(name=name), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, message):
-                self._mock_p(**options)
-        for path in bootstrap.MODEL_D_MAINTENANCE_PATHS:
-            entries = {item: ("100644", "blob")
-                       for item in bootstrap.MODEL_D_MAINTENANCE_PATHS}
-            entries[path] = ("100755", "blob")
-            with self.subTest(mode=path), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, "100644"):
-                self._mock_p(entries=entries)
-            blobs = dict(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS)
-            blobs[path] = "0" * 40
-            with self.subTest(blob=path), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, "blob mismatch"):
-                self._mock_p(blobs=blobs)
-
-    def test_selected_p_sha_rejects_same_content_alternate_commit(self) -> None:
-        selected, alternate, s2, e_sha = bootstrap.EXPECTED_P_SHA, "9" * 40, "2" * 40, "3" * 40
-
-        def identity(root: Path, *arguments: str) -> str:
-            values = {
-                ("rev-parse", "HEAD"): e_sha,
-                ("remote", "get-url", "origin"):
-                    "https://github.com/KiloAlpha021/security-policy.git",
-                ("cat-file", "-t", e_sha): "commit",
-                ("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", e_sha):
-                    "B3 Test\0b3@example.invalid\0B3 Test\0b3@example.invalid",
-                ("rev-list", "--parents", "-n", "1", e_sha):
-                    f"{e_sha} {s2} {alternate}",
-            }
-            return values[arguments]
-
-        with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
-             mock.patch.object(bootstrap, "_validate_b1_candidate"), \
-             mock.patch.object(bootstrap, "_git_attribution"), \
-             mock.patch.object(bootstrap, "_git", side_effect=identity):
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "selected P"):
-                bootstrap.validate_b3_establishment(
-                    self.protected, s2, self.p, selected, self.e, e_sha)
-
-    def test_e_requires_selected_p_order_and_terminal_tree(self) -> None:
-        s2, p_sha, e_sha = "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
-
-        def identity(root: Path, *arguments: str) -> str:
-            if root == self.e and arguments == ("rev-parse", "HEAD"):
-                return e_sha
-            if root == self.e and arguments == ("remote", "get-url", "origin"):
-                return "https://github.com/KiloAlpha021/security-policy.git"
-            if root == self.e and arguments == ("cat-file", "-t", e_sha):
-                return "commit"
-            if root == self.e and arguments == ("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", e_sha):
-                return "B3 Test\0b3@example.invalid\0B3 Test\0b3@example.invalid"
-            if root == self.e and arguments == ("rev-list", "--parents", "-n", "1", e_sha):
-                return f"{e_sha} {s2} {p_sha}"
-            if root == self.e and arguments == ("rev-parse", f"{e_sha}^{{tree}}"):
-                return bootstrap.G2_BOUND_CANDIDATE_TREE
-            if root == self.e and len(arguments) == 2 and arguments[0] == "rev-parse":
-                return dict(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS)[arguments[1].split(":", 1)[1]]
-            raise AssertionError((root, arguments))
-
-        terminal = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_BOUND_EXPECTED_TERMINAL}"\n').encode()
-        with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
-             mock.patch.object(bootstrap, "_validate_b1_candidate"), \
-             mock.patch.object(bootstrap, "_git_attribution"), \
-             mock.patch.object(bootstrap, "_git", side_effect=identity), \
-             mock.patch.object(bootstrap, "_git_bytes", return_value=terminal), \
-             mock.patch.object(bootstrap, "validate_protected_universe"):
-            bootstrap.validate_b3_establishment(
-                self.protected, s2, self.p, p_sha, self.e, e_sha)
-
-    def test_e_complete_adversarial_matrix(self) -> None:
-        s2, p_sha, e_sha = "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
-
-        def run(*, head: str | None = None, repository: str | None = None,
-                kind: str = "commit", attribution: str | None = None,
-                parents: str | None = None, tree: str | None = None,
-                blobs: dict[str, str] | None = None,
-                lifecycle: str = "CONSUMED") -> None:
-            actual_blobs = blobs or dict(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS)
-
-            def identity(root: Path, *arguments: str) -> str:
-                values = {
-                    ("rev-parse", "HEAD"): head or e_sha,
-                    ("remote", "get-url", "origin"):
-                        repository or "https://github.com/KiloAlpha021/security-policy.git",
-                    ("cat-file", "-t", e_sha): kind,
-                    ("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", e_sha):
-                        attribution if attribution is not None else
-                        "B3 Test\0b3@example.invalid\0B3 Test\0b3@example.invalid",
-                    ("rev-list", "--parents", "-n", "1", e_sha):
-                        parents or f"{e_sha} {s2} {p_sha}",
-                    ("rev-parse", f"{e_sha}^{{tree}}"): tree or bootstrap.G2_BOUND_CANDIDATE_TREE,
-                }
-                if (len(arguments) == 2 and arguments[0] == "rev-parse"
-                        and arguments[1].startswith(e_sha + ":")):
-                    return actual_blobs[arguments[1].split(":", 1)[1]]
-                return values[arguments]
-
-            raw = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:{lifecycle}"\n').encode()
-            with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
-                 mock.patch.object(bootstrap, "_validate_b1_candidate"), \
-                 mock.patch.object(bootstrap, "_git_attribution",
-                                   side_effect=(bootstrap.BootstrapError("B3 E attribution is malformed")
-                                                if attribution == "\0\0\0" else None)), \
-                 mock.patch.object(bootstrap, "_git", side_effect=identity), \
-                 mock.patch.object(bootstrap, "_git_bytes", return_value=raw), \
-                 mock.patch.object(bootstrap, "validate_protected_universe"):
-                bootstrap.validate_b3_establishment(
-                    self.protected, s2, self.p, p_sha, self.e, e_sha)
-
-        cases = (
-            ("head", {"head": "0" * 40}, "E checkout"),
-            ("repository", {"repository": "https://github.com/KiloAlpha021/security-workflows.git"}, "repository"),
-            ("object", {"kind": "tree"}, "not a commit"),
-            ("attribution", {"attribution": "\0\0\0"}, "attribution"),
-            ("one-parent", {"parents": f"{e_sha} {s2}"}, "ordered parents"),
-            ("extra-parent", {"parents": f"{e_sha} {s2} {p_sha} {'4' * 40}"}, "ordered parents"),
-            ("reversed", {"parents": f"{e_sha} {p_sha} {s2}"}, "ordered parents"),
-            ("wrong-s2", {"parents": f"{e_sha} {'4' * 40} {p_sha}"}, "ordered parents"),
-            ("wrong-p", {"parents": f"{e_sha} {s2} {'9' * 40}"}, "selected P"),
-            ("tree", {"tree": "0" * 40}, "tree mismatch"),
-            ("one-byte-result", {"tree": "f" * 40}, "tree mismatch"),
-            ("wrong-mode", {"tree": "e" * 40}, "tree mismatch"),
-            ("missing-path", {"tree": "d" * 40}, "tree mismatch"),
-            ("extra-path", {"tree": "c" * 40}, "tree mismatch"),
-            ("mixed-s2-b1", {"tree": "b" * 40}, "tree mismatch"),
-            ("wrong-g1", {"tree": "a" * 40}, "tree mismatch"),
-            ("replacement-binding", {"tree": "8" * 40}, "tree mismatch"),
-            ("unexpected-authority", {"tree": "7" * 40}, "tree mismatch"),
-            ("active-bound", {"lifecycle": "ACTIVE_BOUND"}, "terminal CONSUMED"),
-            ("active-unbound", {"lifecycle": "ACTIVE_UNBOUND"}, "terminal CONSUMED"),
-        )
-        for name, options, message in cases:
-            with self.subTest(name=name), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, message):
-                run(**options)
-        for path in bootstrap.MODEL_D_MAINTENANCE_PATHS:
-            blobs = dict(bootstrap.G2_EXPECTED_CANDIDATE_BLOBS)
-            blobs[path] = "0" * 40
-            with self.subTest(blob=path), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, "terminal blob"):
-                run(blobs=blobs)
-
-    def test_b3_establishment_rejects_root_aliases(self) -> None:
-        for p_root, e_root in (
-                (self.protected, self.e), (self.p, self.protected),
-                (self.p, self.p)):
-            with self.subTest(p=p_root.name, e=e_root.name), \
-                 mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
-                 self.assertRaisesRegex(bootstrap.BootstrapError, "roots must be separate"):
-                bootstrap.validate_b3_establishment(
-                    self.protected, "2" * 40, p_root, bootstrap.EXPECTED_P_SHA,
-                    e_root, "3" * 40)
-
-    def test_terminal_requires_exact_order_tree_and_protected_main(self) -> None:
-        t, s2, p_sha, e_sha = "4" * 40, "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
-
-        def identity(root: Path, *arguments: str) -> str:
-            values = {
-                ("rev-parse", "HEAD"): t,
-                ("rev-parse", "refs/remotes/origin/main"): t,
-                ("cat-file", "-t", t): "commit",
-                ("rev-list", "--parents", "-n", "1", t): f"{t} {s2} {e_sha}",
-                ("rev-list", "--parents", "-n", "1", e_sha): f"{e_sha} {s2} {p_sha}",
-                ("rev-parse", f"{t}^{{tree}}"): bootstrap.G2_BOUND_CANDIDATE_TREE,
-            }
-            return values[arguments]
-
-        terminal = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_BOUND_EXPECTED_TERMINAL}"\n').encode()
-        completed = subprocess.CompletedProcess([], 0, b"", b"")
-        with mock.patch.object(bootstrap, "_git", side_effect=identity), \
-             mock.patch.object(bootstrap, "_git_bytes", return_value=terminal), \
-             mock.patch.object(bootstrap, "_require_b3_selected_history"), \
-             mock.patch.object(bootstrap, "validate_protected_universe"), \
-             mock.patch.object(bootstrap.subprocess, "run", return_value=completed):
-            bootstrap.validate_b3_terminal(self.protected, t, s2, p_sha, e_sha)
-
-    def test_t_complete_adversarial_matrix(self) -> None:
-        t, s2, p_sha, e_sha = "4" * 40, "2" * 40, bootstrap.EXPECTED_P_SHA, "3" * 40
-
-        def run(*, head: str | None = None, main: str | None = None,
-                kind: str = "commit", parents: str | None = None,
-                e_parents: str | None = None, tree: str | None = None,
-                lifecycle: str = "CONSUMED", ancestry: int = 0) -> None:
-            def identity(_root: Path, *arguments: str) -> str:
-                values = {
-                    ("rev-parse", "HEAD"): head or t,
-                    ("rev-parse", "refs/remotes/origin/main"): main or t,
-                    ("cat-file", "-t", t): kind,
-                    ("rev-list", "--parents", "-n", "1", t):
-                        parents or f"{t} {s2} {e_sha}",
-                    ("rev-list", "--parents", "-n", "1", e_sha):
-                        e_parents or f"{e_sha} {s2} {p_sha}",
-                    ("rev-parse", f"{t}^{{tree}}"): tree or bootstrap.G2_BOUND_CANDIDATE_TREE,
-                }
-                return values[arguments]
-
-            raw = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:{lifecycle}"\n').encode()
-            completed = subprocess.CompletedProcess([], ancestry, b"", b"")
-            with mock.patch.object(bootstrap, "_git", side_effect=identity), \
-                 mock.patch.object(bootstrap, "_git_bytes", return_value=raw), \
-                 mock.patch.object(bootstrap, "_require_b3_selected_history"), \
-                 mock.patch.object(bootstrap, "validate_protected_universe"), \
-                 mock.patch.object(bootstrap.subprocess, "run", return_value=completed):
-                bootstrap.validate_b3_terminal(self.protected, t, s2, p_sha, e_sha)
-
-        cases = (
-            ("head", {"head": "0" * 40}, "protected main"),
-            ("later-main", {"main": "0" * 40}, "protected main"),
-            ("object", {"kind": "tree"}, "not a commit"),
-            ("one-parent", {"parents": f"{t} {s2}"}, "ordered parents"),
-            ("extra-parent", {"parents": f"{t} {s2} {e_sha} {'5' * 40}"}, "ordered parents"),
-            ("reversed", {"parents": f"{t} {e_sha} {s2}"}, "ordered parents"),
-            ("wrong-s2", {"parents": f"{t} {'5' * 40} {e_sha}"}, "ordered parents"),
-            ("wrong-e", {"parents": f"{t} {s2} {'5' * 40}"}, "ordered parents"),
-            ("malformed-e", {"e_parents": f"{e_sha} {s2}"}, "E and P ancestry"),
-            ("wrong-p", {"e_parents": f"{e_sha} {s2} {'9' * 40}"}, "E and P ancestry"),
-            ("tree", {"tree": "0" * 40}, "tree mismatch"),
-            ("one-byte", {"tree": "f" * 40}, "tree mismatch"),
-            ("wrong-blob", {"tree": "e" * 40}, "tree mismatch"),
-            ("wrong-mode", {"tree": "d" * 40}, "tree mismatch"),
-            ("wrong-g1", {"tree": "c" * 40}, "tree mismatch"),
-            ("second-terminal", {"parents": f"{t} {'9' * 40} {e_sha}"}, "ordered parents"),
-            ("ancestry", {"ancestry": 1}, "S1 ancestry"),
-            ("active-bound", {"lifecycle": "ACTIVE_BOUND"}, "terminal CONSUMED"),
-            ("active-unbound", {"lifecycle": "ACTIVE_UNBOUND"}, "terminal CONSUMED"),
-        )
-        for name, options, message in cases:
-            with self.subTest(name=name), self.assertRaisesRegex(
-                    bootstrap.BootstrapError, message):
-                run(**options)
-
-    def test_b3_terminal_state_cannot_be_reused_as_enablement(self) -> None:
-        terminal = "4" * 40
-        with mock.patch.object(
-                bootstrap, "validate_b3_selected_authority",
-                side_effect=bootstrap.BootstrapError(
-                    "B3 P selector is not protected main")):
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "protected main"):
-                bootstrap.validate_b3_establishment(
-                    self.protected, terminal, self.p, bootstrap.EXPECTED_P_SHA,
-                    self.e, "3" * 40)
-
-    def test_b3_cli_requires_all_explicit_roots_and_shas(self) -> None:
-        parser = bootstrap._parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["admit-b3", "--protected-sha", "1" * 40])
-        arguments = parser.parse_args([
-            "admit-b3", "--protected-sha", "2" * 40,
-            "--protected-root", "protected", "--p-sha", "1" * 40,
-            "--p-root", "p", "--e-sha", "3" * 40, "--e-root", "e"])
-        self.assertEqual(arguments.p_sha, "1" * 40)
-        self.assertEqual(arguments.e_sha, "3" * 40)
-
-    def test_b3_cli_rejects_each_missing_or_duplicated_identity(self) -> None:
-        parser = bootstrap._parser()
-        pairs = (
-            ("--protected-sha", "2" * 40),
-            ("--protected-root", "protected"),
-            ("--p-sha", "1" * 40),
-            ("--p-root", "p"),
-            ("--e-sha", "3" * 40),
-            ("--e-root", "e"),
-        )
-        complete = ["admit-b3"] + [item for pair in pairs for item in pair]
-        for missing in range(len(pairs)):
-            arguments = ["admit-b3"] + [item for index, pair in enumerate(pairs)
-                                          if index != missing for item in pair]
-            with self.subTest(missing=pairs[missing][0]), \
-                 self.assertRaises(SystemExit):
-                parser.parse_args(arguments)
-        with self.assertRaises(SystemExit):
-            parser.parse_args(complete + ["--p-sha", "9" * 40])
-
-    def test_workflow_b3_inputs_bind_event_and_separate_authority(self) -> None:
-        workflow = yaml.safe_load(
-            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text())
+    def workflow_preparation(self) -> subprocess.CompletedProcess[str]:
+        workflow = yaml.load(
+            (Path(__file__).parent / bootstrap.CANDIDATE_BASELINE_PATH).read_text(
+                encoding="utf-8"), Loader=yaml.BaseLoader)
         steps = workflow["jobs"]["security-workflows-policy"]["steps"]
-        by_name = {step["name"]: step for step in steps}
-        identity = by_name["Resolve exact B3 proposal identities"]["run"]
-        admission = by_name["Enforce exact DESIGN-B terminal admission"]["run"]
-        self.assertIn('${{ github.event.pull_request.head.sha }}', identity)
-        self.assertIn('$fields[2]', identity)
-        self.assertIn('--protected-root "${{ github.workspace }}/policy"', admission)
-        self.assertIn('--p-root "${{ github.workspace }}/p-candidate"', admission)
-        self.assertIn('--e-root "${{ github.workspace }}/e-candidate"', admission)
-        self.assertIn('--protected-sha "${{ steps.protected-git.outputs.protected-sha }}"', admission)
-        self.assertIn('--p-sha "${{ steps.b3-identities.outputs.p-sha }}"', admission)
-        self.assertIn('--e-sha "${{ steps.b3-identities.outputs.e-sha }}"', admission)
-        self.assertNotIn("--expected-tree", admission)
-        self.assertNotIn("--expected-s1", admission)
-        self.assertNotIn("--expected-s2", admission)
+        run = next(step["run"] for step in steps
+                   if step["name"] == "Resolve protected bootstrap authority")
+        preparation = run.split('python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate', 1)[0]
+        for expression, value in (
+                ("${{ github.workspace }}", str(self.root)),
+                ("${{ github.sha }}", self.candidate_sha),
+                ("${{ github.repository }}", bootstrap.DOWNSTREAM_REPOSITORY),
+                ("${{ steps.protected-git.outputs.protected-sha }}", self.protected_sha)):
+            preparation = preparation.replace(expression, value)
+        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                               preparation], capture_output=True, text=True)
 
-    def test_workflow_separates_protected_p_and_e(self) -> None:
-        workflow = (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text()
-        for token in ("p-candidate", "e-candidate", "b3-identities.outputs.p-sha",
-                      "b3-identities.outputs.e-sha", "admit-b3"):
-            self.assertIn(token, workflow)
-        self.assertIn("$fields[2]", workflow)
-        self.assertIn("policy/protected_policy_bootstrap.py\" admit-b3", workflow)
-        self.assertNotIn("p-candidate/protected_policy_bootstrap.py\" admit-b3", workflow)
-        self.assertNotIn("e-candidate/protected_policy_bootstrap.py\" admit-b3", workflow)
+    def test_downstream_workflow_preparation_uses_protected_policy(self) -> None:
+        self.assertFalse((self.candidate / bootstrap.CANDIDATE_BASELINE_PATH).exists())
+        result = self.workflow_preparation()
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        fake = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        fake.write_text("name: candidate substitute\n", encoding="utf-8")
+        git(self.candidate, "add", ".")
+        git(self.candidate, "commit", "-m", "fake policy workflow")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        result = self.workflow_preparation()
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        git(self.protected, "rm", bootstrap.CANDIDATE_BASELINE_PATH)
+        git(self.protected, "commit", "-m", "remove protected policy")
+        self.protected_sha = git(self.protected, "rev-parse", "HEAD")
+        result = self.workflow_preparation()
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_real_downstream_baseline_and_fake_candidate_policy(self) -> None:
+        self.assertFalse((self.candidate / bootstrap.CANDIDATE_BASELINE_PATH).exists())
+        inputs = bootstrap._cli_inputs(self.arguments())
+        result = bootstrap.evaluate(inputs)
+        self.assertEqual(inputs.candidate_baseline, bootstrap.CURRENT_BASELINE)
+        self.assertIs(result.evaluation_context,
+                      bootstrap.EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS)
+        self.assertIs(result.policy_source, bootstrap.PolicySource.POLICY)
+        candidate_policy = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        candidate_policy.write_bytes(
+            b"name: fake policy\nenv:\n  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-9\n")
+        git(self.candidate, "add", ".")
+        git(self.candidate, "commit", "-m", "fake policy")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        self.assertEqual(bootstrap._cli_inputs(self.arguments()).candidate_baseline,
+                         bootstrap.CURRENT_BASELINE)
+
+    def test_missing_or_changed_protected_baseline_has_no_candidate_fallback(self) -> None:
+        fake = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        fake.write_bytes(
+            b"name: fake\nenv:\n  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n")
+        self.policy_file.unlink()
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._cli_inputs(self.arguments())
+        self.policy_file.write_bytes(
+            b"name: changed\nenv:\n  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-1\n")
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "Protected baseline bytes differ"):
+            bootstrap._cli_inputs(self.arguments())
+
+    def test_wrong_roots_shas_repository_and_context_reject(self) -> None:
+        inputs = bootstrap._cli_inputs(self.arguments())
+        for changed in (
+                dict(candidate_root=self.protected, protected_root=self.candidate),
+                dict(candidate_sha=self.protected_sha),
+                dict(protected_sha=self.candidate_sha),
+                dict(repository=bootstrap.REPOSITORY)):
+            with self.subTest(changed=changed), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.evaluate(replace(inputs, **changed))
+        for changed in (dict(repository="Other/repository", base_repository="Other/repository"),
+                        dict(base_repository=bootstrap.REPOSITORY),
+                        dict(event_name="workflow_dispatch")):
+            with self.subTest(changed=changed), self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._cli_inputs(self.arguments(**changed))
+
+    def test_self_policy_still_reads_candidate_baseline(self) -> None:
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-policy.git")
+        candidate_policy = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        candidate_policy.write_bytes((
+            "name: self proposal\nenv:\n  POLICY_BASELINE_VERSION: " +
+            bootstrap.CURRENT_BASELINE + "\n").encode())
+        git(self.candidate, "add", ".")
+        git(self.candidate, "commit", "-m", "self proposal")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        inputs = bootstrap._cli_inputs(self.arguments(
+            repository=bootstrap.REPOSITORY, base_repository=bootstrap.REPOSITORY))
+        self.assertIs(bootstrap.evaluate(inputs).policy_source, bootstrap.PolicySource.CANDIDATE)
 
 
 class G2SeedAdmissionTests(unittest.TestCase):
@@ -4069,18 +3335,19 @@ class G2SeedAdmissionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.source = Path(__file__).parent.resolve()
         self.protected = Path(temporary.name).resolve() / "protected"
-        subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout", str(self.source),
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.source),
                         str(self.protected)], check=True, capture_output=True)
         self._configure(self.protected)
-        git(self.protected, "checkout", "-B", "main",
-            "9b78dcb50df2e7ae89cfb32733e37f88659e12ab")
-        self.base_sha = git(self.protected, "rev-parse", "HEAD")
+        self.base_sha = git(self.protected, "rev-parse", "HEAD^1")
+        seed_candidate_sha = git(self.protected, "rev-parse", "HEAD^2")
+        git(self.protected, "checkout", "-B", "main", self.base_sha)
         git(self.protected, "checkout", "-b", "seed")
         for name in bootstrap.MODEL_D_MAINTENANCE_PATHS:
             destination = self.protected / name
-            destination.write_bytes(bootstrap._git_bytes(
-                self.source, "show",
-                f"bb0e4279954ed7b0600d71091e69d369516e5d75:{name}"))
+            data = subprocess.run(
+                ["git", "-C", str(self.source), "show", f"{seed_candidate_sha}:{name}"],
+                check=True, capture_output=True).stdout
+            destination.write_bytes(data)
         git(self.protected, "add", *bootstrap.MODEL_D_MAINTENANCE_PATHS)
         git(self.protected, "commit", "-m", "Synthetic G2 seed proposal")
         self.seed_proposal = git(self.protected, "rev-parse", "HEAD")
@@ -4089,7 +3356,7 @@ class G2SeedAdmissionTests(unittest.TestCase):
         self.seed_sha = git(self.protected, "rev-parse", "HEAD")
         git(self.protected, "update-ref", "refs/remotes/origin/main", self.seed_sha)
         self.candidate = Path(temporary.name).resolve() / "candidate"
-        subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout", str(self.protected),
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.protected),
                         str(self.candidate)], check=True, capture_output=True)
         self._configure(self.candidate)
         git(self.candidate, "checkout", "-b", "g2-use")
@@ -4272,387 +3539,6 @@ class G2SeedAdmissionTests(unittest.TestCase):
         git(self.candidate, "commit", "--amend", "--no-edit")
         with self.assertRaises(bootstrap.BootstrapError):
             self._admit()
-
-
-class S2CCorrectionTests(unittest.TestCase):
-    """Exercise the deliberate attribution format and one finite S2 repair."""
-
-    S2 = "580e923a5adb83bda915af32ffacb9c55512a26f"
-    GOOD = b"Jos\xc3\xa9\0jose@example.invalid\0Committer\0c@example.invalid\n"
-
-    def test_actual_workflow_b3_detector_routes_lf_and_crlf_exclusively(self) -> None:
-        source = Path(__file__).parent.resolve()
-        workflow = yaml.safe_load(
-            (source / ".github/workflows/security-workflows-policy.yml").read_text())
-        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
-        by_name = {step["name"]: step for step in steps}
-        detector = by_name["Acquire protected Git identity"]
-        self.assertEqual(detector["id"], "protected-git")
-        self.assertEqual(
-            by_name["Resolve exact B3 proposal identities"]["if"],
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'")
-        self.assertEqual(
-            by_name["Enforce exact DESIGN-B terminal admission"]["if"],
-            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'")
-        self.assertEqual(
-            by_name["Enforce exact Model D maintenance admission"]["if"],
-            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'")
-        exact_s2 = bootstrap._git_bytes(source, "show", f"{self.S2}:protected_policy_bootstrap.py")
-        exact_s1 = bootstrap._git_bytes(
-            source, "show", f"{bootstrap.B3_AUTHORITY_ORIGIN}:protected_policy_bootstrap.py")
-        marker = b'B3_ENABLEMENT = "DESIGN_B_FINITE_V1"'
-        self.assertEqual(exact_s2.count(marker), 1)
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            policy = workspace / "policy"
-            subprocess.run(["git", "clone", "--quiet", str(source), str(policy)],
-                           check=True, capture_output=True)
-            git(policy, "checkout", "--detach", self.S2)
-            git(policy, "config", "core.autocrlf", "false")
-            script = detector["run"].replace(
-                "${{ github.workspace }}", workspace.as_posix())
-            output = workspace / "GITHUB_OUTPUT"
-
-            def execute(data: bytes, *, wrong_root: bool = False) -> tuple[int, str, str]:
-                (policy / "protected_policy_bootstrap.py").write_bytes(data)
-                output.unlink(missing_ok=True)
-                command = script
-                if wrong_root:
-                    command = command.replace(
-                        (workspace / "policy").as_posix(),
-                        (workspace / "missing-policy").as_posix())
-                completed = subprocess.run(
-                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
-                    env={**os.environ, "GITHUB_OUTPUT": str(output)},
-                    capture_output=True, text=True)
-                return (completed.returncode,
-                        output.read_text(encoding="utf-8") if output.exists() else "",
-                        completed.stderr + completed.stdout)
-
-            cases = (
-                ("exact-lf", exact_s2, "true"),
-                ("exact-crlf", exact_s2.replace(b"\n", b"\r\n"), "true"),
-                ("missing-marker", exact_s1, "false"),
-                ("altered-marker", exact_s2.replace(marker, b'B3_ENABLEMENT = "OTHER"'), "false"),
-            )
-            for name, data, expected in cases:
-                with self.subTest(name=name):
-                    code, recorded, diagnostic = execute(data)
-                    self.assertEqual(code, 0, diagnostic)
-                    self.assertEqual(
-                        recorded.splitlines(),
-                        [f"protected-sha={self.S2}", f"b3-enabled={expected}"])
-                    b3_route = expected == "true"
-                    legacy_route = expected != "true"
-                    self.assertNotEqual(b3_route, legacy_route)
-                    self.assertEqual(b3_route, name.startswith("exact-"))
-            for name, data in (
-                ("duplicate-exact", exact_s2 + marker + b"\n"),
-                ("duplicate-ambiguous", exact_s2 + b"B3_ENABLEMENT=OTHER\n"),
-            ):
-                with self.subTest(name=name):
-                    code, recorded, diagnostic = execute(data)
-                    self.assertNotEqual(code, 0)
-                    self.assertIn("Ambiguous B3 enablement declaration", diagnostic)
-                    self.assertNotIn("b3-enabled=", recorded)
-            code, recorded, _ = execute(exact_s2, wrong_root=True)
-            self.assertNotEqual(code, 0)
-            self.assertNotIn("b3-enabled=", recorded)
-            (workspace / "candidate").mkdir()
-            (workspace / "candidate" / "protected_policy_bootstrap.py").write_bytes(exact_s2)
-            code, recorded, diagnostic = execute(exact_s1)
-            self.assertEqual(code, 0, diagnostic)
-            self.assertIn("b3-enabled=false", recorded)
-
-    def test_attribution_parser_accepts_exact_record_and_rejects_controls(self) -> None:
-        root = Path(__file__).parent
-        with mock.patch.object(bootstrap, "_git_bytes", return_value=self.GOOD):
-            self.assertEqual(bootstrap._git_attribution(root, "a" * 40, "B3 P"),
-                             ("Jos\u00e9", "jose@example.invalid",
-                              "Committer", "c@example.invalid"))
-        bad = {
-            "short": b"a\0b\0c\n",
-            "extra": b"a\0b\0c\0d\0e\n",
-            "empty-author": b"\0b\0c\0d\n",
-            "empty-author-email": b"a\0\0c\0d\n",
-            "empty-committer": b"a\0b\0\0d\n",
-            "empty-committer-email": b"a\0b\0c\0\n",
-            "leading-delimiter": b"\0a\0b\0c\n",
-            "trailing-delimiter": b"a\0b\0c\0\n",
-            "no-newline": b"a\0b\0c\0d",
-            "extra-newline": b"a\0b\0c\0d\n\n",
-            "cr": b"a\rb\0c\0d\0e\n",
-            "lf": b"a\nb\0c\0d\0e\n",
-            "tab": b"a\tb\0c\0d\0e\n",
-            "unicode-control": "a\u202eb\0c\0d\0e\n".encode(),
-            "invalid-utf8": b"\xff\0b\0c\0d\n",
-        }
-        for name, output in bad.items():
-            with self.subTest(name=name), \
-                 mock.patch.object(bootstrap, "_git_bytes", return_value=output), \
-                 self.assertRaisesRegex(bootstrap.BootstrapError, "attribution is malformed"):
-                bootstrap._git_attribution(root, "a" * 40, "B3 P")
-
-    def test_generic_git_identity_still_rejects_nul(self) -> None:
-        with mock.patch.object(bootstrap.subprocess, "run", return_value=
-                               subprocess.CompletedProcess([], 0, "a\0b", "")):
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "Malformed Git identity"):
-                bootstrap._git(Path(__file__).parent, "rev-parse", "HEAD")
-
-    def test_native_s2c_is_exactly_one_s2_anchored_layer(self) -> None:
-        source = Path(__file__).parent.resolve()
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "policy"
-            subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
-                           check=True, capture_output=True)
-            git(repo, "checkout", "--detach", self.S2)
-            git(repo, "remote", "set-url", "origin",
-                "https://github.com/KiloAlpha021/security-policy.git")
-            git(repo, "config", "core.autocrlf", "false")
-            git(repo, "config", "user.name", "S2C Test")
-            git(repo, "config", "user.email", "s2c@example.invalid")
-            for name in bootstrap.B3_CORRECTION_PATHS:
-                (repo / name).write_bytes(subprocess.run(
-                    ["git", "-C", str(source), "show", f"{bootstrap.B3_P_SELECTION_BASE}:{name}"],
-                    check=True, capture_output=True).stdout)
-            git(repo, "add", "--", *bootstrap.B3_CORRECTION_PATHS)
-            git(repo, "commit", "-m", "C")
-            proposal = git(repo, "rev-parse", "HEAD")
-            tree = git(repo, "rev-parse", "HEAD^{tree}")
-
-            def make(message: str, tree_sha: str, *parents: str) -> str:
-                command = ["git", "-C", str(repo), "commit-tree", tree_sha]
-                for parent in parents:
-                    command.extend(("-p", parent))
-                return subprocess.run(command, input=message + "\n", text=True,
-                                      check=True, capture_output=True).stdout.strip()
-
-            corrected = make("S2C", tree, self.S2, proposal)
-            git(repo, "checkout", "--detach", corrected)
-            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
-            bootstrap.validate_b3_corrected_authority(repo, corrected)
-            with mock.patch.object(bootstrap, "_exact_modified_paths",
-                                   return_value=("protected_policy_bootstrap.py",)):
-                with self.assertRaisesRegex(bootstrap.BootstrapError, "three-file scope"):
-                    bootstrap.validate_b3_corrected_authority(repo, corrected)
-            original = bootstrap._git_bytes
-            def mutated_source(root: Path, *arguments: str) -> bytes:
-                value = original(root, *arguments)
-                if arguments == ("show", f"{corrected}:protected_policy_bootstrap.py"):
-                    return value.replace(
-                        b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
-                        b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED')
-                return value
-            with mock.patch.object(bootstrap, "_git_bytes", side_effect=mutated_source):
-                with self.assertRaises(bootstrap.BootstrapError):
-                    bootstrap.validate_b3_corrected_authority(repo, corrected)
-            original_source = original(
-                repo, "show", f"{corrected}:protected_policy_bootstrap.py")
-            authority_mutations = {
-                "binding": original_source.replace(
-                    bootstrap.G2_BOUND_CANDIDATE_TREE.encode(), b"0" * 40),
-                "g1-revival": original_source.replace(
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED',
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE_BOUND'),
-                "g2-unbound": original_source.replace(
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_UNBOUND'),
-                "future-p": original_source + b'\nFUTURE_P_SHA = "' + b"f" * 40 + b'"\n',
-                "alternate-p": original_source + b'\nAUTHORIZED_PROVENANCE = "' + b"f" * 40 + b'"\n',
-                "generation": original_source.replace(
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2"',
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_3"'),
-                "marker": original_source.replace(
-                    b'B3_CORRECTION = "PPR_FWD_01_V1"', b''),
-            }
-            for name, source_mutation in authority_mutations.items():
-                def changed_source(root: Path, *arguments: str) -> bytes:
-                    if arguments == ("show", f"{corrected}:protected_policy_bootstrap.py"):
-                        return source_mutation
-                    return original(root, *arguments)
-                with self.subTest(authority=name), \
-                     mock.patch.object(bootstrap, "_git_bytes",
-                                       side_effect=changed_source), \
-                     self.assertRaises(bootstrap.BootstrapError):
-                    bootstrap.validate_b3_corrected_authority(repo, corrected)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "protected main"):
-                git(repo, "update-ref", "refs/remotes/origin/main", self.S2)
-                bootstrap.validate_b3_corrected_authority(repo, corrected)
-            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
-            wrong_first = make("wrong first", tree, bootstrap.B3_AUTHORITY_ORIGIN,
-                               proposal)
-            git(repo, "checkout", "--detach", wrong_first)
-            git(repo, "update-ref", "refs/remotes/origin/main", wrong_first)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2 first parent"):
-                bootstrap.validate_b3_corrected_authority(repo, wrong_first)
-            git(repo, "checkout", "--detach", corrected)
-            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
-            wrong_child = make("not an S2 child", tree, bootstrap.B3_AUTHORITY_ORIGIN)
-            wrong_proposal = make("wrong proposal", tree, self.S2, wrong_child)
-            git(repo, "checkout", "--detach", wrong_proposal)
-            git(repo, "update-ref", "refs/remotes/origin/main", wrong_proposal)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "direct S2 child"):
-                bootstrap.validate_b3_corrected_authority(repo, wrong_proposal)
-            git(repo, "checkout", "--detach", corrected)
-            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
-            with mock.patch.object(bootstrap, "_git", wraps=bootstrap._git) as identity:
-                def wrong_tree(root: Path, *arguments: str) -> str:
-                    if arguments == ("rev-parse", f"{proposal}^{{tree}}"):
-                        return "0" * 40
-                    return identity.original(root, *arguments)
-                identity.original = identity._mock_wraps
-                identity.side_effect = wrong_tree
-                with self.assertRaisesRegex(bootstrap.BootstrapError,
-                                            "merge tree differs"):
-                    bootstrap.validate_b3_corrected_authority(repo, corrected)
-            replay = make("C2", tree, corrected)
-            second = make("S2C2", tree, corrected, replay)
-            git(repo, "checkout", "--detach", second)
-            git(repo, "update-ref", "refs/remotes/origin/main", second)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2 first parent"):
-                bootstrap.validate_b3_corrected_authority(repo, second)
-            arbitrary = make("arbitrary ACTIVE_BOUND", tree, corrected)
-            git(repo, "checkout", "--detach", arbitrary)
-            git(repo, "update-ref", "refs/remotes/origin/main", arbitrary)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2 first parent"):
-                bootstrap.validate_b3_corrected_authority(repo, arbitrary)
-
-
-class S2PSelectionTests(unittest.TestCase):
-    """The protected selector is one S2C successor, never E-supplied data."""
-
-    S2C = "c7041b6802c9196c491d63977cdc6f81a3566b01"
-
-    def test_native_one_use_and_closed_selection_schema(self) -> None:
-        source = Path(__file__).parent.resolve()
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "policy"
-            subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
-                           check=True, capture_output=True)
-            git(repo, "config", "core.autocrlf", "false")
-            git(repo, "checkout", "--detach", self.S2C)
-            git(repo, "remote", "set-url", "origin",
-                "https://github.com/KiloAlpha021/security-policy.git")
-            git(repo, "config", "user.name", "S2P Test")
-            git(repo, "config", "user.email", "s2p@example.invalid")
-            for name in bootstrap.B3_P_SELECTION_PATHS:
-                target = repo / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes((source / name).read_bytes())
-            git(repo, "add", "--", *bootstrap.B3_P_SELECTION_PATHS)
-            git(repo, "commit", "-m", "SIMULATION_ONLY selector proposal")
-            proposal = git(repo, "rev-parse", "HEAD")
-            tree = git(repo, "rev-parse", "HEAD^{tree}")
-
-            def make(label: str, tree_sha: str, *parents: str) -> str:
-                command = ["git", "-C", str(repo), "commit-tree", tree_sha]
-                for parent in parents:
-                    command.extend(("-p", parent))
-                return subprocess.run(command, input=label + "\n", text=True,
-                                      check=True, capture_output=True).stdout.strip()
-
-            selected = make("SIMULATION_ONLY S2P", tree, self.S2C, proposal)
-
-            def protected_at(revision: str) -> None:
-                git(repo, "checkout", "--detach", revision)
-                git(repo, "update-ref", "refs/remotes/origin/main", revision)
-
-            protected_at(selected)
-            bootstrap.validate_b3_selected_authority(repo, selected)
-            self.assertEqual(bootstrap.EXPECTED_P_SHA,
-                             "f8f41127efe2c27cc7ba8f3132754b5c363636a1")
-            with mock.patch.object(bootstrap, "_exact_modified_paths",
-                                   return_value=("protected_policy_bootstrap.py",)), \
-                 self.assertRaisesRegex(bootstrap.BootstrapError, "three-file scope"):
-                bootstrap.validate_b3_selected_authority(repo, selected)
-            with mock.patch.object(bootstrap, "_tree_entries",
-                                   return_value={name: ("100755", "blob")
-                                                 for name in bootstrap.B3_P_SELECTION_PATHS}), \
-                 self.assertRaisesRegex(bootstrap.BootstrapError, "100644"):
-                bootstrap.validate_b3_selected_authority(repo, selected)
-            original = bootstrap._git_bytes
-            actual = original(repo, "show", f"{selected}:protected_policy_bootstrap.py")
-            mutations = {
-                "missing": actual.replace(
-                    b'EXPECTED_P_SHA = "f8f41127efe2c27cc7ba8f3132754b5c363636a1"\n', b""),
-                "wrong": actual.replace(bootstrap.EXPECTED_P_SHA.encode(), b"9" * 40),
-                "duplicate": actual + b'\nEXPECTED_P_SHA = "' +
-                    bootstrap.EXPECTED_P_SHA.encode() + b'"\n',
-                "alternate-name": actual + b'\nALTERNATE_P_SHA = "' + b"9" * 40 + b'"\n',
-                "g1-revival": actual.replace(
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED',
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE_BOUND'),
-                "g2-consumed": actual.replace(
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED'),
-                "g2-unbound": actual.replace(
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
-                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_UNBOUND'),
-                "binding": actual.replace(
-                    bootstrap.G2_BOUND_CANDIDATE_TREE.encode(), b"0" * 40),
-            }
-            for label, changed in mutations.items():
-                def altered(root: Path, *args: str) -> bytes:
-                    if args == ("show", f"{selected}:protected_policy_bootstrap.py"):
-                        return changed
-                    return original(root, *args)
-                with self.subTest(label=label), \
-                     mock.patch.object(bootstrap, "_git_bytes", side_effect=altered), \
-                     self.assertRaises(bootstrap.BootstrapError):
-                    bootstrap.validate_b3_selected_authority(repo, selected)
-            wrong_first = make("wrong first", tree, bootstrap.B3_CORRECTION_BASE,
-                               proposal)
-            protected_at(wrong_first)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2C first parent"):
-                bootstrap.validate_b3_selected_authority(repo, wrong_first)
-            wrong_proposal = make("wrong proposal", tree, self.S2C,
-                                  bootstrap.B3_CORRECTION_BASE)
-            protected_at(wrong_proposal)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "direct S2C child"):
-                bootstrap.validate_b3_selected_authority(repo, wrong_proposal)
-            second_child = make("replay", tree, selected)
-            second = make("second S2P", tree, selected, second_child)
-            protected_at(second)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2C first parent"):
-                bootstrap.validate_b3_selected_authority(repo, second)
-            arbitrary = make("arbitrary ACTIVE_BOUND", tree, selected)
-            protected_at(arbitrary)
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2C first parent"):
-                bootstrap.validate_b3_selected_authority(repo, arbitrary)
-
-    def test_supplied_p_cannot_override_protected_expected_p(self) -> None:
-        alternate = "9" * 40
-        with mock.patch.object(bootstrap, "validate_b3_selected_authority"), \
-             mock.patch.object(bootstrap, "_validate_b1_candidate") as validate_p, \
-             self.assertRaisesRegex(bootstrap.BootstrapError,
-                                    "differs from protected expected P"):
-            bootstrap.validate_b3_establishment(
-                Path(__file__).parent.resolve(), self.S2C,
-                Path(__file__).parent.resolve(), alternate,
-                Path(__file__).parent.resolve(), "3" * 40)
-        validate_p.assert_not_called()
-        with self.assertRaisesRegex(bootstrap.BootstrapError,
-                                    "differs from protected expected P"):
-            bootstrap.validate_b3_terminal(
-                Path(__file__).parent.resolve(), "4" * 40,
-                self.S2C, alternate, "3" * 40)
-
-    def test_workflow_selects_p_from_protected_code(self) -> None:
-        workflow = yaml.safe_load(
-            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text())
-        steps = {step["name"]: step for step in
-                 workflow["jobs"]["security-workflows-policy"]["steps"]}
-        identity = steps["Resolve exact B3 proposal identities"]["run"]
-        self.assertIn('policy/protected_policy_bootstrap.py" select-b3-p', identity)
-        self.assertIn("$proposedP = $fields[2]", identity)
-        self.assertIn("$proposedP -ne $pSha", identity)
-        self.assertNotIn("$pSha = $fields[2]", identity)
-        self.assertIn("steps.b3-identities.outputs.p-sha",
-                      str(steps["Check out exact selected B1 provenance P"]))
-        parser = bootstrap._parser()
-        self.assertEqual(parser.parse_args([
-            "select-b3-p", "--protected-sha", self.S2C,
-            "--protected-root", "policy"]).operation, "select-b3-p")
 
 
 if __name__ == "__main__":
