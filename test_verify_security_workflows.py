@@ -1371,7 +1371,7 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
         }
         self.assertEqual(imported, {
             "__future__", "argparse", "ast", "hashlib", "os", "re", "stat", "subprocess", "sys",
-            "tempfile", "dataclasses", "enum", "pathlib"
+            "tempfile", "dataclasses", "enum", "pathlib", "unicodedata"
         })
         self.assertNotIn("yaml", imported)
         completed = subprocess.run(
@@ -3580,8 +3580,9 @@ class B3DesignBTests(unittest.TestCase):
     def test_actual_candidate_declaration_schema_is_closed(self) -> None:
         repository = Path(__file__).parent.resolve()
         s1_equivalent = bootstrap._git_bytes(
-            repository, "show", "HEAD:protected_policy_bootstrap.py")
-        candidate = Path(bootstrap.__file__).read_bytes()
+            repository, "show", f"{bootstrap.B3_AUTHORITY_ORIGIN}:protected_policy_bootstrap.py")
+        candidate = bootstrap._git_bytes(
+            repository, "show", f"{bootstrap.B3_CORRECTION_BASE}:protected_policy_bootstrap.py")
         bootstrap._require_b3_enablement_declaration_schema(
             s1_equivalent, candidate)
 
@@ -3695,8 +3696,6 @@ class B3DesignBTests(unittest.TestCase):
                 return repository or "https://github.com/KiloAlpha021/security-policy.git"
             if arguments == ("cat-file", "-t", revision):
                 return kind
-            if arguments == ("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", revision):
-                return attribution if attribution is not None else "B3 Test\0b3@example.invalid\0B3 Test\0b3@example.invalid"
             if arguments == ("rev-list", "--parents", "-n", "1", revision):
                 return parents or f"{revision} {parent}"
             if arguments == ("rev-parse", f"{revision}^{{tree}}"):
@@ -3709,8 +3708,14 @@ class B3DesignBTests(unittest.TestCase):
         raw = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:{lifecycle}"\n'
                f'# {disposition}\n').encode()
         entries = entries or {path: ("100644", "blob") for path in bootstrap.MODEL_D_MAINTENANCE_PATHS}
+        def output(_root: Path, *arguments: str) -> bytes:
+            if arguments[:2] == ("show", "-s"):
+                value = (attribution if attribution is not None else
+                         "B3 Test\0b3@example.invalid\0B3 Test\0b3@example.invalid")
+                return (value + "\n").encode()
+            return raw
         with mock.patch.object(bootstrap, "_git", side_effect=identity), \
-             mock.patch.object(bootstrap, "_git_bytes", side_effect=lambda *_args: raw), \
+             mock.patch.object(bootstrap, "_git_bytes", side_effect=output), \
              mock.patch.object(bootstrap, "_exact_modified_paths",
                                return_value=paths or bootstrap.MODEL_D_MAINTENANCE_PATHS), \
              mock.patch.object(bootstrap, "_tree_entries", return_value=entries), \
@@ -3776,8 +3781,9 @@ class B3DesignBTests(unittest.TestCase):
             }
             return values[arguments]
 
-        with mock.patch.object(bootstrap, "validate_b3_enabled_authority"), \
+        with mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
              mock.patch.object(bootstrap, "_validate_b1_candidate"), \
+             mock.patch.object(bootstrap, "_git_attribution"), \
              mock.patch.object(bootstrap, "_git", side_effect=identity):
             with self.assertRaisesRegex(bootstrap.BootstrapError, "selected P"):
                 bootstrap.validate_b3_establishment(
@@ -3804,8 +3810,9 @@ class B3DesignBTests(unittest.TestCase):
             raise AssertionError((root, arguments))
 
         terminal = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_BOUND_EXPECTED_TERMINAL}"\n').encode()
-        with mock.patch.object(bootstrap, "validate_b3_enabled_authority"), \
+        with mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
              mock.patch.object(bootstrap, "_validate_b1_candidate"), \
+             mock.patch.object(bootstrap, "_git_attribution"), \
              mock.patch.object(bootstrap, "_git", side_effect=identity), \
              mock.patch.object(bootstrap, "_git_bytes", return_value=terminal), \
              mock.patch.object(bootstrap, "validate_protected_universe"):
@@ -3841,8 +3848,11 @@ class B3DesignBTests(unittest.TestCase):
                 return values[arguments]
 
             raw = (f'G2_MAINTENANCE_LIFECYCLE = "{bootstrap.G2_MAINTENANCE_GENERATION}:{lifecycle}"\n').encode()
-            with mock.patch.object(bootstrap, "validate_b3_enabled_authority"), \
+            with mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
                  mock.patch.object(bootstrap, "_validate_b1_candidate"), \
+                 mock.patch.object(bootstrap, "_git_attribution",
+                                   side_effect=(bootstrap.BootstrapError("B3 E attribution is malformed")
+                                                if attribution == "\0\0\0" else None)), \
                  mock.patch.object(bootstrap, "_git", side_effect=identity), \
                  mock.patch.object(bootstrap, "_git_bytes", return_value=raw), \
                  mock.patch.object(bootstrap, "validate_protected_universe"):
@@ -3887,7 +3897,7 @@ class B3DesignBTests(unittest.TestCase):
                 (self.protected, self.e), (self.p, self.protected),
                 (self.p, self.p)):
             with self.subTest(p=p_root.name, e=e_root.name), \
-                 mock.patch.object(bootstrap, "validate_b3_enabled_authority"), \
+                 mock.patch.object(bootstrap, "validate_b3_corrected_authority"), \
                  self.assertRaisesRegex(bootstrap.BootstrapError, "roots must be separate"):
                 bootstrap.validate_b3_establishment(
                     self.protected, "2" * 40, p_root, "1" * 40,
@@ -3911,6 +3921,7 @@ class B3DesignBTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, b"", b"")
         with mock.patch.object(bootstrap, "_git", side_effect=identity), \
              mock.patch.object(bootstrap, "_git_bytes", return_value=terminal), \
+             mock.patch.object(bootstrap, "_require_b3_corrected_history"), \
              mock.patch.object(bootstrap, "validate_protected_universe"), \
              mock.patch.object(bootstrap.subprocess, "run", return_value=completed):
             bootstrap.validate_b3_terminal(self.protected, t, s2, p_sha, e_sha)
@@ -3939,6 +3950,7 @@ class B3DesignBTests(unittest.TestCase):
             completed = subprocess.CompletedProcess([], ancestry, b"", b"")
             with mock.patch.object(bootstrap, "_git", side_effect=identity), \
                  mock.patch.object(bootstrap, "_git_bytes", return_value=raw), \
+                 mock.patch.object(bootstrap, "_require_b3_corrected_history"), \
                  mock.patch.object(bootstrap, "validate_protected_universe"), \
                  mock.patch.object(bootstrap.subprocess, "run", return_value=completed):
                 bootstrap.validate_b3_terminal(self.protected, t, s2, p_sha, e_sha)
@@ -3972,7 +3984,7 @@ class B3DesignBTests(unittest.TestCase):
     def test_b3_terminal_state_cannot_be_reused_as_enablement(self) -> None:
         terminal = "4" * 40
         with mock.patch.object(
-                bootstrap, "validate_b3_enabled_authority",
+                bootstrap, "validate_b3_corrected_authority",
                 side_effect=bootstrap.BootstrapError(
                     "B3 validator is not the finite S1 enablement merge")):
             with self.assertRaisesRegex(bootstrap.BootstrapError, "finite S1"):
@@ -4252,6 +4264,164 @@ class G2SeedAdmissionTests(unittest.TestCase):
         git(self.candidate, "commit", "--amend", "--no-edit")
         with self.assertRaises(bootstrap.BootstrapError):
             self._admit()
+
+
+class S2CCorrectionTests(unittest.TestCase):
+    """Exercise the deliberate attribution format and one finite S2 repair."""
+
+    S2 = "580e923a5adb83bda915af32ffacb9c55512a26f"
+    GOOD = b"Jos\xc3\xa9\0jose@example.invalid\0Committer\0c@example.invalid\n"
+
+    def test_attribution_parser_accepts_exact_record_and_rejects_controls(self) -> None:
+        root = Path(__file__).parent
+        with mock.patch.object(bootstrap, "_git_bytes", return_value=self.GOOD):
+            self.assertEqual(bootstrap._git_attribution(root, "a" * 40, "B3 P"),
+                             ("Jos\u00e9", "jose@example.invalid",
+                              "Committer", "c@example.invalid"))
+        bad = {
+            "short": b"a\0b\0c\n",
+            "extra": b"a\0b\0c\0d\0e\n",
+            "empty-author": b"\0b\0c\0d\n",
+            "empty-author-email": b"a\0\0c\0d\n",
+            "empty-committer": b"a\0b\0\0d\n",
+            "empty-committer-email": b"a\0b\0c\0\n",
+            "leading-delimiter": b"\0a\0b\0c\n",
+            "trailing-delimiter": b"a\0b\0c\0\n",
+            "no-newline": b"a\0b\0c\0d",
+            "extra-newline": b"a\0b\0c\0d\n\n",
+            "cr": b"a\rb\0c\0d\0e\n",
+            "lf": b"a\nb\0c\0d\0e\n",
+            "tab": b"a\tb\0c\0d\0e\n",
+            "unicode-control": "a\u202eb\0c\0d\0e\n".encode(),
+            "invalid-utf8": b"\xff\0b\0c\0d\n",
+        }
+        for name, output in bad.items():
+            with self.subTest(name=name), \
+                 mock.patch.object(bootstrap, "_git_bytes", return_value=output), \
+                 self.assertRaisesRegex(bootstrap.BootstrapError, "attribution is malformed"):
+                bootstrap._git_attribution(root, "a" * 40, "B3 P")
+
+    def test_generic_git_identity_still_rejects_nul(self) -> None:
+        with mock.patch.object(bootstrap.subprocess, "run", return_value=
+                               subprocess.CompletedProcess([], 0, "a\0b", "")):
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "Malformed Git identity"):
+                bootstrap._git(Path(__file__).parent, "rev-parse", "HEAD")
+
+    def test_native_s2c_is_exactly_one_s2_anchored_layer(self) -> None:
+        source = Path(__file__).parent.resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "policy"
+            subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
+                           check=True, capture_output=True)
+            git(repo, "checkout", "--detach", self.S2)
+            git(repo, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            git(repo, "config", "core.autocrlf", "false")
+            git(repo, "config", "user.name", "S2C Test")
+            git(repo, "config", "user.email", "s2c@example.invalid")
+            for name in bootstrap.B3_CORRECTION_PATHS:
+                (repo / name).write_bytes((source / name).read_bytes())
+            git(repo, "add", "--", *bootstrap.B3_CORRECTION_PATHS)
+            git(repo, "commit", "-m", "C")
+            proposal = git(repo, "rev-parse", "HEAD")
+            tree = git(repo, "rev-parse", "HEAD^{tree}")
+
+            def make(message: str, tree_sha: str, *parents: str) -> str:
+                command = ["git", "-C", str(repo), "commit-tree", tree_sha]
+                for parent in parents:
+                    command.extend(("-p", parent))
+                return subprocess.run(command, input=message + "\n", text=True,
+                                      check=True, capture_output=True).stdout.strip()
+
+            corrected = make("S2C", tree, self.S2, proposal)
+            git(repo, "checkout", "--detach", corrected)
+            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
+            bootstrap.validate_b3_corrected_authority(repo, corrected)
+            with mock.patch.object(bootstrap, "_exact_modified_paths",
+                                   return_value=("protected_policy_bootstrap.py",)):
+                with self.assertRaisesRegex(bootstrap.BootstrapError, "two-file scope"):
+                    bootstrap.validate_b3_corrected_authority(repo, corrected)
+            original = bootstrap._git_bytes
+            def mutated_source(root: Path, *arguments: str) -> bytes:
+                value = original(root, *arguments)
+                if arguments == ("show", f"{corrected}:protected_policy_bootstrap.py"):
+                    return value.replace(
+                        b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
+                        b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED')
+                return value
+            with mock.patch.object(bootstrap, "_git_bytes", side_effect=mutated_source):
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_b3_corrected_authority(repo, corrected)
+            original_source = original(
+                repo, "show", f"{corrected}:protected_policy_bootstrap.py")
+            authority_mutations = {
+                "binding": original_source.replace(
+                    bootstrap.G2_BOUND_CANDIDATE_TREE.encode(), b"0" * 40),
+                "g1-revival": original_source.replace(
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:CONSUMED',
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_1:ACTIVE_BOUND'),
+                "g2-unbound": original_source.replace(
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_BOUND',
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2:ACTIVE_UNBOUND'),
+                "future-p": original_source + b'\nFUTURE_P_SHA = "' + b"f" * 40 + b'"\n',
+                "alternate-p": original_source + b'\nAUTHORIZED_PROVENANCE = "' + b"f" * 40 + b'"\n',
+                "generation": original_source.replace(
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_2"',
+                    b'MODEL_D_ORCHESTRATION_V1_GENERATION_3"'),
+                "marker": original_source.replace(
+                    b'B3_CORRECTION = "PPR_FWD_01_V1"', b''),
+            }
+            for name, source_mutation in authority_mutations.items():
+                def changed_source(root: Path, *arguments: str) -> bytes:
+                    if arguments == ("show", f"{corrected}:protected_policy_bootstrap.py"):
+                        return source_mutation
+                    return original(root, *arguments)
+                with self.subTest(authority=name), \
+                     mock.patch.object(bootstrap, "_git_bytes",
+                                       side_effect=changed_source), \
+                     self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.validate_b3_corrected_authority(repo, corrected)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "protected main"):
+                git(repo, "update-ref", "refs/remotes/origin/main", self.S2)
+                bootstrap.validate_b3_corrected_authority(repo, corrected)
+            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
+            wrong_first = make("wrong first", tree, bootstrap.B3_AUTHORITY_ORIGIN,
+                               proposal)
+            git(repo, "checkout", "--detach", wrong_first)
+            git(repo, "update-ref", "refs/remotes/origin/main", wrong_first)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2 first parent"):
+                bootstrap.validate_b3_corrected_authority(repo, wrong_first)
+            git(repo, "checkout", "--detach", corrected)
+            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
+            wrong_child = make("not an S2 child", tree, bootstrap.B3_AUTHORITY_ORIGIN)
+            wrong_proposal = make("wrong proposal", tree, self.S2, wrong_child)
+            git(repo, "checkout", "--detach", wrong_proposal)
+            git(repo, "update-ref", "refs/remotes/origin/main", wrong_proposal)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "direct S2 child"):
+                bootstrap.validate_b3_corrected_authority(repo, wrong_proposal)
+            git(repo, "checkout", "--detach", corrected)
+            git(repo, "update-ref", "refs/remotes/origin/main", corrected)
+            with mock.patch.object(bootstrap, "_git", wraps=bootstrap._git) as identity:
+                def wrong_tree(root: Path, *arguments: str) -> str:
+                    if arguments == ("rev-parse", f"{proposal}^{{tree}}"):
+                        return "0" * 40
+                    return identity.original(root, *arguments)
+                identity.original = identity._mock_wraps
+                identity.side_effect = wrong_tree
+                with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                            "merge tree differs"):
+                    bootstrap.validate_b3_corrected_authority(repo, corrected)
+            replay = make("C2", tree, corrected)
+            second = make("S2C2", tree, corrected, replay)
+            git(repo, "checkout", "--detach", second)
+            git(repo, "update-ref", "refs/remotes/origin/main", second)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2 first parent"):
+                bootstrap.validate_b3_corrected_authority(repo, second)
+            arbitrary = make("arbitrary ACTIVE_BOUND", tree, corrected)
+            git(repo, "checkout", "--detach", arbitrary)
+            git(repo, "update-ref", "refs/remotes/origin/main", arbitrary)
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "exact S2 first parent"):
+                bootstrap.validate_b3_corrected_authority(repo, arbitrary)
 
 
 if __name__ == "__main__":
