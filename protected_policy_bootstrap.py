@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -44,6 +45,13 @@ G2_BOUND_TEST_BLOB = "cd5ce5f194cef50dd016ca529f2857cf8c7a6082"
 G2_BOUND_EXPECTED_TERMINAL = "MODEL_D_ORCHESTRATION_V1_GENERATION_2:CONSUMED"
 B3_AUTHORITY_ORIGIN = "9393099a9060f90689341611457c9b9032959b88"
 B3_ENABLEMENT = "DESIGN_B_FINITE_V1"
+B3_CORRECTION = "PPR_FWD_01_V1"
+B3_CORRECTION_BASE = "580e923a5adb83bda915af32ffacb9c55512a26f"
+B3_CORRECTION_PATHS = (
+    ".github/workflows/security-workflows-policy.yml",
+    "protected_policy_bootstrap.py",
+    "test_verify_security_workflows.py",
+)
 MODEL_D_MAINTENANCE_PATHS = (
     ".github/workflows/security-workflows-policy.yml",
     "protected_policy_bootstrap.py",
@@ -759,9 +767,7 @@ def _validate_b1_candidate(candidate: Path, revision: str) -> None:
         raise BootstrapError("B3 P repository mismatch")
     if _git(candidate, "cat-file", "-t", revision) != "commit":
         raise BootstrapError("B3 P is not a commit")
-    attribution = _git(candidate, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", revision).split("\0")
-    if len(attribution) != 4 or any(not value.strip() for value in attribution):
-        raise BootstrapError("B3 P attribution is missing")
+    _git_attribution(candidate, revision, "B3 P")
     parents = _git(candidate, "rev-list", "--parents", "-n", "1", revision).split()
     if parents != [revision, G2_BOUND_ORIGIN]:
         raise BootstrapError("B3 P must have sole parent S0")
@@ -853,11 +859,65 @@ def validate_b3_enabled_authority(protected_root: Path, protected_sha: str) -> N
     validate_protected_universe(protected, revision)
 
 
+def _require_b3_corrected_history(root: Path, revision: str) -> None:
+    """Recognize only one S2-anchored, purpose-limited correction merge."""
+    if _git(root, "cat-file", "-t", revision) != "commit":
+        raise BootstrapError("B3 correction checkpoint is not a commit")
+    parents = _git(root, "rev-list", "--parents", "-n", "1", revision).split()
+    if len(parents) != 3 or parents[1] != B3_CORRECTION_BASE:
+        raise BootstrapError("B3 correction must have exact S2 first parent")
+    proposal = parents[2]
+    if _git(root, "cat-file", "-t", proposal) != "commit":
+        raise BootstrapError("B3 correction proposal is not a commit")
+    if _git(root, "rev-list", "--parents", "-n", "1", proposal).split() != [
+            proposal, B3_CORRECTION_BASE]:
+        raise BootstrapError("B3 correction proposal must be a direct S2 child")
+    if (_git(root, "rev-parse", f"{proposal}^{{tree}}") !=
+            _git(root, "rev-parse", f"{revision}^{{tree}}")):
+        raise BootstrapError("B3 correction merge tree differs from proposal")
+    if _exact_modified_paths(root, B3_CORRECTION_BASE, revision) != B3_CORRECTION_PATHS:
+        raise BootstrapError("B3 correction exceeds its three-file scope")
+    before = _git_bytes(root, "show", f"{B3_CORRECTION_BASE}:protected_policy_bootstrap.py")
+    source = _git_bytes(root, "show", f"{revision}:protected_policy_bootstrap.py")
+    expected = _module_authority_declarations(before)
+    for name, value in (
+            ("B3_CORRECTION", B3_CORRECTION),
+            ("B3_CORRECTION_BASE", B3_CORRECTION_BASE),
+            ("B3_CORRECTION_PATHS", B3_CORRECTION_PATHS)):
+        expected[name] = ast.dump(ast.parse(repr(value), mode="eval").body,
+                                  annotate_fields=True, include_attributes=False)
+    if _module_authority_declarations(source) != expected:
+        raise BootstrapError("B3 correction authority declarations differ from S2")
+    if _g2_lifecycle(source) != "ACTIVE_BOUND":
+        raise BootstrapError("B3 correction must remain ACTIVE_BOUND")
+    _require_g2_bound_declarations(source)
+    for declaration in (
+            f'B3_AUTHORITY_ORIGIN = "{B3_AUTHORITY_ORIGIN}"',
+            f'B3_ENABLEMENT = "{B3_ENABLEMENT}"',
+            f'B3_CORRECTION = "{B3_CORRECTION}"'):
+        if source.split(b"\n").count(declaration.encode()) != 1:
+            raise BootstrapError("B3 correction marker is missing or duplicated")
+
+
+def validate_b3_corrected_authority(protected_root: Path, protected_sha: str) -> None:
+    """Require the actual protected main to be the unique S2 correction."""
+    protected = _root(protected_root, "B3 protected root")
+    revision = _sha(protected_sha, "B3 protected SHA")
+    if _git(protected, "rev-parse", "HEAD") != revision:
+        raise BootstrapError("B3 corrected checkout mismatch")
+    if _git(protected, "rev-parse", "refs/remotes/origin/main") != revision:
+        raise BootstrapError("B3 corrected validator is not protected main")
+    if _canonical_remote(_git(protected, "remote", "get-url", "origin")) != REPOSITORY:
+        raise BootstrapError("B3 corrected repository mismatch")
+    _require_b3_corrected_history(protected, revision)
+    validate_protected_universe(protected, revision)
+
+
 def validate_b3_establishment(
         protected_root: Path, protected_sha: str,
         p_root: Path, p_sha: str, e_root: Path, e_sha: str) -> None:
     """Admit one exact P through one deterministic terminal-tree proposal E."""
-    validate_b3_enabled_authority(protected_root, protected_sha)
+    validate_b3_corrected_authority(protected_root, protected_sha)
     protected_revision = _sha(protected_sha, "B3 protected SHA")
     selected_p = _sha(p_sha, "selected P SHA")
     proposal = _sha(e_sha, "E SHA")
@@ -874,9 +934,7 @@ def validate_b3_establishment(
         raise BootstrapError("B3 E repository mismatch")
     if _git(e, "cat-file", "-t", proposal) != "commit":
         raise BootstrapError("B3 E is not a commit")
-    attribution = _git(e, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", proposal).split("\0")
-    if len(attribution) != 4 or any(not value.strip() for value in attribution):
-        raise BootstrapError("B3 E attribution is missing")
+    _git_attribution(e, proposal, "B3 E")
     parents = _git(e, "rev-list", "--parents", "-n", "1", proposal).split()
     if parents != [proposal, protected_revision, selected_p]:
         raise BootstrapError("B3 E ordered parents must be exact S2 and selected P")
@@ -909,6 +967,7 @@ def validate_b3_terminal(
         raise BootstrapError("B3 T ordered parents must be exact S2 and E")
     if _git(terminal, "rev-list", "--parents", "-n", "1", proposal).split() != [proposal, enabled, selected_p]:
         raise BootstrapError("B3 T does not retain exact E and P ancestry")
+    _require_b3_corrected_history(terminal, enabled)
     ancestry = subprocess.run(
         ["git", "-C", str(terminal), "merge-base", "--is-ancestor",
          B3_AUTHORITY_ORIGIN, enabled], capture_output=True, check=False)
@@ -1245,6 +1304,25 @@ def _root(value: object, label: str) -> Path:
     if not resolved.is_dir() or resolved != value:
         raise BootstrapError(f"Invalid {label}")
     return resolved
+
+
+def _git_attribution(root: Path, revision: str, label: str) -> tuple[str, str, str, str]:
+    """Read the one intentional NUL-delimited Git identity record."""
+    output = _git_bytes(
+        root, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", revision)
+    if (not output.endswith(b"\n") or output.count(b"\n") != 1 or
+            b"\r" in output or output[:-1].count(b"\0") != 3):
+        raise BootstrapError(f"{label} attribution is malformed")
+    try:
+        fields = tuple(field.decode("utf-8", errors="strict")
+                       for field in output[:-1].split(b"\0"))
+    except UnicodeError as error:
+        raise BootstrapError(f"{label} attribution is malformed") from error
+    if (len(fields) != 4 or any(not field.strip() for field in fields) or
+            any(unicodedata.category(char).startswith("C")
+                for field in fields for char in field)):
+        raise BootstrapError(f"{label} attribution is malformed")
+    return fields  # type: ignore[return-value]
 
 
 def _git(root: Path, *arguments: str) -> str:
