@@ -204,9 +204,11 @@ def validate_workflow(text: str) -> None:
         "EVENT_REPOSITORY": "${{ github.repository }}",
         "CANDIDATE_SHA": "${{ github.sha }}",
         "EVENT_NAME": "${{ github.event_name }}",
+        "EVENT_BASE_SHA": "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
+        "EVENT_HEAD_SHA": "${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}",
     } or verifier_step.get("run", "").strip().splitlines() != [
         "$ErrorActionPreference = 'Stop'",
-        "python trusted/verify_candidate.py --candidate candidate --trusted trusted --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --event-name $env:EVENT_NAME",
+        "python trusted/verify_candidate.py --candidate candidate --trusted trusted --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --event-name $env:EVENT_NAME --event-base-sha $env:EVENT_BASE_SHA --event-head-sha $env:EVENT_HEAD_SHA --github-output $env:GITHUB_OUTPUT",
         "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
     ]:
         raise ValueError("Protected verifier invocation changed")
