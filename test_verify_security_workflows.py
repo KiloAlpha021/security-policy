@@ -840,18 +840,25 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                 candidate, "rev-parse", f"{merge_sha}:{bootstrap.CANDIDATE_BASELINE_PATH}")
 
             git(candidate, "config", "core.autocrlf", "true")
-            workflow_path.unlink()
-            git(candidate, "checkout", "--", bootstrap.CANDIDATE_BASELINE_PATH)
-            self.assertIn(b"\r\n", workflow_path.read_bytes())
-            self.assertEqual(git(candidate, "hash-object", bootstrap.CANDIDATE_BASELINE_PATH),
-                             committed_blob)
-            self.assertNotEqual(
-                git(candidate, "hash-object", "--no-filters", bootstrap.CANDIDATE_BASELINE_PATH),
-                committed_blob,
-            )
-            with self.assertRaisesRegex(bootstrap.BootstrapError,
-                                        "Invalid candidate baseline source bytes"):
-                bootstrap.extract_candidate_baseline(candidate)
+            fixture_env = {key: os.environ.get(key) for key in
+                           ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")}
+            with mock.patch.dict(os.environ, {
+                    "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.autocrlf",
+                    "GIT_CONFIG_VALUE_0": "true"}):
+                workflow_path.unlink()
+                git(candidate, "checkout", "--", bootstrap.CANDIDATE_BASELINE_PATH)
+                self.assertIn(b"\r\n", workflow_path.read_bytes())
+                self.assertEqual(git(candidate, "hash-object", bootstrap.CANDIDATE_BASELINE_PATH),
+                                 committed_blob)
+                self.assertNotEqual(
+                    git(candidate, "hash-object", "--no-filters", bootstrap.CANDIDATE_BASELINE_PATH),
+                    committed_blob,
+                )
+                with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                            "Invalid candidate baseline source bytes"):
+                    bootstrap.extract_candidate_baseline(candidate)
+            self.assertEqual(
+                {key: os.environ.get(key) for key in fixture_env}, fixture_env)
 
             workflow = yaml.load(
                 (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
@@ -1378,7 +1385,7 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
         })
         self.assertNotIn("yaml", imported)
         completed = subprocess.run(
-            [os.sys.executable, "-I", "-S", "-c",
+            [os.sys.executable, "-I", "-S", "-B", "-c",
              "import importlib.util,sys;"
              "p=sys.argv[1];s=importlib.util.spec_from_file_location('b',p);"
              "m=importlib.util.module_from_spec(s);sys.modules['b']=m;s.loader.exec_module(m);"
@@ -4403,9 +4410,10 @@ class S2CCorrectionTests(unittest.TestCase):
         source = Path(__file__).parent.resolve()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "policy"
-            subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
+            subprocess.run(["git", "-c", "core.autocrlf=false", "clone", "--quiet", str(source), str(repo)],
                            check=True, capture_output=True)
-            git(repo, "checkout", "--detach", self.S2)
+            repo = repo.resolve(strict=True)
+            git(repo, "-c", "core.autocrlf=false", "checkout", "--detach", self.S2)
             git(repo, "remote", "set-url", "origin",
                 "https://github.com/KiloAlpha021/security-policy.git")
             git(repo, "config", "core.autocrlf", "false")
@@ -4527,8 +4535,9 @@ class S2PSelectionTests(unittest.TestCase):
         source = Path(__file__).parent.resolve()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "policy"
-            subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
+            subprocess.run(["git", "-c", "core.autocrlf=false", "clone", "--quiet", str(source), str(repo)],
                            check=True, capture_output=True)
+            repo = repo.resolve(strict=True)
             git(repo, "config", "core.autocrlf", "false")
             git(repo, "checkout", "--detach", self.S2C)
             git(repo, "remote", "set-url", "origin",
