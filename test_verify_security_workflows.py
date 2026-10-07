@@ -454,8 +454,8 @@ if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from author
             self.assertIn(expected, run)
         self.assertIn("policy/test_verify_security_workflows.py", by_name["Apply protected Stage A baseline to candidate target"]["run"])
         self.assertNotIn("candidate/test_verify_security_workflows.py", text)
-        self.assertIn("policy/verify_security_workflows.py --candidate candidate",
-                      by_name["Validate downstream security workflows"]["run"])
+        self.assertEqual(by_name["Validate downstream security workflows"]["run"],
+                         ModelDClosedPowerShellProfileTests._DOWNSTREAM_RUN)
         for step in steps:
             if "run" in step:
                 self.assertIn("$ErrorActionPreference = 'Stop'", step["run"])
@@ -2250,6 +2250,9 @@ class ModelDPlanV1Tests(unittest.TestCase):
 class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     """D4 closed profile for the one protected Model D workflow, not generic PS."""
 
+    _DOWNSTREAM_ENV = {'DOWNSTREAM_EVENT_REPOSITORY': '${{ github.repository }}', 'DOWNSTREAM_CANDIDATE_SHA': '${{ github.sha }}', 'DOWNSTREAM_BASE_REPOSITORY': '${{ github.event.pull_request.base.repo.full_name || github.repository }}', 'DOWNSTREAM_BASE_BRANCH': "${{ github.event.pull_request.base.ref || 'main' }}", 'DOWNSTREAM_EVENT_NAME': '${{ github.event_name }}'}
+    _DOWNSTREAM_RUN = '$ErrorActionPreference = \'Stop\'\n.\\policy-env\\Scripts\\python.exe policy/verify_security_workflows.py --candidate candidate --policy policy --event-repository "$env:DOWNSTREAM_EVENT_REPOSITORY" --candidate-sha "$env:DOWNSTREAM_CANDIDATE_SHA" --base-repository "$env:DOWNSTREAM_BASE_REPOSITORY" --base-branch "$env:DOWNSTREAM_BASE_BRANCH" --event-name "$env:DOWNSTREAM_EVENT_NAME"\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n'
+
     _AST_TYPES = frozenset({
         "ArrayExpressionAst", "ArrayLiteralAst", "AssignmentStatementAst",
         "BinaryExpressionAst", "CommandAst", "CommandExpressionAst",
@@ -2301,7 +2304,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Test independent root policy": "435b6b77a7e2d99f14a71ee6474e163492bd72b0dd516bd63f305393af4853fa",
         "Install isolated hash-locked audit environment": "b96ce83b8b71555e5b23570d0f7d92f5ff1fc3f38b5b264ad7902f119980813f",
         "Audit locked policy dependencies": "0c70fcfd7f2074edd996e1deaf7ca5ac06ab49c6e578e525a6321c8bb7ec17ec",
-        "Validate downstream security workflows": "98622aeb4b2c26df74de7cbcd68750ffebb2ad7de78a6abd1b6df9c7045d8be8",
+        "Validate downstream security workflows": "db7cea9aed7f58756b1a29bc7099ebe938ab9ad87692dcd5378aac743cdab44a",
     }
     _EXPRESSION_DIGESTS = {
         "Acquire protected Git identity": "626f38d5235646eebb8630cef6a809250712768735127c17c93ea94bcc65fb15",
@@ -2467,7 +2470,17 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
         self.assertEqual(len(reports), len(blocks))
         return {report["name"]: report for report in reports}
 
+    def _assert_downstream_invocation(self, workflow: dict[str, object]) -> None:
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        invocations = [step for step in steps if "/verify_security_workflows.py" in step.get("run", "")]
+        self.assertEqual(len(invocations), 1)
+        step = invocations[0]
+        self.assertEqual(step["name"], "Validate downstream security workflows")
+        self.assertEqual(step.get("env"), self._DOWNSTREAM_ENV)
+        self.assertEqual(step["run"], self._DOWNSTREAM_RUN)
+
     def _assert_closed(self, workflow: dict[str, object]) -> None:
+        self._assert_downstream_invocation(workflow)
         self.assertEqual(set(workflow), {"name", "on", "permissions", "env", "jobs"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group", "workflow_dispatch"})
@@ -2535,6 +2548,7 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
             },
         }
         fixed_env = {
+            "Validate downstream security workflows": self._DOWNSTREAM_ENV,
             "Run candidate Stage A evidence": {
                 "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "core.autocrlf",
@@ -2605,7 +2619,10 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 "\0".join(expressions).encode("utf-8")).hexdigest()
             self.assertEqual(expression_digest, self._EXPRESSION_DIGESTS.get(
                 name, hashlib.sha256(b"").hexdigest()), name)
-            self.assertTrue(set(report["variables"]) <= self._VARIABLES, name)
+            allowed_variables = self._VARIABLES | (
+                {"env:" + key for key in self._DOWNSTREAM_ENV}
+                if name == "Validate downstream security workflows" else set())
+            self.assertTrue(set(report["variables"]) <= allowed_variables, name)
             self.assertTrue(set(report["assignments"]) <= self._ASSIGNMENTS, name)
             assignment_digest = hashlib.sha256(
                 "\0".join(report["assignmentTexts"]).encode("utf-8")).hexdigest()
@@ -2639,6 +2656,65 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
 
     def test_current_workflow_has_closed_ast_and_structure(self) -> None:
         self._assert_closed(self._workflow())
+
+    def test_downstream_invocation_contract_rejects_independent_substitutions(self) -> None:
+        workflow = self._workflow()
+        self._assert_closed(workflow)
+        name = "Validate downstream security workflows"
+        command = self._DOWNSTREAM_RUN
+        mutations = []
+        for argument, value in (
+                ("--candidate", "candidate"), ("--policy", "policy"),
+                ("--event-repository", '"$env:DOWNSTREAM_EVENT_REPOSITORY"'),
+                ("--candidate-sha", '"$env:DOWNSTREAM_CANDIDATE_SHA"'),
+                ("--base-repository", '"$env:DOWNSTREAM_BASE_REPOSITORY"'),
+                ("--base-branch", '"$env:DOWNSTREAM_BASE_BRANCH"'),
+                ("--event-name", '"$env:DOWNSTREAM_EVENT_NAME"')):
+            mutations.append((argument, command.replace(" " + argument + " " + value, "", 1)))
+        for before, after in (
+                ("policy/verify_security_workflows.py", "candidate/verify_security_workflows.py"),
+                ("--policy policy", "--policy candidate"),
+                ("$env:DOWNSTREAM_EVENT_REPOSITORY", "$env:CANDIDATE_REPOSITORY"),
+                ("$ErrorActionPreference = 'Stop'", "$ErrorActionPreference = 'Continue'"),
+                ("$ErrorActionPreference = 'Stop'\n", ""),
+                ("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", ""),
+                ("exit $LASTEXITCODE", "exit 0")):
+            mutations.append((before, command.replace(before, after, 1)))
+        mutations.append(("duplicate invocation", command + command))
+        for label, run in mutations:
+            changed = copy.deepcopy(workflow)
+            step = next(s for s in changed["jobs"]["security-workflows-policy"]["steps"] if s["name"] == name)
+            self.assertNotEqual(run, step["run"])
+            step["run"] = run
+            with self.subTest(mutation=label), self.assertRaises(AssertionError):
+                self._assert_closed(changed)
+        for key in self._DOWNSTREAM_ENV:
+            for value in (None, "mutable-or-wrong", "${{ inputs.authority }}"):
+                changed = copy.deepcopy(workflow)
+                step = next(s for s in changed["jobs"]["security-workflows-policy"]["steps"] if s["name"] == name)
+                if value is None:
+                    del step["env"][key]
+                else:
+                    step["env"][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(AssertionError):
+                    self._assert_closed(changed)
+        changed = copy.deepcopy(workflow)
+        step = next(s for s in changed["jobs"]["security-workflows-policy"]["steps"] if s["name"] == name)
+        step["env"]["DOWNSTREAM_CANDIDATE_SHA"] = "${{ github.event.pull_request.head.sha }}"
+        with self.assertRaises(AssertionError):
+            self._assert_closed(changed)
+        for scope in ("workflow", "job", "other-step"):
+            changed = copy.deepcopy(workflow)
+            job = changed["jobs"]["security-workflows-policy"]
+            step = next(s for s in job["steps"] if s["name"] == name)
+            target = changed if scope == "workflow" else job if scope == "job" else job["steps"][0]
+            target.setdefault("env", {}).update(step.pop("env"))
+            with self.subTest(scope=scope), self.assertRaises(AssertionError):
+                self._assert_closed(changed)
+        changed = copy.deepcopy(workflow)
+        changed["jobs"]["security-workflows-policy"]["steps"][3]["run"] += command
+        with self.assertRaises(AssertionError):
+            self._assert_closed(changed)
 
     def test_policy_test_git_environments_are_exact_and_step_scoped(self) -> None:
         workflow = self._workflow()
