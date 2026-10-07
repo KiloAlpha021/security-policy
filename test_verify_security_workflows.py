@@ -2419,6 +2419,11 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 "GIT_CONFIG_KEY_0": "core.autocrlf",
                 "GIT_CONFIG_VALUE_0": "false",
             },
+            "Run legacy protected health": {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.autocrlf",
+                "GIT_CONFIG_VALUE_0": "false",
+            },
         }
         self.assertEqual({step["name"] for step in steps if "env" in step},
                          set(expected_env) | set(fixed_env) |
@@ -2514,7 +2519,7 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
     def test_current_workflow_has_closed_ast_and_structure(self) -> None:
         self._assert_closed(self._workflow())
 
-    def test_stage_a_git_environment_is_exact_and_step_scoped(self) -> None:
+    def test_policy_test_git_environments_are_exact_and_step_scoped(self) -> None:
         workflow = self._workflow()
         steps = workflow["jobs"]["security-workflows-policy"]["steps"]
         by_name = {step["name"]: step for step in steps}
@@ -2523,7 +2528,8 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
             "GIT_CONFIG_KEY_0": "core.autocrlf",
             "GIT_CONFIG_VALUE_0": "false",
         }
-        self.assertEqual(by_name["Run candidate Stage A evidence"]["env"], expected)
+        for name in ("Run candidate Stage A evidence", "Run legacy protected health"):
+            self.assertEqual(by_name[name]["env"], expected)
 
         mutations = (
             lambda env: env.pop("GIT_CONFIG_COUNT"),
@@ -2535,18 +2541,22 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
         for mutate in mutations:
             candidate = copy.deepcopy(workflow)
             candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
-            candidate_step = next(step for step in candidate_steps
-                                  if step["name"] == "Run candidate Stage A evidence")
-            mutate(candidate_step["env"])
-            with self.subTest(env=candidate_step["env"]), self.assertRaises(AssertionError):
-                self._assert_closed(candidate)
+            for name in ("Run candidate Stage A evidence", "Run legacy protected health"):
+                candidate = copy.deepcopy(workflow)
+                candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
+                candidate_step = next(step for step in candidate_steps
+                                      if step["name"] == name)
+                mutate(candidate_step["env"])
+                with self.subTest(step=name, env=candidate_step["env"]), \
+                     self.assertRaises(AssertionError):
+                    self._assert_closed(candidate)
 
         candidate = copy.deepcopy(workflow)
         candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
         stage_a = next(step for step in candidate_steps
                        if step["name"] == "Run candidate Stage A evidence")
         unauthorized = next(step for step in candidate_steps
-                            if step["name"] == "Run legacy protected health")
+                            if step["name"] == "Test independent root policy")
         unauthorized["env"] = stage_a.pop("env")
         with self.assertRaises(AssertionError):
             self._assert_closed(candidate)
