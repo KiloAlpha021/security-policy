@@ -85,8 +85,23 @@ jobs:
           python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate --event-name "${{ github.event_name }}" --repository "${{ github.repository }}" --base-repository "${{ github.event.pull_request.base.repo.full_name || github.repository }}" --base-branch "${{ github.event.pull_request.base.ref || 'main' }}" --candidate-sha "${{ github.sha }}" --protected-sha "${{ steps.protected-git.outputs.protected-sha }}" --candidate-root "${{ github.workspace }}/candidate" --protected-root "${{ github.workspace }}/policy" --event-ref "${{ github.ref }}" --default-branch "${{ github.event.repository.default_branch || 'main' }}" --workflow-ref "${{ github.workflow_ref }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Resolve exact B3 proposal identities
+      - name: Classify B3 preprocessing topology
         if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'
+        id: b3-applicability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $eSha = "${{ github.event.pull_request.head.sha }}"
+          if ($eSha -notmatch '^[0-9a-f]{40}$') { throw 'Missing or malformed B3 candidate SHA' }
+          $parents = @(git -C "${{ github.workspace }}/candidate" rev-list --parents -n 1 $eSha)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $fields = $parents.Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          if ($fields.Count -lt 2 -or $fields[0] -ne $eSha) { throw 'Malformed B3 candidate topology' }
+          $b3Enabled = $fields.Count -gt 2
+          "b3-applicable=$($b3Enabled.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Resolve exact B3 proposal identities
+        if: steps.b3-applicability.outputs.b3-applicable == 'true'
         id: b3-identities
         shell: pwsh
         run: |
@@ -107,7 +122,7 @@ jobs:
           "p-sha=$pSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Check out exact B3 establishment proposal E
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'
+        if: steps.b3-applicability.outputs.b3-applicable == 'true'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: KiloAlpha021/security-policy
@@ -116,7 +131,7 @@ jobs:
           path: e-candidate
 
       - name: Check out exact selected B1 provenance P
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'
+        if: steps.b3-applicability.outputs.b3-applicable == 'true'
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: KiloAlpha021/security-policy
@@ -149,7 +164,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Enforce exact DESIGN-B terminal admission
-        if: steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'
+        if: steps.b3-applicability.outputs.b3-applicable == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
