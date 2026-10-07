@@ -351,13 +351,6 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $observedHead = (git -C $candidateRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from authorized candidate SHA' }
-$workflowPath = '.github/workflows/security-workflows-policy.yml'
-$expectedBlob = (git -C $candidateRoot rev-parse "${candidateSha}:$workflowPath").Trim()
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-if ($expectedBlob -notmatch '^[0-9a-f]{40}$') { throw 'Malformed committed candidate workflow blob' }
-$actualBlob = (git -C $candidateRoot hash-object --no-filters $workflowPath).Trim()
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from exact committed Git blob' }
 """)
         self.assertNotIn('${{ github.workspace }}/policy', preparation_run)
         self.assertTrue(invocation.startswith(" evaluate "))
@@ -489,8 +482,6 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
              '"${{ github.workspace }}/candidate/protected_policy_bootstrap.py" admit-maintenance'),
             ("config core.autocrlf false", "config core.autocrlf true"),
             ("reset --hard $candidateSha", "reset --hard HEAD"),
-            ("hash-object --no-filters $workflowPath", "hash-object $workflowPath"),
-            ("if ($actualBlob -ne $expectedBlob)", "if ($actualBlob -eq $expectedBlob)"),
             ('$candidateSha = "${{ github.sha }}"',
              '$candidateSha = "${{ github.event.pull_request.head.sha }}"'),
             (" --require-hashes", ""), (" --only-binary=:all:", ""),
@@ -1842,11 +1833,142 @@ class ProtectedBootstrapP0b1Tests(unittest.TestCase):
         for option in ("--repository", "--base-repository"):
             downstream_arguments[downstream_arguments.index(option) + 1] = (
                 bootstrap.DOWNSTREAM_REPOSITORY)
+        downstream_arguments[downstream_arguments.index("--workflow-ref") + 1] = (
+            bootstrap.REPOSITORY + "/" + bootstrap.CANDIDATE_BASELINE_PATH + "@refs/heads/main")
         completed = self.run_cli(downstream_arguments, downstream_output)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(b"evaluation-context=DOWNSTREAM_SECURITY_WORKFLOWS\n",
                       downstream_output.read_bytes())
         self.assertIn(b"policy-source=policy\n", downstream_output.read_bytes())
+
+    def _downstream_profile_arguments(self) -> list[str]:
+        git(self.candidate, "rm", "-r", ".")
+        profile = self.candidate / "profiles/example/profile.json"
+        profile.parent.mkdir(parents=True)
+        profile.write_bytes(b"{}\n")
+        git(self.candidate, "add", ".")
+        git(self.candidate, "commit", "-m", "profile-only downstream")
+        self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        arguments = self.cli_arguments()
+        for option, value in {
+                "--repository": bootstrap.DOWNSTREAM_REPOSITORY,
+                "--base-repository": bootstrap.DOWNSTREAM_REPOSITORY,
+                "--workflow-ref": (bootstrap.REPOSITORY + "/" + bootstrap.CANDIDATE_BASELINE_PATH
+                                   + "@refs/heads/main"),
+        }.items():
+            arguments[arguments.index(option) + 1] = value
+        return arguments
+
+    def test_downstream_profile_only_uses_protected_baseline_and_plan(self) -> None:
+        arguments = self._downstream_profile_arguments()
+        self.assertFalse((self.candidate / bootstrap.CANDIDATE_BASELINE_PATH).exists())
+        output = Path(self.temp.name).resolve() / "downstream-profile-output"
+        for event, ref in (("pull_request", "refs/pull/64/merge"),
+                           ("merge_group", "refs/heads/gh-readonly-queue/main/pr-64-test")):
+            with self.subTest(event=event):
+                arguments[arguments.index("--event-name") + 1] = event
+                arguments[arguments.index("--event-ref") + 1] = ref
+                output.write_bytes(b"")
+                completed = self.run_cli(arguments, output)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(b"evaluation-context=DOWNSTREAM_SECURITY_WORKFLOWS\n", output.read_bytes())
+                self.assertIn(b"policy-source=policy\n", output.read_bytes())
+                self.assertIn(b"version-disposition=SAME_VERSION\n", output.read_bytes())
+        inputs = bootstrap._cli_inputs(bootstrap._parser().parse_args(arguments))
+        result = bootstrap.evaluate(inputs)
+        plan = bootstrap.derive_model_d_plan(result)
+        self.assertIs(plan.candidate_evidence, bootstrap.CandidateEvidenceDisposition.SKIP)
+        self.assertIs(plan.protected_evidence, bootstrap.ProtectedEvidenceDisposition.TEST_INDEPENDENT_POLICY)
+        self.assertIs(plan.downstream_validation, bootstrap.DownstreamValidationDisposition.RUN)
+        self.assertIs(plan.policy_lock_source, bootstrap.PolicySource.POLICY)
+        self.assertIs(plan.audit_lock_source, bootstrap.PolicySource.POLICY)
+
+    def test_downstream_never_falls_back_to_candidate_baseline(self) -> None:
+        arguments = self._downstream_profile_arguments()
+        candidate_workflow = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        candidate_workflow.parent.mkdir(parents=True)
+        candidate_workflow.write_bytes(b"  POLICY_BASELINE_VERSION: SECURITY-POLICY-BASELINE-2\n")
+        output = Path(self.temp.name).resolve() / "no-fallback-output"
+        output.write_bytes(b"")
+        completed = self.run_cli(arguments, output)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"version-disposition=SAME_VERSION\n", output.read_bytes())
+        protected_workflow = self.protected / bootstrap.CANDIDATE_BASELINE_PATH
+        original = protected_workflow.read_bytes()
+        for raw in (None, original + b"# uncommitted mutation\n", original.replace(b"\n", b"\r\n")):
+            with self.subTest(raw=raw):
+                if raw is None:
+                    protected_workflow.unlink()
+                else:
+                    protected_workflow.write_bytes(raw)
+                output.write_bytes(b"")
+                completed = self.run_cli(arguments, output)
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(output.read_bytes(), b"")
+        protected_workflow.write_bytes(candidate_workflow.read_bytes())
+        git(self.protected, "add", ".")
+        git(self.protected, "commit", "-m", "unsupported downstream successor")
+        revision = git(self.protected, "rev-parse", "HEAD")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", revision)
+        arguments[arguments.index("--protected-sha") + 1] = revision
+        completed = self.run_cli(arguments, output)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("Successor proposal requires self-PR context", completed.stderr)
+
+    def test_downstream_source_binding_and_root_identity_reject_substitution(self) -> None:
+        arguments = self._downstream_profile_arguments()
+        output = Path(self.temp.name).resolve() / "binding-output"
+        for option, value in (
+                ("--repository", "KiloAlpha021/other"),
+                ("--base-repository", bootstrap.REPOSITORY),
+                ("--base-branch", "other"), ("--default-branch", "other"),
+                ("--event-name", "push"), ("--event-name", "workflow_dispatch"),
+                ("--event-ref", "refs/heads/main"), ("--event-ref", "refs/pull/64/head"),
+                ("--event-ref", "refs/pull/64/merge\n"),
+                ("--workflow-ref", bootstrap.DOWNSTREAM_REPOSITORY + "/"
+                 + bootstrap.CANDIDATE_BASELINE_PATH + "@refs/heads/main"),
+                ("--workflow-ref", bootstrap.REPOSITORY + "/"
+                 + bootstrap.CANDIDATE_BASELINE_PATH + "@refs/heads/other"),
+                ("--candidate-sha", "a" * 40), ("--protected-sha", "b" * 40),
+                ("--candidate-root", str(self.protected)),
+                ("--protected-root", str(self.candidate)),
+                ("--protected-root", str(self.protected / "missing")),
+        ):
+            with self.subTest(option=option, value=value):
+                changed = arguments.copy()
+                changed[changed.index(option) + 1] = value
+                output.write_bytes(b"")
+                completed = self.run_cli(changed, output)
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(output.read_bytes(), b"")
+        for root, remote in ((self.candidate, bootstrap.DOWNSTREAM_REPOSITORY),
+                             (self.protected, bootstrap.REPOSITORY)):
+            with self.subTest(remote=root):
+                git(root, "remote", "set-url", "origin", "https://github.com/KiloAlpha021/other.git")
+                output.write_bytes(b"")
+                self.assertEqual(self.run_cli(arguments, output).returncode, 2)
+                self.assertEqual(output.read_bytes(), b"")
+                git(root, "remote", "set-url", "origin", "https://github.com/" + remote + ".git")
+
+    def test_self_pr_baseline_requires_exact_committed_candidate_workflow(self) -> None:
+        workflow = self.candidate / bootstrap.CANDIDATE_BASELINE_PATH
+        original = workflow.read_bytes()
+        output = Path(self.temp.name).resolve() / "self-strict-output"
+        for raw in (None, original + b"# otherwise valid baseline\n",
+                    original.replace(b"\n", b"\r\n")):
+            with self.subTest(raw=raw):
+                if raw is None:
+                    workflow.unlink()
+                else:
+                    workflow.write_bytes(raw)
+                output.write_bytes(b"")
+                completed = self.run_cli(destination=output)
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(output.read_bytes(), b"")
+        workflow.write_bytes(original)
+        self.assertEqual(self.run_cli(destination=output).returncode, 0)
 
     def test_p0a_api_and_authority_boundary_remain_closed(self) -> None:
         self.assertFalse(hasattr(bootstrap.BootstrapInputs, "policy_source"))
@@ -2144,7 +2266,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Classify B3 preprocessing topology": ("git", "Out-File"),
         "Resolve exact B3 proposal identities": ("git", "python", "Out-File", "Out-File"),
         "Enforce exact DESIGN-B terminal admission": ("python",),
-        "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "python"),
+        "Resolve protected bootstrap authority": ("git", "git", "git", "python"),
         "Assert protected bootstrap outputs": (),
         "Enforce exact Model D maintenance admission": ("python",),
         "Resolve protected Model D orchestration": ("python",),
@@ -2169,7 +2291,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Classify B3 preprocessing topology": "5966862e1c107834f8b883bf10e1d816a0d1384256bf9953e1bda8c8d189eb50",
         "Resolve exact B3 proposal identities": "85e9480bc77b27871892d2f6f99f8dda934a59fb798351b1679593c2cbb61dec",
         "Enforce exact DESIGN-B terminal admission": "624d07da700b166d38005a31c72cbb95afe780cf94081748aebb4f5da9b2f8fd",
-        "Resolve protected bootstrap authority": "1033bc372e862723b7301df8269c8d55268af0263a4049e665c44a2bd491e9d1",
+        "Resolve protected bootstrap authority": "21dee7b931b3d137e3512b27c79ff38cf2c9eb1fc49037b80cecabe06b05c2ac",
         "Enforce exact Model D maintenance admission": "a27a6cb21b57491d4f10396fcd1e05d9f1db6cc2e3570a5b6c28b2828c6fab66",
         "Resolve protected Model D orchestration": "55508070002061086a43cc0996f426eda44cb46106fb1094c77bcb7cd3885713",
         "Install isolated hash-locked policy environment": "ee8dac9367b0f079fcccfb636cceee965b4802e963649a1645a5da2be9fb3520",
@@ -2198,7 +2320,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Acquire protected Git identity": "320593180ff57d38faec11febbe67cf71e3b903ef323baf07f8150ce28aec235",
         "Classify B3 preprocessing topology": "5613ee52d7bba552cf58488775e5bbf12c6ab0c819aafa7241dbdfe1ce43ac3a",
         "Resolve exact B3 proposal identities": "ea68267ec2ebaa3edb2418ab0e26adf76f576a5fbdf95761535eeb4cd52acf2e",
-        "Resolve protected bootstrap authority": "7345417463fdbf2b043e1c7a229cc9ce631efc2c8de8348111022a2d6e8df5d6",
+        "Resolve protected bootstrap authority": "2c5c7c05ca40452951d55fedd6dd00f07d5b5567d70e43b13297595fa7f0401d",
     }
     _STOP_ASSIGNMENT_DIGEST = "a6ff9ace77f1623d434a131b94c045ea59228ca4c1afaffe3900356c386bb1a5"
     _IF = {
@@ -2244,8 +2366,6 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         ),
         "Resolve protected bootstrap authority": (
             "$observedHead -ne $candidateSha",
-            "$expectedBlob -notmatch '^[0-9a-f]{40}$'",
-            "$actualBlob -ne $expectedBlob",
         ),
         "Assert protected bootstrap outputs": (
             "$env:EVALUATION_CONTEXT -notin @('SELF_PR_BOOTSTRAP', 'STAGE_A_PROTECTED_PROOF', 'DOWNSTREAM_SECURITY_WORKFLOWS')",
@@ -2266,10 +2386,10 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         ),
     }
     _VARIABLES = frozenset({
-        "actualBlob", "candidateRoot", "candidateSha", "ErrorActionPreference",
+        "candidateRoot", "candidateSha", "ErrorActionPreference",
         "bootstrap", "b3Enabled", "eSha", "parents", "fields", "proposedP", "pSha",
-        "expectedBlob", "LASTEXITCODE", "observedHead", "protectedSha",
-        "pythonVersion", "workflowPath", "env:GITHUB_OUTPUT",
+        "LASTEXITCODE", "observedHead", "protectedSha",
+        "pythonVersion", "env:GITHUB_OUTPUT",
         "env:AUDIT_LOCK_SOURCE", "env:CANDIDATE_EVIDENCE", "env:D0_CONTEXT",
         "env:D0_SOURCE", "env:D0_VERSION", "env:DOWNSTREAM_VALIDATION",
         "env:EVALUATION_CONTEXT", "env:MODEL_D_CONTEXT", "env:MODEL_D_OWNER",
@@ -2281,8 +2401,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _ASSIGNMENTS = frozenset({
         "$ErrorActionPreference", "$pythonVersion", "$protectedSha", "$bootstrap",
         "$b3Enabled", "$eSha", "$parents", "$fields", "$proposedP", "$pSha",
-        "$candidateRoot", "$candidateSha", "$observedHead", "$workflowPath",
-        "$expectedBlob", "$actualBlob",
+        "$candidateRoot", "$candidateSha", "$observedHead",
     })
     _INSPECTOR = r'''
 $ErrorActionPreference = 'Stop'
