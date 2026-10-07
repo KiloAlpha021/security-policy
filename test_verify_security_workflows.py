@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -301,10 +302,12 @@ def duplicate():
         expected = [
             "Check out exact candidate", "Check out independent root policy", "Set up CPython",
             "Assert exact CPython runtime", "Acquire protected Git identity",
+            "Resolve protected bootstrap authority",
+            "Classify B3 preprocessing topology",
             "Resolve exact B3 proposal identities",
             "Check out exact B3 establishment proposal E",
             "Check out exact selected B1 provenance P",
-            "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
+            "Assert protected bootstrap outputs",
             "Enforce exact Model D maintenance admission",
             "Enforce exact DESIGN-B terminal admission",
             "Resolve protected Model D orchestration", "Assert protected Model D outputs",
@@ -359,7 +362,9 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         self.assertNotIn('${{ github.workspace }}/policy', preparation_run)
         self.assertTrue(invocation.startswith(" evaluate "))
         self.assertEqual(names.index("Resolve protected bootstrap authority"),
-                         names.index("Check out exact selected B1 provenance P") + 1)
+                         names.index("Acquire protected Git identity") + 1)
+        self.assertEqual(names.index("Resolve exact B3 proposal identities"),
+                         names.index("Classify B3 preprocessing topology") + 1)
         self.assertIn('python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate', bootstrap_run)
         self.assertNotIn("candidate/protected_policy_bootstrap.py", bootstrap_run)
         for argument in (
@@ -883,6 +888,59 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
             self.assertEqual(bootstrap.extract_candidate_baseline(candidate),
                              bootstrap.CURRENT_BASELINE)
             self.assertEqual(sentinel.read_bytes(), b"protected\n")
+
+    def test_candidate_workflow_has_durable_canonical_representation(self) -> None:
+        root = Path(__file__).parent.resolve()
+        relative = bootstrap.CANDIDATE_BASELINE_PATH
+        workflow_path = root / relative
+        attributes_path = root / ".gitattributes"
+
+        def canonical(data: bytes) -> bool:
+            if (not data or data.startswith(b"\xef\xbb\xbf") or b"\x00" in data or
+                    b"\r" in data or not data.endswith(b"\n") or
+                    data.endswith(b"\n\n")):
+                return False
+            try:
+                data.decode("utf-8", errors="strict")
+            except UnicodeError:
+                return False
+            return True
+
+        data = workflow_path.read_bytes()
+        self.assertTrue(canonical(data))
+        self.assertEqual(
+            attributes_path.read_bytes(),
+            b".github/workflows/security-workflows-policy.yml text eol=lf\n",
+        )
+        attributes = git(root, "check-attr", "text", "eol", "--", relative).splitlines()
+        self.assertEqual(attributes, [f"{relative}: text: set", f"{relative}: eol: lf"])
+
+        for label, changed in (
+            ("crlf", data.replace(b"\n", b"\r\n", 1)),
+            ("bom", b"\xef\xbb\xbf" + data),
+            ("nul", b"\x00" + data),
+            ("missing-newline", data.removesuffix(b"\n")),
+            ("extra-newline", data + b"\n"),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(canonical(changed))
+
+        with tempfile.TemporaryDirectory(prefix="canonical-workflow-") as directory:
+            checkout = Path(directory)
+            git(checkout, "init", "-b", "main")
+            git(checkout, "config", "user.name", "Canonical Test")
+            git(checkout, "config", "user.email", "canonical@example.invalid")
+            git(checkout, "config", "core.autocrlf", "true")
+            target = checkout / relative
+            target.parent.mkdir(parents=True)
+            (checkout / ".gitattributes").write_bytes(attributes_path.read_bytes())
+            target.write_bytes(data)
+            git(checkout, "add", ".gitattributes", relative)
+            git(checkout, "commit", "-m", "canonical")
+            target.unlink()
+            git(checkout, "checkout", "--", relative)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertNotIn(b"\r", target.read_bytes())
 
     def test_all_pwsh_blocks_parse_executably(self) -> None:
         workflow = yaml.load(
@@ -2083,6 +2141,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _COMMANDS = {
         "Assert exact CPython runtime": ("python",),
         "Acquire protected Git identity": ("git", "Out-File", "Get-Content", "Out-File"),
+        "Classify B3 preprocessing topology": ("git", "Out-File"),
         "Resolve exact B3 proposal identities": ("git", "python", "Out-File", "Out-File"),
         "Enforce exact DESIGN-B terminal admission": ("python",),
         "Resolve protected bootstrap authority": ("git", "git", "git", "git", "git", "python"),
@@ -2107,6 +2166,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _COMMAND_DIGESTS = {
         "Assert exact CPython runtime": "ff4765d5070a8f20c672195931f3296bd7f98d025cc603a3253336a1909ef10a",
         "Acquire protected Git identity": "42f84cc61849df6f624e89aec24b79d879613e3ee90093e7419a088f8a99fc9f",
+        "Classify B3 preprocessing topology": "5966862e1c107834f8b883bf10e1d816a0d1384256bf9953e1bda8c8d189eb50",
         "Resolve exact B3 proposal identities": "85e9480bc77b27871892d2f6f99f8dda934a59fb798351b1679593c2cbb61dec",
         "Enforce exact DESIGN-B terminal admission": "624d07da700b166d38005a31c72cbb95afe780cf94081748aebb4f5da9b2f8fd",
         "Resolve protected bootstrap authority": "1033bc372e862723b7301df8269c8d55268af0263a4049e665c44a2bd491e9d1",
@@ -2123,6 +2183,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     }
     _EXPRESSION_DIGESTS = {
         "Acquire protected Git identity": "626f38d5235646eebb8630cef6a809250712768735127c17c93ea94bcc65fb15",
+        "Classify B3 preprocessing topology": "662649d4e9fe6e796b216b59ab87d9fd1d5d6a9229d2a76c8b42d32d595d6b7e",
         "Resolve exact B3 proposal identities": "4bc0bbaf4a3b93b158c80966d4c245a28cb5a621c85bb7d462a38433f6155878",
         "Enforce exact DESIGN-B terminal admission": "d96cbb766649076440ed894b7c091515c566b09a1800d22cd2119d24b27aacbe",
         "Resolve protected bootstrap authority": "d10fe55d40daab7b732dc2414601063a036a64f8fd75abe71ecfa089546a4ff2",
@@ -2135,6 +2196,7 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
     _ASSIGNMENT_DIGESTS = {
         "Assert exact CPython runtime": "d28dad29c037f617afecde27704bef3d358314acff79e6e0dc6e838ef68ddbab",
         "Acquire protected Git identity": "320593180ff57d38faec11febbe67cf71e3b903ef323baf07f8150ce28aec235",
+        "Classify B3 preprocessing topology": "5613ee52d7bba552cf58488775e5bbf12c6ab0c819aafa7241dbdfe1ce43ac3a",
         "Resolve exact B3 proposal identities": "ea68267ec2ebaa3edb2418ab0e26adf76f576a5fbdf95761535eeb4cd52acf2e",
         "Resolve protected bootstrap authority": "7345417463fdbf2b043e1c7a229cc9ce631efc2c8de8348111022a2d6e8df5d6",
     }
@@ -2143,13 +2205,15 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Enforce exact Model D maintenance admission":
             "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'",
         "Resolve exact B3 proposal identities":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
-        "Check out exact B3 establishment proposal E":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
-        "Check out exact selected B1 provenance P":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
-        "Enforce exact DESIGN-B terminal admission":
+            "steps.b3-applicability.outputs.b3-applicable == 'true'",
+        "Classify B3 preprocessing topology":
             "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'",
+        "Check out exact B3 establishment proposal E":
+            "steps.b3-applicability.outputs.b3-applicable == 'true'",
+        "Check out exact selected B1 provenance P":
+            "steps.b3-applicability.outputs.b3-applicable == 'true'",
+        "Enforce exact DESIGN-B terminal admission":
+            "steps.b3-applicability.outputs.b3-applicable == 'true'",
         "Run candidate Stage A evidence":
             "steps.protected-model-d.outputs.candidate-evidence == 'RUN_CANDIDATE_STAGE_A_EVIDENCE'",
         "Run legacy protected health":
@@ -2166,6 +2230,10 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Acquire protected Git identity": (
             "$protectedSha -notmatch '^[0-9a-f]{40}$'",
             "[regex]::Matches($bootstrap, '(?m)^[ \\t]*B3_ENABLEMENT[ \\t]*=').Count -gt 1",
+        ),
+        "Classify B3 preprocessing topology": (
+            "$eSha -notmatch '^[0-9a-f]{40}$'",
+            "$fields.Count -lt 2 -or $fields[0] -ne $eSha",
         ),
         "Resolve exact B3 proposal identities": (
             "$eSha -notmatch '^[0-9a-f]{40}$'",
@@ -2297,10 +2365,12 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
         self.assertEqual([step["name"] for step in steps], [
             "Check out exact candidate", "Check out independent root policy",
             "Set up CPython", "Assert exact CPython runtime",
-            "Acquire protected Git identity", "Resolve exact B3 proposal identities",
+            "Acquire protected Git identity", "Resolve protected bootstrap authority",
+            "Classify B3 preprocessing topology",
+            "Resolve exact B3 proposal identities",
             "Check out exact B3 establishment proposal E",
             "Check out exact selected B1 provenance P",
-            "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
+            "Assert protected bootstrap outputs",
             "Enforce exact Model D maintenance admission",
             "Enforce exact DESIGN-B terminal admission",
             "Resolve protected Model D orchestration", "Assert protected Model D outputs",
@@ -2345,8 +2415,21 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 "DOWNSTREAM_VALIDATION": "downstream-validation",
             },
         }
+        fixed_env = {
+            "Run candidate Stage A evidence": {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.autocrlf",
+                "GIT_CONFIG_VALUE_0": "false",
+            },
+            "Run legacy protected health": {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.autocrlf",
+                "GIT_CONFIG_VALUE_0": "false",
+            },
+        }
         self.assertEqual({step["name"] for step in steps if "env" in step},
-                         set(expected_env) | {"Apply protected Stage A baseline to candidate target"})
+                         set(expected_env) | set(fixed_env) |
+                         {"Apply protected Stage A baseline to candidate target"})
         by_name = {step["name"]: step for step in steps}
         for name, keys in expected_env.items():
             expected = {}
@@ -2354,6 +2437,8 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 source = ("protected-bootstrap" if name == "Assert protected bootstrap outputs"
                           or key.startswith("D0_") else "protected-model-d")
                 expected[key] = "${{ steps." + source + ".outputs." + output + " }}"
+            self.assertEqual(by_name[name]["env"], expected)
+        for name, expected in fixed_env.items():
             self.assertEqual(by_name[name]["env"], expected)
         self.assertEqual(set(by_name["Apply protected Stage A baseline to candidate target"]["env"]), {
             "POLICY_CANDIDATE_ROOT", "POLICY_PROTECTED_ROOT", "POLICY_EXPECTED_REPOSITORY",
@@ -2365,6 +2450,7 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
             "Acquire protected Git identity": "protected-git",
             "Resolve exact B3 proposal identities": "b3-identities",
             "Resolve protected bootstrap authority": "protected-bootstrap",
+            "Classify B3 preprocessing topology": "b3-applicability",
             "Resolve protected Model D orchestration": "protected-model-d",
         })
         self.assertEqual(steps[0]["with"]["path"], "candidate")
@@ -2410,6 +2496,8 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 "Acquire protected Git identity": [
                     '"protected-sha=$protectedSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append',
                     '"b3-enabled=$($b3Enabled.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'],
+                "Classify B3 preprocessing topology": [
+                    '"b3-applicable=$($b3Enabled.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'],
                 "Resolve exact B3 proposal identities": [
                     '"e-sha=$eSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append',
                     '"p-sha=$pSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append'],
@@ -2432,6 +2520,48 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
 
     def test_current_workflow_has_closed_ast_and_structure(self) -> None:
         self._assert_closed(self._workflow())
+
+    def test_policy_test_git_environments_are_exact_and_step_scoped(self) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        by_name = {step["name"]: step for step in steps}
+        expected = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.autocrlf",
+            "GIT_CONFIG_VALUE_0": "false",
+        }
+        for name in ("Run candidate Stage A evidence", "Run legacy protected health"):
+            self.assertEqual(by_name[name]["env"], expected)
+
+        mutations = (
+            lambda env: env.pop("GIT_CONFIG_COUNT"),
+            lambda env: env.__setitem__("GIT_CONFIG_COUNT", "2"),
+            lambda env: env.__setitem__("GIT_CONFIG_KEY_0", "core.eol"),
+            lambda env: env.__setitem__("GIT_CONFIG_VALUE_0", "true"),
+            lambda env: env.__setitem__("GIT_CONFIG_KEY_1", "core.safecrlf"),
+        )
+        for mutate in mutations:
+            candidate = copy.deepcopy(workflow)
+            candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
+            for name in ("Run candidate Stage A evidence", "Run legacy protected health"):
+                candidate = copy.deepcopy(workflow)
+                candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
+                candidate_step = next(step for step in candidate_steps
+                                      if step["name"] == name)
+                mutate(candidate_step["env"])
+                with self.subTest(step=name, env=candidate_step["env"]), \
+                     self.assertRaises(AssertionError):
+                    self._assert_closed(candidate)
+
+        candidate = copy.deepcopy(workflow)
+        candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
+        stage_a = next(step for step in candidate_steps
+                       if step["name"] == "Run candidate Stage A evidence")
+        unauthorized = next(step for step in candidate_steps
+                            if step["name"] == "Test independent root policy")
+        unauthorized["env"] = stage_a.pop("env")
+        with self.assertRaises(AssertionError):
+            self._assert_closed(candidate)
 
     def test_comments_and_string_text_do_not_create_ast_authority(self) -> None:
         workflow = self._workflow()
@@ -4297,10 +4427,23 @@ class S2CCorrectionTests(unittest.TestCase):
         self.assertEqual(detector["id"], "protected-git")
         self.assertEqual(
             by_name["Resolve exact B3 proposal identities"]["if"],
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'")
+            "steps.b3-applicability.outputs.b3-applicable == 'true'")
+        self.assertEqual(
+            by_name["Classify B3 preprocessing topology"]["if"],
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'")
+        self.assertEqual(
+            by_name["Check out exact B3 establishment proposal E"]["if"],
+            "steps.b3-applicability.outputs.b3-applicable == 'true'")
+        self.assertEqual(
+            by_name["Check out exact selected B1 provenance P"]["if"],
+            "steps.b3-applicability.outputs.b3-applicable == 'true'")
+        step_names = [step["name"] for step in steps]
+        self.assertLess(
+            step_names.index("Resolve protected bootstrap authority"),
+            step_names.index("Resolve exact B3 proposal identities"))
         self.assertEqual(
             by_name["Enforce exact DESIGN-B terminal admission"]["if"],
-            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'")
+            "steps.b3-applicability.outputs.b3-applicable == 'true'")
         self.assertEqual(
             by_name["Enforce exact Model D maintenance admission"]["if"],
             "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'")
@@ -4370,6 +4513,83 @@ class S2CCorrectionTests(unittest.TestCase):
             code, recorded, diagnostic = execute(exact_s1)
             self.assertEqual(code, 0, diagnostic)
             self.assertIn("b3-enabled=false", recorded)
+
+    def test_b3_topology_prefilter_routes_once_and_leaves_authority_to_admission(self) -> None:
+        workflow = yaml.safe_load(
+            (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml")
+            .read_text(encoding="utf-8"))
+        steps = {step["name"]: step for step in
+                 workflow["jobs"]["security-workflows-policy"]["steps"]}
+        classifier = steps["Classify B3 preprocessing topology"]
+        routed = "steps.b3-applicability.outputs.b3-applicable == 'true'"
+        self.assertEqual(
+            classifier["if"],
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'",
+        )
+        for name in (
+            "Resolve exact B3 proposal identities",
+            "Check out exact B3 establishment proposal E",
+            "Check out exact selected B1 provenance P",
+            "Enforce exact DESIGN-B terminal admission",
+        ):
+            self.assertEqual(steps[name]["if"], routed)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            candidate = workspace / "candidate"
+            candidate.mkdir()
+            git(candidate, "init", "-b", "main")
+            git(candidate, "config", "user.name", "B3 Applicability Test")
+            git(candidate, "config", "user.email", "b3-applicability@example.invalid")
+            tree = git(candidate, "write-tree")
+
+            def commit(*parents: str) -> str:
+                command = ["git", "-C", str(candidate), "commit-tree", tree]
+                for parent in parents:
+                    command.extend(("-p", parent))
+                return subprocess.run(
+                    command, input="candidate\n", check=True, capture_output=True,
+                    text=True, env={**os.environ,
+                                    "GIT_AUTHOR_NAME": "B3 Applicability Test",
+                                    "GIT_AUTHOR_EMAIL": "b3-applicability@example.invalid",
+                                    "GIT_COMMITTER_NAME": "B3 Applicability Test",
+                                    "GIT_COMMITTER_EMAIL": "b3-applicability@example.invalid"},
+                ).stdout.strip()
+
+            root = commit()
+            ordinary = commit(root)
+            selected_p = commit(root)
+            establishment = commit(root, selected_p)
+            extra_parent = commit(root, selected_p, ordinary)
+            output = workspace / "GITHUB_OUTPUT"
+
+            def execute(revision: str) -> tuple[int, str, str]:
+                output.unlink(missing_ok=True)
+                script = classifier["run"].replace(
+                    "${{ github.workspace }}", workspace.as_posix()).replace(
+                    "${{ github.event.pull_request.head.sha }}", revision)
+                completed = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+                    env={**os.environ, "GITHUB_OUTPUT": str(output)},
+                    capture_output=True, text=True,
+                )
+                recorded = output.read_text(encoding="utf-8") if output.exists() else ""
+                return completed.returncode, recorded, completed.stderr + completed.stdout
+
+            code, recorded, diagnostic = execute(ordinary)
+            self.assertEqual(code, 0, diagnostic)
+            self.assertEqual(recorded.splitlines(), ["b3-applicable=false"])
+            code, recorded, diagnostic = execute(establishment)
+            self.assertEqual(code, 0, diagnostic)
+            self.assertEqual(recorded.splitlines(), ["b3-applicable=true"])
+            code, recorded, diagnostic = execute(extra_parent)
+            self.assertEqual(code, 0, diagnostic)
+            self.assertEqual(recorded.splitlines(), ["b3-applicable=true"])
+            for malformed in (root, "x" * 40):
+                with self.subTest(malformed=malformed):
+                    code, recorded, _ = execute(malformed)
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(recorded, "")
 
     def test_attribution_parser_accepts_exact_record_and_rejects_controls(self) -> None:
         root = Path(__file__).parent
