@@ -880,6 +880,59 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                              bootstrap.CURRENT_BASELINE)
             self.assertEqual(sentinel.read_bytes(), b"protected\n")
 
+    def test_candidate_workflow_has_durable_canonical_representation(self) -> None:
+        root = Path(__file__).parent.resolve()
+        relative = bootstrap.CANDIDATE_BASELINE_PATH
+        workflow_path = root / relative
+        attributes_path = root / ".gitattributes"
+
+        def canonical(data: bytes) -> bool:
+            if (not data or data.startswith(b"\xef\xbb\xbf") or b"\x00" in data or
+                    b"\r" in data or not data.endswith(b"\n") or
+                    data.endswith(b"\n\n")):
+                return False
+            try:
+                data.decode("utf-8", errors="strict")
+            except UnicodeError:
+                return False
+            return True
+
+        data = workflow_path.read_bytes()
+        self.assertTrue(canonical(data))
+        self.assertEqual(
+            attributes_path.read_bytes(),
+            b".github/workflows/security-workflows-policy.yml text eol=lf\n",
+        )
+        attributes = git(root, "check-attr", "text", "eol", "--", relative).splitlines()
+        self.assertEqual(attributes, [f"{relative}: text: set", f"{relative}: eol: lf"])
+
+        for label, changed in (
+            ("crlf", data.replace(b"\n", b"\r\n", 1)),
+            ("bom", b"\xef\xbb\xbf" + data),
+            ("nul", b"\x00" + data),
+            ("missing-newline", data.removesuffix(b"\n")),
+            ("extra-newline", data + b"\n"),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(canonical(changed))
+
+        with tempfile.TemporaryDirectory(prefix="canonical-workflow-") as directory:
+            checkout = Path(directory)
+            git(checkout, "init", "-b", "main")
+            git(checkout, "config", "user.name", "Canonical Test")
+            git(checkout, "config", "user.email", "canonical@example.invalid")
+            git(checkout, "config", "core.autocrlf", "true")
+            target = checkout / relative
+            target.parent.mkdir(parents=True)
+            (checkout / ".gitattributes").write_bytes(attributes_path.read_bytes())
+            target.write_bytes(data)
+            git(checkout, "add", ".gitattributes", relative)
+            git(checkout, "commit", "-m", "canonical")
+            target.unlink()
+            git(checkout, "checkout", "--", relative)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertNotIn(b"\r", target.read_bytes())
+
     def test_all_pwsh_blocks_parse_executably(self) -> None:
         workflow = yaml.load(
             (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
