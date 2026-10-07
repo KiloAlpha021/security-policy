@@ -845,23 +845,25 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                 candidate, "rev-parse", f"{merge_sha}:{bootstrap.CANDIDATE_BASELINE_PATH}")
 
             git(candidate, "config", "core.autocrlf", "true")
-            with mock.patch.dict(os.environ, {"GIT_CONFIG_VALUE_0": "true"}):
+            fixture_env = {key: os.environ.get(key) for key in
+                           ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")}
+            with mock.patch.dict(os.environ, {
+                    "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.autocrlf",
+                    "GIT_CONFIG_VALUE_0": "true"}):
                 workflow_path.unlink()
                 git(candidate, "checkout", "--", bootstrap.CANDIDATE_BASELINE_PATH)
                 self.assertIn(b"\r\n", workflow_path.read_bytes())
-                self.assertEqual(
-                    git(candidate, "hash-object", bootstrap.CANDIDATE_BASELINE_PATH),
-                    committed_blob,
-                )
+                self.assertEqual(git(candidate, "hash-object", bootstrap.CANDIDATE_BASELINE_PATH),
+                                 committed_blob)
                 self.assertNotEqual(
-                    git(candidate, "hash-object", "--no-filters",
-                        bootstrap.CANDIDATE_BASELINE_PATH),
+                    git(candidate, "hash-object", "--no-filters", bootstrap.CANDIDATE_BASELINE_PATH),
                     committed_blob,
                 )
                 with self.assertRaisesRegex(bootstrap.BootstrapError,
                                             "Invalid candidate baseline source bytes"):
                     bootstrap.extract_candidate_baseline(candidate)
-            self.assertEqual(os.environ["GIT_CONFIG_VALUE_0"], "false")
+            self.assertEqual(
+                {key: os.environ.get(key) for key in fixture_env}, fixture_env)
 
             workflow = yaml.load(
                 (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
@@ -4631,7 +4633,7 @@ class S2CCorrectionTests(unittest.TestCase):
             subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
                            check=True, capture_output=True)
             repo = repo.resolve(strict=True)
-            git(repo, "checkout", "--detach", self.S2)
+            git(repo, "-c", "core.autocrlf=false", "checkout", "--detach", self.S2)
             git(repo, "remote", "set-url", "origin",
                 "https://github.com/KiloAlpha021/security-policy.git")
             git(repo, "config", "core.autocrlf", "false")
