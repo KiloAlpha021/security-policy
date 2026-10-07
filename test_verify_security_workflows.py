@@ -4620,6 +4620,7 @@ class S2CCorrectionTests(unittest.TestCase):
             repo = Path(directory) / "policy"
             subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
                            check=True, capture_output=True)
+            repo = repo.resolve(strict=True)
             git(repo, "checkout", "--detach", self.S2)
             git(repo, "remote", "set-url", "origin",
                 "https://github.com/KiloAlpha021/security-policy.git")
@@ -4744,6 +4745,7 @@ class S2PSelectionTests(unittest.TestCase):
             repo = Path(directory) / "policy"
             subprocess.run(["git", "clone", "--quiet", str(source), str(repo)],
                            check=True, capture_output=True)
+            repo = repo.resolve(strict=True)
             git(repo, "config", "core.autocrlf", "false")
             git(repo, "checkout", "--detach", self.S2C)
             git(repo, "remote", "set-url", "origin",
