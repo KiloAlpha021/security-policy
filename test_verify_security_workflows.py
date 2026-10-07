@@ -301,10 +301,11 @@ def duplicate():
         expected = [
             "Check out exact candidate", "Check out independent root policy", "Set up CPython",
             "Assert exact CPython runtime", "Acquire protected Git identity",
+            "Resolve protected bootstrap authority",
             "Resolve exact B3 proposal identities",
             "Check out exact B3 establishment proposal E",
             "Check out exact selected B1 provenance P",
-            "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
+            "Assert protected bootstrap outputs",
             "Enforce exact Model D maintenance admission",
             "Enforce exact DESIGN-B terminal admission",
             "Resolve protected Model D orchestration", "Assert protected Model D outputs",
@@ -359,7 +360,9 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
         self.assertNotIn('${{ github.workspace }}/policy', preparation_run)
         self.assertTrue(invocation.startswith(" evaluate "))
         self.assertEqual(names.index("Resolve protected bootstrap authority"),
-                         names.index("Check out exact selected B1 provenance P") + 1)
+                         names.index("Acquire protected Git identity") + 1)
+        self.assertEqual(names.index("Resolve exact B3 proposal identities"),
+                         names.index("Resolve protected bootstrap authority") + 1)
         self.assertIn('python -I -S "${{ github.workspace }}/policy/protected_policy_bootstrap.py" evaluate', bootstrap_run)
         self.assertNotIn("candidate/protected_policy_bootstrap.py", bootstrap_run)
         for argument in (
@@ -2136,11 +2139,11 @@ class ModelDClosedPowerShellProfileTests(unittest.TestCase):
         "Enforce exact Model D maintenance admission":
             "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled != 'true'",
         "Resolve exact B3 proposal identities":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'",
         "Check out exact B3 establishment proposal E":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'",
         "Check out exact selected B1 provenance P":
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'",
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'",
         "Enforce exact DESIGN-B terminal admission":
             "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'",
         "Run candidate Stage A evidence":
@@ -2290,10 +2293,11 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
         self.assertEqual([step["name"] for step in steps], [
             "Check out exact candidate", "Check out independent root policy",
             "Set up CPython", "Assert exact CPython runtime",
-            "Acquire protected Git identity", "Resolve exact B3 proposal identities",
+            "Acquire protected Git identity", "Resolve protected bootstrap authority",
+            "Resolve exact B3 proposal identities",
             "Check out exact B3 establishment proposal E",
             "Check out exact selected B1 provenance P",
-            "Resolve protected bootstrap authority", "Assert protected bootstrap outputs",
+            "Assert protected bootstrap outputs",
             "Enforce exact Model D maintenance admission",
             "Enforce exact DESIGN-B terminal admission",
             "Resolve protected Model D orchestration", "Assert protected Model D outputs",
@@ -4290,7 +4294,17 @@ class S2CCorrectionTests(unittest.TestCase):
         self.assertEqual(detector["id"], "protected-git")
         self.assertEqual(
             by_name["Resolve exact B3 proposal identities"]["if"],
-            "steps.protected-git.outputs.b3-enabled == 'true' && github.event_name == 'pull_request'")
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'")
+        self.assertEqual(
+            by_name["Check out exact B3 establishment proposal E"]["if"],
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'")
+        self.assertEqual(
+            by_name["Check out exact selected B1 provenance P"]["if"],
+            "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'")
+        step_names = [step["name"] for step in steps]
+        self.assertLess(
+            step_names.index("Resolve protected bootstrap authority"),
+            step_names.index("Resolve exact B3 proposal identities"))
         self.assertEqual(
             by_name["Enforce exact DESIGN-B terminal admission"]["if"],
             "steps.protected-bootstrap.outputs.evaluation-context == 'SELF_PR_BOOTSTRAP' && steps.protected-git.outputs.b3-enabled == 'true'")
