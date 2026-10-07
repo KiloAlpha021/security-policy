@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -844,18 +845,23 @@ if ($actualBlob -ne $expectedBlob) { throw 'Candidate workflow bytes differ from
                 candidate, "rev-parse", f"{merge_sha}:{bootstrap.CANDIDATE_BASELINE_PATH}")
 
             git(candidate, "config", "core.autocrlf", "true")
-            workflow_path.unlink()
-            git(candidate, "checkout", "--", bootstrap.CANDIDATE_BASELINE_PATH)
-            self.assertIn(b"\r\n", workflow_path.read_bytes())
-            self.assertEqual(git(candidate, "hash-object", bootstrap.CANDIDATE_BASELINE_PATH),
-                             committed_blob)
-            self.assertNotEqual(
-                git(candidate, "hash-object", "--no-filters", bootstrap.CANDIDATE_BASELINE_PATH),
-                committed_blob,
-            )
-            with self.assertRaisesRegex(bootstrap.BootstrapError,
-                                        "Invalid candidate baseline source bytes"):
-                bootstrap.extract_candidate_baseline(candidate)
+            with mock.patch.dict(os.environ, {"GIT_CONFIG_VALUE_0": "true"}):
+                workflow_path.unlink()
+                git(candidate, "checkout", "--", bootstrap.CANDIDATE_BASELINE_PATH)
+                self.assertIn(b"\r\n", workflow_path.read_bytes())
+                self.assertEqual(
+                    git(candidate, "hash-object", bootstrap.CANDIDATE_BASELINE_PATH),
+                    committed_blob,
+                )
+                self.assertNotEqual(
+                    git(candidate, "hash-object", "--no-filters",
+                        bootstrap.CANDIDATE_BASELINE_PATH),
+                    committed_blob,
+                )
+                with self.assertRaisesRegex(bootstrap.BootstrapError,
+                                            "Invalid candidate baseline source bytes"):
+                    bootstrap.extract_candidate_baseline(candidate)
+            self.assertEqual(os.environ["GIT_CONFIG_VALUE_0"], "false")
 
             workflow = yaml.load(
                 (Path(__file__).parent / ".github/workflows/security-workflows-policy.yml").read_text(
@@ -2407,8 +2413,16 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 "DOWNSTREAM_VALIDATION": "downstream-validation",
             },
         }
+        fixed_env = {
+            "Run candidate Stage A evidence": {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.autocrlf",
+                "GIT_CONFIG_VALUE_0": "false",
+            },
+        }
         self.assertEqual({step["name"] for step in steps if "env" in step},
-                         set(expected_env) | {"Apply protected Stage A baseline to candidate target"})
+                         set(expected_env) | set(fixed_env) |
+                         {"Apply protected Stage A baseline to candidate target"})
         by_name = {step["name"]: step for step in steps}
         for name, keys in expected_env.items():
             expected = {}
@@ -2416,6 +2430,8 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
                 source = ("protected-bootstrap" if name == "Assert protected bootstrap outputs"
                           or key.startswith("D0_") else "protected-model-d")
                 expected[key] = "${{ steps." + source + ".outputs." + output + " }}"
+            self.assertEqual(by_name[name]["env"], expected)
+        for name, expected in fixed_env.items():
             self.assertEqual(by_name[name]["env"], expected)
         self.assertEqual(set(by_name["Apply protected Stage A baseline to candidate target"]["env"]), {
             "POLICY_CANDIDATE_ROOT", "POLICY_PROTECTED_ROOT", "POLICY_EXPECTED_REPOSITORY",
@@ -2497,6 +2513,43 @@ ConvertTo-Json -InputObject $reports -Depth 5 -Compress
 
     def test_current_workflow_has_closed_ast_and_structure(self) -> None:
         self._assert_closed(self._workflow())
+
+    def test_stage_a_git_environment_is_exact_and_step_scoped(self) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["security-workflows-policy"]["steps"]
+        by_name = {step["name"]: step for step in steps}
+        expected = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.autocrlf",
+            "GIT_CONFIG_VALUE_0": "false",
+        }
+        self.assertEqual(by_name["Run candidate Stage A evidence"]["env"], expected)
+
+        mutations = (
+            lambda env: env.pop("GIT_CONFIG_COUNT"),
+            lambda env: env.__setitem__("GIT_CONFIG_COUNT", "2"),
+            lambda env: env.__setitem__("GIT_CONFIG_KEY_0", "core.eol"),
+            lambda env: env.__setitem__("GIT_CONFIG_VALUE_0", "true"),
+            lambda env: env.__setitem__("GIT_CONFIG_KEY_1", "core.safecrlf"),
+        )
+        for mutate in mutations:
+            candidate = copy.deepcopy(workflow)
+            candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
+            candidate_step = next(step for step in candidate_steps
+                                  if step["name"] == "Run candidate Stage A evidence")
+            mutate(candidate_step["env"])
+            with self.subTest(env=candidate_step["env"]), self.assertRaises(AssertionError):
+                self._assert_closed(candidate)
+
+        candidate = copy.deepcopy(workflow)
+        candidate_steps = candidate["jobs"]["security-workflows-policy"]["steps"]
+        stage_a = next(step for step in candidate_steps
+                       if step["name"] == "Run candidate Stage A evidence")
+        unauthorized = next(step for step in candidate_steps
+                            if step["name"] == "Run legacy protected health")
+        unauthorized["env"] = stage_a.pop("env")
+        with self.assertRaises(AssertionError):
+            self._assert_closed(candidate)
 
     def test_comments_and_string_text_do_not_create_ast_authority(self) -> None:
         workflow = self._workflow()
