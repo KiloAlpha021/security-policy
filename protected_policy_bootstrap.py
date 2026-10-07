@@ -1437,7 +1437,7 @@ def _canonical_remote(value: str) -> str:
     return _repository(repository, "Git remote repository")
 
 
-def _context(inputs: BootstrapInputs) -> EvaluationContext:
+def _context(inputs: BootstrapInputs | argparse.Namespace) -> EvaluationContext:
     event = _clean(inputs.event_name, "event name")
     repository = _repository(inputs.repository, "repository")
     base_repository = _repository(inputs.base_repository, "base repository")
@@ -1543,7 +1543,26 @@ def _parser() -> argparse.ArgumentParser:
 def _cli_inputs(arguments: argparse.Namespace) -> BootstrapInputs:
     candidate_root = Path(arguments.candidate_root)
     protected_root = Path(arguments.protected_root)
-    baseline = extract_candidate_baseline(candidate_root)
+    context = _context(arguments)
+    baseline_root = candidate_root
+    baseline_sha = arguments.candidate_sha
+    if context is EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS:
+        expected_workflow = f"{REPOSITORY}/{CANDIDATE_BASELINE_PATH}@refs/heads/main"
+        event_pattern = (r"refs/pull/[1-9][0-9]*/merge" if arguments.event_name == "pull_request"
+                         else r"refs/heads/gh-readonly-queue/main/[^\s]+")
+        if (arguments.default_branch != "main" or arguments.workflow_ref != expected_workflow
+                or re.fullmatch(event_pattern, arguments.event_ref) is None):
+            raise BootstrapError("Unsupported downstream policy-source binding")
+        baseline_root = protected_root
+        baseline_sha = arguments.protected_sha
+    root = _root(baseline_root, "baseline source root")
+    revision = _sha(baseline_sha, "baseline source SHA")
+    expected_blob = _sha(_git(root, "rev-parse", f"{revision}:{CANDIDATE_BASELINE_PATH}"),
+                         "committed baseline workflow blob")
+    actual_blob = _git(root, "hash-object", "--no-filters", CANDIDATE_BASELINE_PATH)
+    if actual_blob != expected_blob:
+        raise BootstrapError("Baseline workflow bytes differ from exact committed Git blob")
+    baseline = extract_candidate_baseline(root)
     return BootstrapInputs(
         event_name=arguments.event_name,
         repository=arguments.repository,
