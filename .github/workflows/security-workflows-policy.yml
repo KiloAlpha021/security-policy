@@ -285,7 +285,13 @@ jobs:
       - name: Validate downstream security workflows
         if: steps.protected-model-d.outputs.downstream-validation == 'RUN_DOWNSTREAM_VALIDATION'
         shell: pwsh
+        env:
+          DOWNSTREAM_EVENT_REPOSITORY: ${{ github.repository }}
+          DOWNSTREAM_CANDIDATE_SHA: ${{ github.sha }}
+          DOWNSTREAM_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || github.repository }}
+          DOWNSTREAM_BASE_BRANCH: ${{ github.event.pull_request.base.ref || 'main' }}
+          DOWNSTREAM_EVENT_NAME: ${{ github.event_name }}
         run: |
           $ErrorActionPreference = 'Stop'
-          .\policy-env\Scripts\python.exe policy/verify_security_workflows.py --candidate candidate
+          .\policy-env\Scripts\python.exe policy/verify_security_workflows.py --candidate candidate --policy policy --event-repository "$env:DOWNSTREAM_EVENT_REPOSITORY" --candidate-sha "$env:DOWNSTREAM_CANDIDATE_SHA" --base-repository "$env:DOWNSTREAM_BASE_REPOSITORY" --base-branch "$env:DOWNSTREAM_BASE_BRANCH" --event-name "$env:DOWNSTREAM_EVENT_NAME"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
