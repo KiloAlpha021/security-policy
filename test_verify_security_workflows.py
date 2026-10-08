@@ -80,9 +80,11 @@ jobs:
           EVENT_REPOSITORY: ${{ github.repository }}
           CANDIDATE_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          python trusted/verify_candidate.py --candidate candidate --trusted trusted --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --event-name $env:EVENT_NAME
+          python trusted/verify_candidate.py --candidate candidate --trusted trusted --event-repository $env:EVENT_REPOSITORY --candidate-sha $env:CANDIDATE_SHA --event-name $env:EVENT_NAME --event-base-sha $env:EVENT_BASE_SHA --event-head-sha $env:EVENT_HEAD_SHA --github-output $env:GITHUB_OUTPUT
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: checks
         working-directory: candidate
@@ -178,11 +180,26 @@ def duplicate():
                             "EVENT_REPOSITORY: ${{ inputs.repository }}"),
             "wrong_sha": ("CANDIDATE_SHA: ${{ github.sha }}",
                           "CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}"),
+            "wrong_base_sha": (
+                "EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
+                "EVENT_BASE_SHA: ${{ github.sha }}"),
+            "wrong_head_sha": (
+                "EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}",
+                "EVENT_HEAD_SHA: ${{ github.sha }}"),
             "substituted_verifier": ("python trusted/verify_candidate.py",
                                      "python candidate/verify_candidate.py"),
             "missing_verifier": ("python trusted/verify_candidate.py", "Write-Host accepted"),
             "ignored_exit": ("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
                              "Write-Host accepted"),
+            "reordered_arguments": (
+                "--event-base-sha $env:EVENT_BASE_SHA --event-head-sha $env:EVENT_HEAD_SHA",
+                "--event-head-sha $env:EVENT_HEAD_SHA --event-base-sha $env:EVENT_BASE_SHA"),
+            "duplicate_argument": (
+                "--github-output $env:GITHUB_OUTPUT",
+                "--github-output $env:GITHUB_OUTPUT --github-output $env:GITHUB_OUTPUT"),
+            "missing_base_argument": (" --event-base-sha $env:EVENT_BASE_SHA", ""),
+            "missing_head_argument": (" --event-head-sha $env:EVENT_HEAD_SHA", ""),
+            "missing_output_argument": (" --github-output $env:GITHUB_OUTPUT", ""),
             "malformed_yaml": ("jobs:", "jobs: ["),
             "duplicate_key": ("          path: candidate", "          path: candidate\n          path: candidate"),
             "hidden_checkout": ("      - name: Enforce separate candidate and trusted identities",
