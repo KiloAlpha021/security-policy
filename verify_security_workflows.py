@@ -259,10 +259,48 @@ def validate_verifier(text: str) -> None:
             constants.get("TRUSTED_REPOSITORY") != TARGET or \
             constants.get("TRUSTED_REF") != "refs/remotes/origin/main":
         raise ValueError("Trusted verifier target constants changed")
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "verify"]
-    if len(functions) != 1:
-        raise ValueError("Trusted verifier entry changed")
-    body = functions[0].body
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    required_signatures = {
+        "safe_relative_path": (["value"], ["label"]),
+        "read_identities": (["path"], []),
+        "load_profiles": (["trusted"], []),
+        "_validate_dependency_profile": (["trusted", "metadata_path", "profile"], []),
+        "_validate_control_profile": (["metadata_path", "profile"], []),
+        "verify_immutable": (["candidate", "historical", "evolved"], []),
+        "select_dependency_lock": (["candidate", "trusted", "historical"], []),
+        "select_control_profile": (
+            ["candidate", "trusted", "historical", "event_name", "event_base_sha", "event_head_sha"],
+            [],
+        ),
+        "verify": (
+            ["candidate", "trusted", "event_repository", "candidate_sha", "event_name",
+             "event_base_sha", "event_head_sha"],
+            [],
+        ),
+    }
+    if not required_signatures.keys() <= functions.keys():
+        raise ValueError("Trusted verifier helper contract changed")
+    for name, (positional, keyword_only) in required_signatures.items():
+        arguments = functions[name].args
+        if ([item.arg for item in arguments.args] != positional
+                or [item.arg for item in arguments.kwonlyargs] != keyword_only
+                or arguments.vararg is not None or arguments.kwarg is not None):
+            raise ValueError("Trusted verifier helper signature changed")
+
+    def require_ordered(function_name: str, statements: tuple[str, ...], message: str) -> None:
+        nodes = list(ast.walk(functions[function_name]))
+        observed = [(ast.dump(node, include_attributes=False), node.lineno)
+                    for node in nodes if isinstance(node, ast.stmt)]
+        positions: list[int] = []
+        for statement in statements:
+            shape = ast.dump(ast.parse(statement).body[0], include_attributes=False)
+            matches = [line for candidate, line in observed if candidate == shape]
+            positions.append(matches[0] if matches else -1)
+        if -1 in positions or positions != sorted(positions):
+            raise ValueError(message)
+
     required_guards = (
         'candidate = candidate.resolve(strict=True)',
         'trusted = trusted.resolve(strict=True)',
@@ -270,21 +308,77 @@ def validate_verifier(text: str) -> None:
         'if event_repository != CANDIDATE_REPOSITORY: raise ValueError("Wrong target repository")',
         'if event_name not in {"pull_request", "merge_group"}: raise ValueError("Unsupported required-workflow event")',
         'if not SHA.fullmatch(candidate_sha): raise ValueError("Invalid candidate SHA")',
+        'if not SHA.fullmatch(event_base_sha) or not SHA.fullmatch(event_head_sha): raise ValueError("Invalid event base/head identity")',
         'if repository(candidate) != CANDIDATE_REPOSITORY: raise ValueError("Wrong candidate checkout")',
         'if git(candidate, "rev-parse", "HEAD") != candidate_sha: raise ValueError("Candidate checkout does not match event SHA")',
         'if git(candidate, "rev-parse", "--is-shallow-repository") != "false": raise ValueError("Required candidate history is unavailable")',
         'if repository(trusted) != TRUSTED_REPOSITORY: raise ValueError("Wrong trusted checkout")',
         'if git(trusted, "rev-parse", "HEAD") != git(trusted, "rev-parse", TRUSTED_REF): raise ValueError("Trusted checkout is not protected main")',
-        'if actual_lock != expected_lock: raise ValueError("Candidate dependency lock differs from trusted lock")',
+        'historical = read_identities(trusted / "trusted-git-blobs.txt")',
+        'if "pyproject.toml" not in historical or "requirements-dev.lock" not in historical: raise ValueError("Historical dependency controls are incomplete")',
+        'control_profile = select_control_profile(candidate, trusted, historical, event_name, event_base_sha, event_head_sha)',
+        'evolved = set(control_profile["allowed_evolved_paths"]) if control_profile else set()',
+        'verify_immutable(candidate, historical, evolved)',
+        'lock = select_dependency_lock(candidate, trusted, historical)',
+        'selected = str(control_profile["profile_id"]) if control_profile else HISTORICAL_PROFILE',
+        'return lock, selected',
     )
-    guard_shapes = [ast.dump(ast.parse(guard).body[0], include_attributes=False)
-                    for guard in required_guards]
-    observed = [ast.dump(node, include_attributes=False) for node in body]
-    positions = [observed.index(shape) if shape in observed else -1 for shape in guard_shapes]
-    if -1 in positions or positions != sorted(positions) or any(
-        isinstance(node, (ast.Return, ast.Try)) for node in ast.walk(functions[0])
-    ):
-        raise ValueError("Trusted verifier event, origin, or HEAD guard changed")
+    require_ordered("verify", required_guards,
+                    "Trusted verifier event, origin, profile, or HEAD guard changed")
+    if any(isinstance(node, ast.Try) for node in ast.walk(functions["verify"])):
+        raise ValueError("Trusted verifier entry control flow changed")
+
+    require_ordered("select_dependency_lock", (
+        'historical_matches = all(candidate_blob(candidate, name) == expected for name, expected in historical.items() if name in EVOLVABLE_PATHS)',
+        'if historical_matches:\n    expected_lock = git(trusted, "rev-parse", "HEAD:requirements-dev.lock")\n    if candidate_blob(candidate, "requirements-dev.lock") != expected_lock:\n        raise ValueError("Candidate dependency lock differs from trusted lock")\n    return HISTORICAL_LOCK',
+        'matches = []',
+        'dependency_profiles, _ = load_profiles(trusted)',
+        'if not matches: raise ValueError("No applicable trusted successor profile")',
+        'if len(matches) != 1: raise ValueError("Multiple applicable trusted successor profiles")',
+        'return safe_relative_path(matches[0]["trusted_lock_path"], label="trusted lock path")',
+    ), "Trusted dependency-lock selection contract changed")
+    require_ordered("select_control_profile", (
+        'if not changed: return None',
+        '_, profiles = load_profiles(trusted)',
+        'matches: list[dict[str, object]] = []',
+        'if not matches: raise ValueError("No applicable trusted control successor profile")',
+        'if len(matches) != 1: raise ValueError("Multiple applicable trusted control successor profiles")',
+        'return matches[0]',
+    ), "Trusted control-profile selection contract changed")
+    require_ordered("_validate_dependency_profile", (
+        'if profile["authority_limitations"] != AUTHORITY_LIMITATIONS: raise ValueError("Invalid successor authority limitations")',
+        'if not isinstance(evolved, list) or set(evolved) != EVOLVABLE_PATHS: raise ValueError("Invalid evolved dependency surface")',
+        'if not isinstance(blobs, dict) or set(blobs) != EVOLVABLE_PATHS: raise ValueError("Invalid successor blob set")',
+        'if read_identities(manifest_path) != blobs: raise ValueError("Successor manifest/profile identity mismatch")',
+        'lock_path = safe_relative_path(profile["trusted_lock_path"], label="trusted lock path")',
+        'if lock_path != expected_lock: raise ValueError("Untrusted dependency-lock path")',
+        'if resolved_lock.parent != profile_root_resolved: raise ValueError("Trusted lock escapes successor profile")',
+        'if actual_lock != profile["trusted_lock_blob"]: raise ValueError("Successor lock/profile identity mismatch")',
+        'if blobs["requirements-dev.lock"] != profile["trusted_lock_blob"]: raise ValueError("Successor candidate/trusted lock mismatch")',
+    ), "Trusted dependency-profile authority changed")
+    require_ordered("_validate_control_profile", (
+        'if profile["profile_type"] != "TRUSTED_CONTROL_SUCCESSOR": raise ValueError("Invalid trusted control profile type")',
+        'if profile["policy_id"] != "ATIS_STAGE3_TRUSTED_CONTROL_SUCCESSOR_POLICY_V1": raise ValueError("Invalid trusted control successor policy")',
+        'if profile["activation_state"] != "ACTIVE_ON_PROTECTED_MAIN": raise ValueError("Inactive trusted control successor profile")',
+        'if profile["authority_limitations"] != CONTROL_AUTHORITY_LIMITATIONS: raise ValueError("Invalid trusted control authority limitations")',
+        'if profile["preserved_security_invariants"] != PRESERVED_SECURITY_INVARIANTS: raise ValueError("Trusted control invariant preservation mismatch")',
+        'if any("*" in value or "?" in value for value in evolved): raise ValueError("Wildcard trusted control path")',
+        'if set(transition_paths) != set(evolved) or len(transition_paths) != len(set(transition_paths)): raise ValueError("Duplicate or missing trusted control transition")',
+        'if manifest != successor_blobs: raise ValueError("Trusted control manifest/profile identity mismatch")',
+    ), "Trusted control-profile authority changed")
+    require_ordered("safe_relative_path", (
+        'if not isinstance(value, str): raise TypeError(f"Malformed {label}")',
+        'path = PurePosixPath(value)',
+        'if not value or path.is_absolute() or ".." in path.parts or "." in path.parts or "\\\\" in value or ":" in value: raise ValueError(f"Unsafe {label}")',
+        'return path',
+    ), "Trusted path-safety contract changed")
+    require_ordered("read_identities", (
+        'if match is None: raise ValueError("Malformed trusted identity")',
+        'safe_relative_path(name, label="trusted identity")',
+        'if name in identities: raise ValueError("Unsafe or duplicate trusted identity")',
+        'if not identities: raise ValueError("No trusted identities")',
+        'return identities',
+    ), "Trusted identity-manifest contract changed")
     for fragment, message in (
         ("Candidate checkout does not match event SHA", "Candidate SHA verification removed"),
         ("Candidate and trusted roots must be separate", "Root separation removed"),
@@ -313,11 +407,21 @@ def validate_identities(text: str) -> None:
 
 def validate_tests(text: str) -> None:
     for fragment in (
-        "test_valid_candidate_and_protected_controls",
+        "test_valid_historical_candidate_uses_unchanged_historical_lock",
+        "test_exact_approved_successor_uses_trusted_profile_lock",
+        "test_exact_control_successor_selects_one_trusted_profile",
         "test_reversed_roots_fail",
         "test_wrong_candidate_sha_fails",
         "test_wrong_target_repository_fails",
-        "test_malformed_identity_fails",
+        "test_wrong_trusted_repository_fails",
+        "test_wrong_trusted_ref_fails",
+        "test_malformed_historical_identity_fails",
+        "test_multiple_control_profiles_fail",
+        "test_multiple_matching_profiles_fail",
+        "test_parent_traversal_lock_path_fails",
+        "test_candidate_cannot_choose_control_profile",
+        "test_candidate_cannot_choose_profile",
+        "test_workflow_commands_are_candidate_scoped_and_trusted_lock_controlled",
     ):
         require(text, fragment, "Critical adversarial verifier test removed")
     try:
