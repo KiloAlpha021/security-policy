@@ -100,28 +100,111 @@ jobs:
         verifier = '''CANDIDATE_REPOSITORY = "KiloAlpha021/automated-trading-bot"
 TRUSTED_REPOSITORY = "KiloAlpha021/security-workflows"
 TRUSTED_REF = "refs/remotes/origin/main"
-def verify(candidate, trusted, event_repository, candidate_sha, event_name):
+HISTORICAL_PROFILE = "historical-m1"
+def safe_relative_path(value, *, label):
+    if not isinstance(value, str): raise TypeError(f"Malformed {label}")
+    path = PurePosixPath(value)
+    if not value or path.is_absolute() or ".." in path.parts or "." in path.parts or "\\\\" in value or ":" in value: raise ValueError(f"Unsafe {label}")
+    return path
+def read_identities(path):
+    identities = {}
+    for line in path.read_text().splitlines():
+        match = IDENTITY.fullmatch(line)
+        if match is None: raise ValueError("Malformed trusted identity")
+        expected, name = match.groups()
+        safe_relative_path(name, label="trusted identity")
+        if name in identities: raise ValueError("Unsafe or duplicate trusted identity")
+        identities[name] = expected
+    if not identities: raise ValueError("No trusted identities")
+    return identities
+def load_profiles(trusted): return [], []
+def _validate_dependency_profile(trusted, metadata_path, profile):
+    if profile["authority_limitations"] != AUTHORITY_LIMITATIONS: raise ValueError("Invalid successor authority limitations")
+    evolved = profile["allowed_evolved_paths"]
+    if not isinstance(evolved, list) or set(evolved) != EVOLVABLE_PATHS: raise ValueError("Invalid evolved dependency surface")
+    blobs = profile["successor_blobs"]
+    if not isinstance(blobs, dict) or set(blobs) != EVOLVABLE_PATHS: raise ValueError("Invalid successor blob set")
+    manifest_path = metadata_path.parent / "trusted-git-blobs.txt"
+    if read_identities(manifest_path) != blobs: raise ValueError("Successor manifest/profile identity mismatch")
+    lock_path = safe_relative_path(profile["trusted_lock_path"], label="trusted lock path")
+    expected_lock = PurePosixPath("profiles") / metadata_path.parent.name / "requirements-dev.lock"
+    if lock_path != expected_lock: raise ValueError("Untrusted dependency-lock path")
+    resolved_lock = (trusted / lock_path).resolve(strict=True)
+    profile_root_resolved = metadata_path.parent.resolve(strict=True)
+    if resolved_lock.parent != profile_root_resolved: raise ValueError("Trusted lock escapes successor profile")
+    actual_lock = git(trusted, "hash-object", str(resolved_lock))
+    if actual_lock != profile["trusted_lock_blob"]: raise ValueError("Successor lock/profile identity mismatch")
+    if blobs["requirements-dev.lock"] != profile["trusted_lock_blob"]: raise ValueError("Successor candidate/trusted lock mismatch")
+def _validate_control_profile(metadata_path, profile):
+    if profile["profile_type"] != "TRUSTED_CONTROL_SUCCESSOR": raise ValueError("Invalid trusted control profile type")
+    if profile["policy_id"] != "ATIS_STAGE3_TRUSTED_CONTROL_SUCCESSOR_POLICY_V1": raise ValueError("Invalid trusted control successor policy")
+    if profile["activation_state"] != "ACTIVE_ON_PROTECTED_MAIN": raise ValueError("Inactive trusted control successor profile")
+    if profile["authority_limitations"] != CONTROL_AUTHORITY_LIMITATIONS: raise ValueError("Invalid trusted control authority limitations")
+    if profile["preserved_security_invariants"] != PRESERVED_SECURITY_INVARIANTS: raise ValueError("Trusted control invariant preservation mismatch")
+    evolved = profile["allowed_evolved_paths"]
+    if any("*" in value or "?" in value for value in evolved): raise ValueError("Wildcard trusted control path")
+    transition_paths = [item["path"] for item in profile["transitions"]]
+    if set(transition_paths) != set(evolved) or len(transition_paths) != len(set(transition_paths)): raise ValueError("Duplicate or missing trusted control transition")
+    manifest = read_identities(metadata_path.parent / "trusted-git-blobs.txt")
+    successor_blobs = {item["path"]: item["successor_blob"] for item in profile["transitions"]}
+    if manifest != successor_blobs: raise ValueError("Trusted control manifest/profile identity mismatch")
+def verify_immutable(candidate, historical, evolved):
+    raise ValueError("Trusted M1 control mismatch")
+def select_dependency_lock(candidate, trusted, historical):
+    historical_matches = all(candidate_blob(candidate, name) == expected for name, expected in historical.items() if name in EVOLVABLE_PATHS)
+    if historical_matches:
+        expected_lock = git(trusted, "rev-parse", "HEAD:requirements-dev.lock")
+        if candidate_blob(candidate, "requirements-dev.lock") != expected_lock: raise ValueError("Candidate dependency lock differs from trusted lock")
+        return HISTORICAL_LOCK
+    matches = []
+    dependency_profiles, _ = load_profiles(trusted)
+    if not matches: raise ValueError("No applicable trusted successor profile")
+    if len(matches) != 1: raise ValueError("Multiple applicable trusted successor profiles")
+    return safe_relative_path(matches[0]["trusted_lock_path"], label="trusted lock path")
+def select_control_profile(candidate, trusted, historical, event_name, event_base_sha, event_head_sha):
+    changed = set()
+    if not changed: return None
+    _, profiles = load_profiles(trusted)
+    matches: list[dict[str, object]] = []
+    if not matches: raise ValueError("No applicable trusted control successor profile")
+    if len(matches) != 1: raise ValueError("Multiple applicable trusted control successor profiles")
+    return matches[0]
+def verify(candidate, trusted, event_repository, candidate_sha, event_name, event_base_sha, event_head_sha):
     candidate = candidate.resolve(strict=True)
     trusted = trusted.resolve(strict=True)
     if candidate == trusted or candidate in trusted.parents or trusted in candidate.parents: raise ValueError("Candidate and trusted roots must be separate")
     if event_repository != CANDIDATE_REPOSITORY: raise ValueError("Wrong target repository")
     if event_name not in {"pull_request", "merge_group"}: raise ValueError("Unsupported required-workflow event")
     if not SHA.fullmatch(candidate_sha): raise ValueError("Invalid candidate SHA")
+    if not SHA.fullmatch(event_base_sha) or not SHA.fullmatch(event_head_sha): raise ValueError("Invalid event base/head identity")
     if repository(candidate) != CANDIDATE_REPOSITORY: raise ValueError("Wrong candidate checkout")
     if git(candidate, "rev-parse", "HEAD") != candidate_sha: raise ValueError("Candidate checkout does not match event SHA")
     if git(candidate, "rev-parse", "--is-shallow-repository") != "false": raise ValueError("Required candidate history is unavailable")
     if repository(trusted) != TRUSTED_REPOSITORY: raise ValueError("Wrong trusted checkout")
     if git(trusted, "rev-parse", "HEAD") != git(trusted, "rev-parse", TRUSTED_REF): raise ValueError("Trusted checkout is not protected main")
-    if actual_lock != expected_lock: raise ValueError("Candidate dependency lock differs from trusted lock")
-    raise ValueError("Trusted M1 control mismatch")
+    historical = read_identities(trusted / "trusted-git-blobs.txt")
+    if "pyproject.toml" not in historical or "requirements-dev.lock" not in historical: raise ValueError("Historical dependency controls are incomplete")
+    control_profile = select_control_profile(candidate, trusted, historical, event_name, event_base_sha, event_head_sha)
+    evolved = set(control_profile["allowed_evolved_paths"]) if control_profile else set()
+    verify_immutable(candidate, historical, evolved)
+    lock = select_dependency_lock(candidate, trusted, historical)
+    selected = str(control_profile["profile_id"]) if control_profile else HISTORICAL_PROFILE
+    return lock, selected
 def identities(line):
     raise ValueError("Malformed trusted identity")
 def duplicate():
     raise ValueError("Unsafe or duplicate trusted identity")
 '''
         tests = "\n".join(f"def {name}(): pass" for name in (
-            "test_valid_candidate_and_protected_controls", "test_reversed_roots_fail",
-            "test_wrong_candidate_sha_fails", "test_malformed_identity_fails"))
+            "test_valid_historical_candidate_uses_unchanged_historical_lock",
+            "test_exact_approved_successor_uses_trusted_profile_lock",
+            "test_exact_control_successor_selects_one_trusted_profile",
+            "test_reversed_roots_fail", "test_wrong_candidate_sha_fails",
+            "test_wrong_trusted_repository_fails", "test_wrong_trusted_ref_fails",
+            "test_malformed_historical_identity_fails", "test_multiple_control_profiles_fail",
+            "test_multiple_matching_profiles_fail", "test_parent_traversal_lock_path_fails",
+            "test_candidate_cannot_choose_control_profile", "test_candidate_cannot_choose_profile",
+            "test_workflow_commands_are_candidate_scoped_and_trusted_lock_controlled"))
         tests += "\ndef test_wrong_target_repository_fails():\n    with self.assertRaisesRegex(ValueError, 'target repository'):\n        self.check(repository='KiloAlpha021/security-workflows')\n"
         identities = "\n".join((
             "1" * 40 + "  pyproject.toml",
@@ -270,11 +353,26 @@ def duplicate():
             ('KiloAlpha021/automated-trading-bot', 'Other/trading-bot'),
             ('if event_repository != CANDIDATE_REPOSITORY', 'if False'),
             ('if event_name not in {"pull_request", "merge_group"}', 'if False'),
+            ('if not SHA.fullmatch(event_base_sha) or not SHA.fullmatch(event_head_sha)',
+             'if False'),
             ('if candidate == trusted or candidate in trusted.parents or trusted in candidate.parents', 'if False'),
             ('if repository(candidate) != CANDIDATE_REPOSITORY', 'if False'),
             ('if git(candidate, "rev-parse", "HEAD") != candidate_sha', 'if False'),
             ('if repository(trusted) != TRUSTED_REPOSITORY', 'if False'),
-            ('if actual_lock != expected_lock', 'if False'),
+            ('if candidate_blob(candidate, "requirements-dev.lock") != expected_lock',
+             'if False'),
+            ('if not matches: raise ValueError("No applicable trusted successor profile")',
+             'if False'),
+            ('if len(matches) != 1: raise ValueError("Multiple applicable trusted successor profiles")',
+             'if False'),
+            ('if not matches: raise ValueError("No applicable trusted control successor profile")',
+             'if False'),
+            ('if len(matches) != 1: raise ValueError("Multiple applicable trusted control successor profiles")',
+             'if False'),
+            ('if profile["activation_state"] != "ACTIVE_ON_PROTECTED_MAIN"',
+             'if False'),
+            ('if any("*" in value or "?" in value for value in evolved)', 'if False'),
+            ('if resolved_lock.parent != profile_root_resolved', 'if False'),
         ):
             with self.subTest(guard=old):
                 self.assertIn(old, verifier)
