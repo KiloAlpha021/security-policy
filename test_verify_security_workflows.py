@@ -61,6 +61,7 @@ permissions:
   contents: read
 jobs:
   trusted-m1-evaluator:
+    if: github.repository == 'KiloAlpha021/automated-trading-bot'
     name: trusted-m1-evaluator
     steps:
       - uses: actions/checkout@1111111111111111111111111111111111111111
@@ -217,6 +218,48 @@ def duplicate():
         decoy += "\n# repository: KiloAlpha021/automated-trading-bot\n"
         with self.assertRaises(ValueError):
             validate_workflow(decoy)
+
+    def test_repository_guard_is_exact_and_all_step_conditions_are_rejected(self) -> None:
+        workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text(
+            encoding="utf-8"
+        )
+        validate_workflow(workflow)
+        guard = "    if: github.repository == 'KiloAlpha021/automated-trading-bot'"
+        cases = {
+            "missing_repository_guard": (guard + "\n", ""),
+            "altered_repository_guard": (
+                guard,
+                "    if: github.repository == 'Other/automated-trading-bot'",
+            ),
+            "additional_job_condition": (
+                guard,
+                guard + "\n    if: github.event_name == 'pull_request'",
+            ),
+            "conditional_candidate_checkout": (
+                "      - uses: actions/checkout@" + "1" * 40,
+                "      - uses: actions/checkout@" + "1" * 40 + "\n        if: success()",
+            ),
+            "conditional_trusted_checkout": (
+                "      - uses: actions/checkout@" + "1" * 40 + "\n        with:\n"
+                "          repository: KiloAlpha021/security-workflows",
+                "      - uses: actions/checkout@" + "1" * 40 + "\n        if: success()\n"
+                "        with:\n          repository: KiloAlpha021/security-workflows",
+            ),
+            "conditional_verifier": (
+                "      - name: Enforce separate candidate and trusted identities",
+                "      - name: Enforce separate candidate and trusted identities\n"
+                "        if: success()",
+            ),
+            "conditional_security_and_dependency_controls": (
+                "      - name: checks",
+                "      - name: checks\n        if: success()",
+            ),
+        }
+        for name, (old, new) in cases.items():
+            with self.subTest(name=name):
+                self.assertIn(old, workflow)
+                with self.assertRaises(ValueError):
+                    validate_workflow(workflow.replace(old, new, 1))
 
     def test_current_fixed_target_runtime_and_adversarial_contract(self) -> None:
         verifier = (self.candidate / "verify_candidate.py").read_text(encoding="utf-8")
