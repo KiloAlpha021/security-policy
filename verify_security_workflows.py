@@ -175,7 +175,26 @@ def validate_workflow(text: str) -> None:
     job = jobs["trusted-m1-evaluator"]
     if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
         raise ValueError("Unsupported trusted workflow steps")
+    repository_guard = "github.repository == 'KiloAlpha021/automated-trading-bot'"
+    if job.get("if") != repository_guard:
+        raise ValueError("Exact repository job guard changed")
     steps = job["steps"]
+    conditional_paths: list[tuple[object, ...]] = []
+
+    def find_conditions(value: object, path: tuple[object, ...]) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = (*path, key)
+                if key == "if":
+                    conditional_paths.append(child_path)
+                find_conditions(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                find_conditions(child, (*path, index))
+
+    find_conditions(workflow, ())
+    if conditional_paths != [("jobs", "trusted-m1-evaluator", "if")]:
+        raise ValueError("Unauthorized conditional workflow path")
     actions = [(index, step) for index, step in enumerate(steps) if "uses" in step]
     if len(actions) != 3 or [step["uses"].split("@")[0] for _, step in actions] != [
         "actions/checkout", "actions/checkout", "actions/setup-python"
@@ -222,8 +241,6 @@ def validate_workflow(text: str) -> None:
         ("python -m pip_audit --local", "Dependency audit removed"),
     ):
         require(text, fragment, message)
-    if re.search(r"(?m)^\s*if:\s*.*", text):
-        raise ValueError("Critical workflow steps may not be conditional")
 
 
 def validate_verifier(text: str) -> None:
