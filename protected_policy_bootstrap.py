@@ -244,6 +244,13 @@ def derive_model_d_plan(result: BootstrapResult) -> ModelDOrchestrationPlan:
             ProtectedEvidenceDisposition.RUN_LEGACY_HEALTH,
             DownstreamValidationDisposition.SKIP,
         ),
+        (EvaluationContext.SELF_PR_BOOTSTRAP,
+         PolicySource.POLICY,
+         VersionDisposition.SAME_VERSION): (
+            CandidateEvidenceDisposition.RUN_STAGE_A,
+            ProtectedEvidenceDisposition.APPLY_STAGE_A_TO_CANDIDATE,
+            DownstreamValidationDisposition.SKIP,
+        ),
         (EvaluationContext.STAGE_A_PROTECTED_PROOF,
          PolicySource.POLICY,
          VersionDisposition.SAME_VERSION): (
@@ -266,7 +273,9 @@ def derive_model_d_plan(result: BootstrapResult) -> ModelDOrchestrationPlan:
     return ModelDOrchestrationPlan(
         normalization_roots=(NormalizationRoot.CANDIDATE, NormalizationRoot.POLICY),
         policy_lock_source=result.policy_source,
-        audit_lock_source=result.policy_source,
+        audit_lock_source=(PolicySource.CANDIDATE if authority == (
+            EvaluationContext.SELF_PR_BOOTSTRAP, PolicySource.POLICY,
+            VersionDisposition.SAME_VERSION) else result.policy_source),
         candidate_evidence=candidate_evidence,
         protected_evidence=protected_evidence,
         downstream_validation=downstream_validation,
@@ -301,6 +310,203 @@ _PROTECTED_LOCK_BLOBS = {
 }
 
 
+_AUDIT_ORIGIN = "af7a95105466649a538734a16919a81705b5ad8f"
+_AUDIT_PATH = "requirements-audit.lock"
+_AUDIT_SEED_PATHS = ("protected_policy_bootstrap.py", "test_verify_security_workflows.py")
+_AUDIT_OLD = (
+    "dbfa6a4d8ef8c344009ad3a15007b2b1c98511fe",
+    "bd75e0d124e602152a78c08f8f2c8e6ed7a8852bfce4a4b189b605a7f064ce34",
+)
+_AUDIT_NEW = (
+    "04f514da5dddb6aa83723cfba28448972c8a38ac",
+    "e1f6d6d95efa753187742474ae0a13199f9e8e7777decd3464bc9928780333c2",
+)
+
+
+def _audit_object(root: Path, revision: str, name: str) -> tuple[str, str]:
+    """Read regular committed bytes before Windows normalization."""
+    revision = _sha(revision, "audit revision")
+    entry = _git_bytes(root, "ls-tree", "-z", revision, "--", name)
+    try:
+        identity, path = entry.removesuffix(b"\0").split(b"\t")
+        mode, kind, blob = identity.decode("ascii").split(" ")
+        if (not entry.endswith(b"\0") or path != name.encode("ascii")
+                or mode != "100644" or kind != "blob" or not _SHA.fullmatch(blob)):
+            raise ValueError("not a regular committed lock")
+    except (ValueError, UnicodeError) as error:
+        raise BootstrapError("Invalid audit transition object") from error
+    data = _git_bytes(root, "cat-file", "blob", blob)
+    return blob, hashlib.sha256(data).hexdigest()
+
+
+def _audit_parents(root: Path, revision: str) -> tuple[str, ...]:
+    fields = _git(root, "rev-list", "--parents", "-n", "1", revision).split()
+    if not fields or fields[0] != revision or any(not _SHA.fullmatch(x) for x in fields):
+        raise BootstrapError("Invalid audit transition ancestry")
+    return tuple(fields[1:])
+
+
+def _audit_tree(root: Path, revision: str) -> str:
+    return _sha(_git(root, "rev-parse", f"{revision}^{{tree}}"), "audit tree")
+
+
+def _audit_seed(root: Path, revision: str) -> None:
+    """S1 is the first exact owner-controlled seed merge, never a supplied flag."""
+    parents = _audit_parents(root, revision)
+    if len(parents) != 2 or parents[0] != _AUDIT_ORIGIN:
+        raise BootstrapError("Audit seed has the wrong protected predecessor")
+    proposal = parents[1]
+    if (_audit_parents(root, proposal) != (_AUDIT_ORIGIN,)
+            or _audit_tree(root, proposal) != _audit_tree(root, revision)
+            or _exact_modified_paths(root, _AUDIT_ORIGIN, revision) != _AUDIT_SEED_PATHS):
+        raise BootstrapError("Audit seed proposal identity or scope mismatch")
+    for name in _AUDIT_SEED_PATHS:
+        _audit_object(root, revision, name)
+    if _audit_object(root, revision, _AUDIT_PATH) != _AUDIT_OLD:
+        raise BootstrapError("Audit seed must preserve the original lock")
+
+
+def _audit_head(root: Path, head: str, seed: str) -> None:
+    """The sole admitted content change is the exact O-to-N regular lock blob."""
+    if (_audit_parents(root, head) != (seed,)
+            or _exact_modified_paths(root, seed, head) != (_AUDIT_PATH,)
+            or _audit_object(root, seed, _AUDIT_PATH) != _AUDIT_OLD
+            or _audit_object(root, head, _AUDIT_PATH) != _AUDIT_NEW):
+        raise BootstrapError("Audit activation head, lock or scope mismatch")
+
+
+def _audit_merge(root: Path, revision: str, seed: str) -> None:
+    parents = _audit_parents(root, revision)
+    if len(parents) != 2 or parents[0] != seed:
+        raise BootstrapError("Audit activation merge has the wrong predecessor")
+    _audit_head(root, parents[1], seed)
+    if _audit_tree(root, revision) != _audit_tree(root, parents[1]):
+        raise BootstrapError("Audit activation merge tree mismatch")
+
+
+def _audit_state(root: Path, revision: str) -> tuple[str, str | None]:
+    """Classify Git history without granting protected status to a proposal."""
+    # evaluate binds protected revision to HEAD. Prove its complete ancestry
+    # before either historical fallback, including missing ancestor objects.
+    if _git_bytes(root, "rev-parse", "--is-shallow-repository") != b"false\n":
+        raise BootstrapError("Audit transition history must be complete")
+    _git_bytes(root, "-c", "core.commitGraph=false", "rev-list", "--parents", "HEAD")
+    # Pre-origin histories retain only O. They cannot select transition authority.
+    probe = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", _AUDIT_ORIGIN + "^{commit}"],
+        capture_output=True, check=False, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
+    if probe.returncode != 0:
+        return "HISTORICAL", None
+    ancestry = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", _AUDIT_ORIGIN, revision],
+        capture_output=True, check=False, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
+    if ancestry.returncode == 1:
+        return "HISTORICAL", None
+    if ancestry.returncode != 0:
+        raise BootstrapError("Audit transition history is unavailable")
+    if _audit_object(root, _AUDIT_ORIGIN, _AUDIT_PATH) != _AUDIT_OLD:
+        raise BootstrapError("Audit predecessor lock mismatch")
+    if revision == _AUDIT_ORIGIN:
+        return "ORIGIN", None
+    history = _git_bytes(root, "rev-list", "--first-parent", "--reverse",
+                         f"{_AUDIT_ORIGIN}..{revision}").decode("ascii").splitlines()
+    if not history or any(not _SHA.fullmatch(x) for x in history):
+        raise BootstrapError("Audit first-parent history is malformed")
+    seed = history[0]
+    if _audit_parents(root, seed)[:1] != (_AUDIT_ORIGIN,):
+        raise BootstrapError("Audit origin is not on the protected first-parent chain")
+    state = "EXPIRED"
+    if (len(_audit_parents(root, seed)) == 2
+            and _exact_modified_paths(root, _AUDIT_ORIGIN, seed) == _AUDIT_SEED_PATHS):
+        _audit_seed(root, seed)
+        state = "PENDING"
+    for index, commit in enumerate(history):
+        if index and state == "PENDING":
+            if len(_audit_parents(root, commit)) == 2:
+                _audit_merge(root, commit, seed)
+                state = "ACTIVE"
+            elif _audit_object(root, commit, _AUDIT_PATH) == _AUDIT_NEW:
+                _audit_head(root, commit, seed)
+                if index != len(history) - 1:
+                    raise BootstrapError("Unprotected audit proposal ancestry")
+                state = "PROPOSAL"
+            else:
+                state = "EXPIRED"
+        expected = _AUDIT_NEW if state in {"ACTIVE", "PROPOSAL"} else _AUDIT_OLD
+        if _audit_object(root, commit, _AUDIT_PATH) != expected:
+            raise BootstrapError("Audit lock rollback, replay or unapproved identity")
+    return state, seed
+
+
+def audit_lock_evidence_identity(root: Path, revision: str) -> tuple[str, str]:
+    """Attribute a record; PROPOSAL evidence is not protected authority."""
+    state, _ = _audit_state(root, revision)
+    expected = _AUDIT_NEW if state in {"ACTIVE", "PROPOSAL"} else _AUDIT_OLD
+    if _audit_object(root, revision, _AUDIT_PATH) != expected:
+        raise BootstrapError("Audit evidence identity mismatch")
+    return expected
+
+
+def _audit_protected_identity(root: Path, revision: str) -> tuple[str, str]:
+    state, _ = _audit_state(root, revision)
+    if state == "PROPOSAL":
+        raise BootstrapError("Audit proposal is not a protected activation")
+    return audit_lock_evidence_identity(root, revision)
+
+
+def _audit_runtime_source(protected: Path, revision: str) -> None:
+    try:
+        source = Path(__file__).resolve(strict=True)
+        source_bytes = source.read_bytes()
+    except OSError as error:
+        raise BootstrapError("Audit authority source is unavailable") from error
+    if source.parent != protected:
+        raise BootstrapError("Audit authority must execute from the protected source")
+    # CRLF checkout is normalized by D2; arbitrary source changes are not.
+    if source_bytes.replace(b"\r\n", b"\n") != _git_bytes(
+            protected, "show", f"{revision}:protected_policy_bootstrap.py"):
+        raise BootstrapError("Audit authority source differs from protected Git object")
+
+
+def validate_audit_lock_binding(inputs: BootstrapInputs) -> bool:
+    """True only for independently protected S1 admitting exact merge M."""
+    candidate = _root(inputs.candidate_root, "candidate root")
+    protected = _root(inputs.protected_root, "protected root")
+    revision = _sha(inputs.protected_sha, "protected SHA")
+    head = _sha(inputs.candidate_sha, "candidate SHA")
+    context = _context(inputs)
+    if (candidate == protected or candidate.is_relative_to(protected)
+            or protected.is_relative_to(candidate)
+            or _git(candidate, "rev-parse", "HEAD") != head
+            or _git(protected, "rev-parse", "HEAD") != revision
+            or _git(protected, "rev-parse", "refs/remotes/origin/main") != revision
+            or _canonical_remote(_git(protected, "remote", "get-url", "origin")) != REPOSITORY
+            or _canonical_remote(_git(candidate, "remote", "get-url", "origin")) != inputs.repository):
+        raise BootstrapError("Audit independent source/target binding mismatch")
+    state, _ = _audit_state(protected, revision)
+    if context is EvaluationContext.DOWNSTREAM_SECURITY_WORKFLOWS:
+        _audit_protected_identity(protected, revision)
+        return False
+    if context is EvaluationContext.STAGE_A_PROTECTED_PROOF and head != revision:
+        raise BootstrapError("Audit protected proof subject mismatch")
+    policy_name = "requirements-policy.lock"
+    if (_audit_object(candidate, head, policy_name)
+            != _audit_object(protected, revision, policy_name)):
+        raise BootstrapError("Policy lock equality is mandatory")
+    expected = _audit_protected_identity(protected, revision)
+    proposed = _audit_object(candidate, head, _AUDIT_PATH)
+    if proposed == expected:
+        if state == "ACTIVE" and context is EvaluationContext.SELF_PR_BOOTSTRAP:
+            _git_bytes(candidate, "merge-base", "--is-ancestor", revision, head)
+        return False
+    if (state != "PENDING" or context is not EvaluationContext.SELF_PR_BOOTSTRAP
+            or inputs.candidate_baseline != CURRENT_BASELINE or proposed != _AUDIT_NEW):
+        raise BootstrapError("Audit lock replacement lacks active protected authority")
+    _audit_runtime_source(protected, revision)
+    _audit_merge(candidate, head, revision)
+    return True
+
+
 def _validate_model_d_lock(root: Path, revision: str, name: str,
                            source: PolicySource) -> None:
     """Verify exact committed and worktree bytes of one plan-selected lock."""
@@ -313,7 +519,10 @@ def _validate_model_d_lock(root: Path, revision: str, name: str,
             raise ValueError("Invalid lock tree entry")
     except (UnicodeError, ValueError) as error:
         raise BootstrapError("Invalid Model D lock Git identity") from error
-    if source is PolicySource.POLICY and object_id != _PROTECTED_LOCK_BLOBS[name]:
+    expected_blob = (_audit_protected_identity(root, revision)[0]
+                     if name == _AUDIT_PATH and source is PolicySource.POLICY
+                     else _PROTECTED_LOCK_BLOBS[name])
+    if source is PolicySource.POLICY and object_id != expected_blob:
         raise BootstrapError("Protected Model D lock identity changed")
     path = root / name
     try:
@@ -1506,6 +1715,11 @@ def evaluate(inputs: BootstrapInputs) -> BootstrapResult:
     if context is EvaluationContext.SELF_PR_BOOTSTRAP and disposition is VersionDisposition.SAME_VERSION:
         source = PolicySource.CANDIDATE
     else:
+        source = PolicySource.POLICY
+    # Pre-origin bootstrap contracts retain their historical behavior. New lock
+    # authority is possible only from the exact independently protected lineage.
+    audit_state, _ = _audit_state(protected, protected_sha)
+    if audit_state != "HISTORICAL" and validate_audit_lock_binding(inputs):
         source = PolicySource.POLICY
     return BootstrapResult(context, source, disposition, OWNER_AUTHORIZATION, POST_MERGE_PROOF)
 

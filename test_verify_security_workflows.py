@@ -11,6 +11,8 @@ import tempfile
 import unittest
 import ast
 import base64
+import importlib.util
+import sys
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,17 @@ import protected_policy_bootstrap as bootstrap
 def git(root: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(root), *args], check=True,
                           capture_output=True, text=True).stdout.strip()
+
+def historical_audit_lock_bytes() -> bytes:
+    """Historical fixtures remain bound to O even after protected activation."""
+    data = (Path(__file__).parent / "requirements-audit.lock").read_bytes()
+    if hashlib.sha256(data).hexdigest() == bootstrap._AUDIT_NEW[1]:
+        data = data.replace(
+            b"urllib3==2.8.0 --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3",
+            b"urllib3==2.7.0 --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897")
+    if hashlib.sha256(data).hexdigest() != bootstrap._AUDIT_OLD[1]:
+        raise AssertionError("Historical fixture lock attribution mismatch")
+    return data
 
 
 class RootPolicyTests(unittest.TestCase):
@@ -713,10 +726,23 @@ if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from author
             self.assertTrue(protected_lock.is_file() and not protected_lock.is_symlink(), name)
             candidate_bytes = candidate_lock.read_bytes()
             protected_bytes = protected_lock.read_bytes()
-            self.assertEqual(candidate_bytes, protected_bytes, name)
             candidate_blob = git(candidate, "rev-parse", f"HEAD:{name}")
             protected_blob = git(protected, "rev-parse", f"HEAD:{name}")
-            self.assertEqual(candidate_blob, protected_blob, name)
+            if name == "requirements-audit.lock" and candidate_blob != protected_blob:
+                # Only the protected module can admit the independently bound merge.
+                inputs = bootstrap.BootstrapInputs(
+                    event_name=os.environ["POLICY_EXPECTED_EVENT"],
+                    repository=os.environ["POLICY_EXPECTED_REPOSITORY"],
+                    base_repository=os.environ["POLICY_EXPECTED_BASE_REPOSITORY"],
+                    base_branch=os.environ["POLICY_EXPECTED_BASE_BRANCH"],
+                    candidate_sha=os.environ["POLICY_EXPECTED_CANDIDATE_SHA"],
+                    protected_sha=os.environ["POLICY_EXPECTED_PROTECTED_SHA"],
+                    candidate_root=candidate, protected_root=protected,
+                    candidate_baseline=bootstrap.CURRENT_BASELINE)
+                self.assertTrue(bootstrap.validate_audit_lock_binding(inputs))
+            else:
+                self.assertEqual(candidate_bytes, protected_bytes, name)
+                self.assertEqual(candidate_blob, protected_blob, name)
             self.assertEqual(git(candidate, "hash-object", "--no-filters", name),
                              candidate_blob, name)
             self.assertEqual(git(protected, "hash-object", "--no-filters", name),
@@ -767,6 +793,7 @@ if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from author
             shutil.copytree(source_root, candidate, ignore=ignored)
             shutil.copytree(source_root, protected, ignore=ignored)
             for root in (candidate, protected):
+                (root / "requirements-audit.lock").write_bytes(historical_audit_lock_bytes())
                 git(root, "init", "-b", "main")
                 git(root, "config", "core.autocrlf", "false")
                 git(root, "config", "user.name", "Stage A Test")
@@ -1118,8 +1145,9 @@ if ($observedHead -ne $candidateSha) { throw 'Candidate HEAD differs from author
         audit = root / "requirements-audit.lock"
         self.assertEqual(hashlib.sha256(policy.read_bytes()).hexdigest(),
                          "2c8257dff9274ba95c7a2d21757ac79acc816e295e45062d0ad8c05d7a2d2f6c")
-        self.assertEqual(hashlib.sha256(audit.read_bytes()).hexdigest(),
-                         "bd75e0d124e602152a78c08f8f2c8e6ed7a8852bfce4a4b189b605a7f064ce34")
+        expected_audit = bootstrap.audit_lock_evidence_identity(
+            root, git(root, "rev-parse", "HEAD"))
+        self.assertEqual(hashlib.sha256(audit.read_bytes()).hexdigest(), expected_audit[1])
         policy_entries = [line for line in policy.read_text().splitlines()
                           if line and not line.startswith(("#", "--"))]
         audit_entries = [line for line in audit.read_text().splitlines()
@@ -1307,7 +1335,9 @@ class ProtectedBootstrapComponentTests(unittest.TestCase):
         source = Path(__file__).parent
         for root in (self.candidate, self.protected):
             for name in ("requirements-policy.lock", "requirements-audit.lock"):
-                (root / name).write_bytes((source / name).read_bytes())
+                (root / name).write_bytes(
+                    historical_audit_lock_bytes() if name == "requirements-audit.lock"
+                    else (source / name).read_bytes())
             git(root, "add", "requirements-policy.lock", "requirements-audit.lock")
             git(root, "commit", "-m", "lock identities")
         self.candidate_sha = git(self.candidate, "rev-parse", "HEAD")
@@ -2167,6 +2197,12 @@ class ModelDPlanV1Tests(unittest.TestCase):
              bootstrap.CandidateEvidenceDisposition.RUN_STAGE_A,
              bootstrap.ProtectedEvidenceDisposition.RUN_LEGACY_HEALTH,
              bootstrap.DownstreamValidationDisposition.SKIP),
+            (bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.SAME_VERSION,
+             bootstrap.CandidateEvidenceDisposition.RUN_STAGE_A,
+             bootstrap.ProtectedEvidenceDisposition.APPLY_STAGE_A_TO_CANDIDATE,
+             bootstrap.DownstreamValidationDisposition.SKIP),
             (bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF,
              bootstrap.PolicySource.POLICY,
              bootstrap.VersionDisposition.SAME_VERSION,
@@ -2191,7 +2227,11 @@ class ModelDPlanV1Tests(unittest.TestCase):
                     bootstrap.NormalizationRoot.POLICY,
                 ))
                 self.assertIs(plan.policy_lock_source, source)
-                self.assertIs(plan.audit_lock_source, source)
+                mixed = (context is bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP
+                         and source is bootstrap.PolicySource.POLICY
+                         and version is bootstrap.VersionDisposition.SAME_VERSION)
+                self.assertIs(plan.audit_lock_source,
+                              bootstrap.PolicySource.CANDIDATE if mixed else source)
                 self.assertIs(plan.candidate_evidence, candidate)
                 self.assertIs(plan.protected_evidence, protected)
                 self.assertIs(plan.downstream_validation, downstream)
@@ -2233,6 +2273,9 @@ class ModelDPlanV1Tests(unittest.TestCase):
             (bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
              bootstrap.PolicySource.POLICY,
              bootstrap.VersionDisposition.IMMEDIATE_SUCCESSOR),
+            (bootstrap.EvaluationContext.SELF_PR_BOOTSTRAP,
+             bootstrap.PolicySource.POLICY,
+             bootstrap.VersionDisposition.SAME_VERSION),
             (bootstrap.EvaluationContext.STAGE_A_PROTECTED_PROOF,
              bootstrap.PolicySource.POLICY,
              bootstrap.VersionDisposition.SAME_VERSION),
@@ -5117,10 +5160,29 @@ class S2PSelectionTests(unittest.TestCase):
                 "https://github.com/KiloAlpha021/security-policy.git")
             git(repo, "config", "user.name", "S2P Test")
             git(repo, "config", "user.email", "s2p@example.invalid")
+            historical = "4ad5ab08b904a2d8ff56b79c4a730a900e2da66a"
+            historical_blobs = {
+                ".github/workflows/security-workflows-policy.yml":
+                    "2d080ee264468fa19d90838da3d248b6d7838058",
+                "protected_policy_bootstrap.py":
+                    "604f4a37c2386d202f2cf1ff73ec875a48f1e22d",
+                "test_verify_security_workflows.py":
+                    "5b83508e08e2665ab500708268b11d371cbee85c",
+            }
+            self.assertEqual(git(repo, "show", "-s", "--format=%P", historical), self.S2C)
+            self.assertEqual(git(repo, "rev-parse", historical + "^{tree}"),
+                             "c49bebd5d6106da224da733d30b4c2d97c430bfc")
+            self.assertEqual(git(repo, "diff-tree", "--no-commit-id", "--name-status",
+                                 "-r", self.S2C, historical).splitlines(),
+                             ["M\t" + name for name in bootstrap.B3_P_SELECTION_PATHS])
             for name in bootstrap.B3_P_SELECTION_PATHS:
+                self.assertEqual(git(repo, "rev-parse", historical + ":" + name),
+                                 historical_blobs[name])
                 target = repo / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes((source / name).read_bytes())
+                target.write_bytes(subprocess.run(
+                    ["git", "-C", str(repo), "cat-file", "blob", historical_blobs[name]],
+                    check=True, capture_output=True).stdout)
             git(repo, "add", "--", *bootstrap.B3_P_SELECTION_PATHS)
             git(repo, "commit", "-m", "SIMULATION_ONLY selector proposal")
             proposal = git(repo, "rev-parse", "HEAD")
@@ -5235,6 +5297,309 @@ class S2PSelectionTests(unittest.TestCase):
         self.assertEqual(parser.parse_args([
             "select-b3-p", "--protected-sha", self.S2C,
             "--protected-root", "policy"]).operation, "select-b3-p")
+
+
+
+class AuditLockTransitionTests(unittest.TestCase):
+    """Real synthetic Git histories; none of these commits confer owner authority."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.pool_temp = tempfile.TemporaryDirectory(prefix="SYNTHETIC-audit-history-")
+        cls.addClassCleanup(cls.pool_temp.cleanup)
+        cls.pool = Path(cls.pool_temp.name).resolve() / "history"
+        source = Path(__file__).resolve().parent
+        subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout",
+                        str(source), str(cls.pool)], check=True, capture_output=True)
+        git(cls.pool, "config", "user.name", "Synthetic transition fixture")
+        git(cls.pool, "config", "user.email", "synthetic@example.invalid")
+        cls.checkout(cls.pool, bootstrap._AUDIT_ORIGIN)
+        for name in bootstrap._AUDIT_SEED_PATHS:
+            (cls.pool / name).write_bytes((source / name).read_bytes())
+        git(cls.pool, "-c", "core.autocrlf=false", "add", *bootstrap._AUDIT_SEED_PATHS)
+        git(cls.pool, "commit", "-m", "SYNTHETIC seed proposal; no actual authority")
+        cls.proposal = git(cls.pool, "rev-parse", "HEAD")
+        cls.seed_tree = git(cls.pool, "rev-parse", "HEAD^{tree}")
+        cls.seed = cls.commit_tree(cls.pool, cls.seed_tree,
+                                   bootstrap._AUDIT_ORIGIN, cls.proposal)
+        cls.checkout(cls.pool, cls.seed)
+        old = (cls.pool / bootstrap._AUDIT_PATH).read_bytes()
+        cls.new_lock = old.replace(
+            b"urllib3==2.7.0 --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897",
+            b"urllib3==2.8.0 --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3")
+        if hashlib.sha256(cls.new_lock).hexdigest() != bootstrap._AUDIT_NEW[1]:
+            raise AssertionError("Synthetic activation must use the exact new payload")
+        (cls.pool / bootstrap._AUDIT_PATH).write_bytes(cls.new_lock)
+        git(cls.pool, "-c", "core.autocrlf=false", "add", bootstrap._AUDIT_PATH)
+        git(cls.pool, "commit", "-m", "SYNTHETIC activation proposal")
+        cls.head = git(cls.pool, "rev-parse", "HEAD")
+        cls.activation_tree = git(cls.pool, "rev-parse", "HEAD^{tree}")
+        cls.merge = cls.commit_tree(cls.pool, cls.activation_tree, cls.seed, cls.head)
+        cls.checkout(cls.pool, cls.merge)
+
+    @staticmethod
+    def checkout(root: Path, revision: str) -> None:
+        git(root, "-c", "core.autocrlf=false", "checkout", "--detach", revision)
+
+    @staticmethod
+    def commit_tree(root: Path, tree: str, *parents: str) -> str:
+        args = ["-c", "user.name=Synthetic transition fixture",
+                "-c", "user.email=synthetic@example.invalid", "commit-tree", tree]
+        for parent in parents:
+            args.extend(("-p", parent))
+        return git(root, *args, "-m", "SYNTHETIC local lineage, never owner approval")
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="SYNTHETIC-audit-test-")
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.candidate, self.protected = base / "candidate", base / "protected"
+        for root, revision in ((self.candidate, self.merge), (self.protected, self.seed)):
+            subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout",
+                            str(self.pool), str(root)], check=True, capture_output=True)
+            git(root, "remote", "set-url", "origin",
+                "https://github.com/KiloAlpha021/security-policy.git")
+            self.checkout(root, revision)
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.seed)
+        module_name = "synthetic_protected_audit_" + self.id().rsplit(".", 1)[-1]
+        spec = importlib.util.spec_from_file_location(
+            module_name, self.protected / "protected_policy_bootstrap.py")
+        self.authority = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = self.authority
+        self.addCleanup(sys.modules.pop, module_name, None)
+        spec.loader.exec_module(self.authority)
+
+    def inputs(self, **changes: object):
+        values = dict(
+            event_name="pull_request", repository=bootstrap.REPOSITORY,
+            base_repository=bootstrap.REPOSITORY, base_branch="main",
+            candidate_root=self.candidate, protected_root=self.protected,
+            candidate_sha=git(self.candidate, "rev-parse", "HEAD"),
+            protected_sha=git(self.protected, "rev-parse", "HEAD"),
+            candidate_baseline=bootstrap.CURRENT_BASELINE)
+        values.update(changes)
+        return self.authority.BootstrapInputs(**values)
+
+    def protect(self, revision: str) -> None:
+        self.checkout(self.protected, revision)
+        git(self.protected, "update-ref", "refs/remotes/origin/main", revision)
+
+    def commit_change(self, root: Path, parent: str, name: str, data: bytes) -> str:
+        self.checkout(root, parent)
+        (root / name).write_bytes(data)
+        git(root, "-c", "core.autocrlf=false", "add", name)
+        git(root, "-c", "user.name=Synthetic fixture",
+            "-c", "user.email=synthetic@example.invalid",
+            "commit", "-m", "SYNTHETIC adversarial change")
+        return git(root, "rev-parse", "HEAD")
+
+    def reject(self, **changes: object) -> None:
+        with self.assertRaises(self.authority.BootstrapError):
+            self.authority.evaluate_model_d_plan(self.inputs(**changes))
+
+    def test_exact_seed_preserves_both_locks(self) -> None:
+        self.assertEqual(self.authority._audit_state(self.protected, self.seed),
+                         ("PENDING", self.seed))
+        self.assertEqual(self.authority._exact_modified_paths(
+            self.protected, bootstrap._AUDIT_ORIGIN, self.seed), bootstrap._AUDIT_SEED_PATHS)
+        for name in ("requirements-policy.lock", "requirements-audit.lock"):
+            self.assertEqual(git(self.protected, "rev-parse", self.seed + ":" + name),
+                             git(self.protected, "rev-parse", bootstrap._AUDIT_ORIGIN + ":" + name))
+        self.assertEqual(self.authority._audit_protected_identity(self.protected, self.seed),
+                         bootstrap._AUDIT_OLD)
+
+    def test_exact_activation_plan_and_raw_normalization(self) -> None:
+        for root in (self.candidate, self.protected):
+            lock = root / bootstrap._AUDIT_PATH
+            lock.write_bytes(lock.read_bytes().replace(b"\n", b"\r\n"))
+        inputs = self.inputs()
+        result, plan = self.authority.normalize_and_validate_model_d_bytes(inputs)
+        self.assertIs(result.policy_source, self.authority.PolicySource.POLICY)
+        self.assertIs(plan.policy_lock_source, self.authority.PolicySource.POLICY)
+        self.assertIs(plan.audit_lock_source, self.authority.PolicySource.CANDIDATE)
+        self.assertIs(plan.protected_evidence,
+                      self.authority.ProtectedEvidenceDisposition.APPLY_STAGE_A_TO_CANDIDATE)
+        self.assertIs(plan.candidate_evidence,
+                      self.authority.CandidateEvidenceDisposition.RUN_STAGE_A)
+        self.assertEqual((self.candidate / bootstrap._AUDIT_PATH).read_bytes(), self.new_lock)
+        self.assertEqual(hashlib.sha256((self.protected / bootstrap._AUDIT_PATH).read_bytes())
+                         .hexdigest(), bootstrap._AUDIT_OLD[1])
+
+    def test_stage_a_protected_test_executes_against_activation(self) -> None:
+        environment = os.environ.copy()
+        environment.update({
+            "PYTHONPATH": str(self.protected),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "POLICY_CANDIDATE_ROOT": str(self.candidate),
+            "POLICY_PROTECTED_ROOT": str(self.protected),
+            "POLICY_EXPECTED_REPOSITORY": bootstrap.REPOSITORY,
+            "POLICY_EXPECTED_BASE_REPOSITORY": bootstrap.REPOSITORY,
+            "POLICY_EXPECTED_BASE_BRANCH": "main",
+            "POLICY_EXPECTED_EVENT": "pull_request",
+            "POLICY_EXPECTED_CANDIDATE_SHA": self.merge,
+            "POLICY_EXPECTED_PROTECTED_SHA": self.seed})
+        result = subprocess.run(
+            [sys.executable, "-B", str(self.protected / "test_verify_security_workflows.py"),
+             "RootPolicyTests.test_protected_source_and_candidate_target_contract",
+             "RootPolicyTests.test_stage_a_candidate_invariants", "-v"],
+            cwd=self.protected, env=environment, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_future_activation_is_not_authorized_by_seed_proposal(self) -> None:
+        self.protect(self.proposal)
+        self.reject()
+
+    def test_candidate_module_cannot_supply_its_own_authority(self) -> None:
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_audit_lock_binding(bootstrap.BootstrapInputs(
+                **vars(self.inputs())))
+        self.reject(protected_root=self.candidate, protected_sha=self.merge)
+
+    def test_predecessor_cannot_admit_new_lock(self) -> None:
+        self.protect(bootstrap._AUDIT_ORIGIN)
+        self.reject()
+
+    def test_forged_runtime_context_and_identities(self) -> None:
+        for change in (
+            {"candidate_sha": "0" * 40}, {"protected_sha": "0" * 40},
+            {"repository": "KiloAlpha021/other"}, {"base_branch": "other"},
+            {"base_repository": "KiloAlpha021/other"}, {"event_name": "push"},
+            {"candidate_baseline": bootstrap.IMMEDIATE_SUCCESSOR}):
+            with self.subTest(change=change):
+                self.reject(**change)
+
+    def test_wrong_merge_parent_order(self) -> None:
+        wrong = self.commit_tree(self.candidate, self.activation_tree, self.head, self.seed)
+        self.checkout(self.candidate, wrong)
+        self.reject()
+
+    def test_wrong_activation_parent(self) -> None:
+        wrong_head = self.commit_tree(self.candidate, self.activation_tree, self.proposal)
+        wrong_merge = self.commit_tree(self.candidate, self.activation_tree, self.seed, wrong_head)
+        self.checkout(self.candidate, wrong_merge)
+        self.reject()
+
+    def test_wrong_merge_tree(self) -> None:
+        self.commit_change(self.candidate, self.head, "README.md", b"SYNTHETIC merge tampering\n")
+        wrong_tree = git(self.candidate, "rev-parse", "HEAD^{tree}")
+        wrong = self.commit_tree(self.candidate, wrong_tree, self.seed, self.head)
+        self.checkout(self.candidate, wrong)
+        self.reject()
+
+    def test_seed_with_wrong_proposal_parent_rejected(self) -> None:
+        wrong_proposal = self.commit_tree(self.protected, self.seed_tree, self.proposal)
+        wrong_seed = self.commit_tree(self.protected, self.seed_tree,
+                                      bootstrap._AUDIT_ORIGIN, wrong_proposal)
+        self.protect(wrong_seed)
+        with self.assertRaises(self.authority.BootstrapError):
+            self.authority._audit_protected_identity(self.protected, wrong_seed)
+
+    def test_executable_lock_mode_rejected(self) -> None:
+        self.checkout(self.candidate, self.head)
+        git(self.candidate, "update-index", "--chmod=+x", bootstrap._AUDIT_PATH)
+        wrong_tree = git(self.candidate, "write-tree")
+        wrong_head = self.commit_tree(self.candidate, wrong_tree, self.seed)
+        wrong = self.commit_tree(self.candidate, wrong_tree, self.seed, wrong_head)
+        self.checkout(self.candidate, wrong)
+        self.reject()
+
+    def test_normal_equality_after_activation(self) -> None:
+        self.protect(self.merge)
+        self.commit_change(self.candidate, self.merge, "README.md", b"SYNTHETIC normal update\n")
+        result, plan = self.authority.evaluate_model_d_plan(self.inputs())
+        self.assertIs(result.policy_source, self.authority.PolicySource.CANDIDATE)
+        self.assertIs(plan.audit_lock_source, self.authority.PolicySource.CANDIDATE)
+
+    def test_wrong_lock_and_extra_path_rejected(self) -> None:
+        for name, data in ((bootstrap._AUDIT_PATH, self.new_lock + b"# unauthorized\n"),
+                           ("requirements-policy.lock", b"unauthorized\n")):
+            with self.subTest(name=name):
+                wrong_head = self.commit_change(self.candidate, self.seed, name, data)
+                wrong_tree = git(self.candidate, "rev-parse", "HEAD^{tree}")
+                wrong_merge = self.commit_tree(self.candidate, wrong_tree, self.seed, wrong_head)
+                self.checkout(self.candidate, wrong_merge)
+                self.reject()
+
+    def test_new_lock_without_evaluated_merge_rejected(self) -> None:
+        self.checkout(self.candidate, self.head)
+        self.reject()
+        self.protect(self.head)
+        with self.assertRaises(self.authority.BootstrapError):
+            self.authority._audit_protected_identity(self.protected, self.head)
+
+    def test_expired_on_intervening_protected_movement(self) -> None:
+        changed = self.commit_change(self.protected, self.seed,
+                                     "README.md", b"SYNTHETIC intervening movement\n")
+        git(self.protected, "update-ref", "refs/remotes/origin/main", changed)
+        self.reject()
+
+    def test_forged_plan_does_not_skip_protected_evidence(self) -> None:
+        inputs = self.inputs()
+        result, plan = self.authority.evaluate_model_d_plan(inputs)
+        for altered in (
+            replace(plan, protected_evidence=self.authority.ProtectedEvidenceDisposition.RUN_LEGACY_HEALTH),
+            replace(plan, audit_lock_source=self.authority.PolicySource.POLICY),
+            replace(plan, candidate_evidence=self.authority.CandidateEvidenceDisposition.SKIP)):
+            with self.subTest(altered=altered), self.assertRaises(self.authority.BootstrapError):
+                self.authority.validate_model_d_plan_correspondence(inputs, result, altered)
+        self.protect(bootstrap._AUDIT_ORIGIN)
+        with self.assertRaises(self.authority.BootstrapError):
+            self.authority.validate_model_d_plan_correspondence(self.inputs(), result, plan)
+
+    def test_terminal_protected_identity_and_same_version_proof(self) -> None:
+        self.protect(self.merge)
+        self.assertEqual(self.authority._audit_protected_identity(self.protected, self.merge),
+                         bootstrap._AUDIT_NEW)
+        inputs = self.inputs(
+            event_name="workflow_dispatch", event_ref="refs/heads/main",
+            workflow_ref=bootstrap.REPOSITORY
+            + "/.github/workflows/security-workflows-policy.yml@refs/heads/main")
+        _result, plan = self.authority.normalize_and_validate_model_d_bytes(inputs)
+        self.assertIs(plan.audit_lock_source, self.authority.PolicySource.POLICY)
+
+    def test_replayed_old_proposal_after_activation(self) -> None:
+        self.protect(self.merge)
+        self.checkout(self.candidate, self.head)
+        self.reject()
+
+    def test_rollback_and_remove_reintroduce_rejected(self) -> None:
+        self.protect(self.merge)
+        rollback = self.commit_change(self.protected, self.merge, bootstrap._AUDIT_PATH,
+                                      historical_audit_lock_bytes())
+        with self.assertRaises(self.authority.BootstrapError):
+            self.authority._audit_protected_identity(self.protected, rollback)
+        restored = self.commit_change(self.protected, rollback,
+                                      bootstrap._AUDIT_PATH, self.new_lock)
+        with self.assertRaises(self.authority.BootstrapError):
+            self.authority._audit_protected_identity(self.protected, restored)
+
+    def test_missing_full_history_rejected(self) -> None:
+        # Only this disposable fixture is marked shallow.
+        (self.protected / ".git/shallow").write_text(self.seed + "\n", encoding="ascii")
+        self.reject()
+
+    def test_protected_reference_and_runtime_source_tampering(self) -> None:
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.proposal)
+        self.reject()
+        git(self.protected, "update-ref", "refs/remotes/origin/main", self.seed)
+        source = self.protected / "protected_policy_bootstrap.py"
+        source.write_bytes(source.read_bytes() + b"\n# uncommitted authority mutation\n")
+        self.reject()
+
+    def test_downstream_never_uses_candidate_policy_authority(self) -> None:
+        self.protect(self.merge)
+        git(self.candidate, "remote", "set-url", "origin",
+            "https://github.com/KiloAlpha021/security-workflows.git")
+        # A downstream trust candidate has no policy locks.
+        for name in ("requirements-policy.lock", "requirements-audit.lock"):
+            (self.candidate / name).unlink()
+        result, plan = self.authority.evaluate_model_d_plan(self.inputs(
+            repository=bootstrap.DOWNSTREAM_REPOSITORY,
+            base_repository=bootstrap.DOWNSTREAM_REPOSITORY))
+        self.assertIs(result.policy_source, self.authority.PolicySource.POLICY)
+        self.assertIs(plan.audit_lock_source, self.authority.PolicySource.POLICY)
+        self.assertIs(plan.downstream_validation,
+                      self.authority.DownstreamValidationDisposition.RUN)
 
 
 if __name__ == "__main__":
