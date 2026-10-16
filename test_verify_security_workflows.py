@@ -3719,6 +3719,7 @@ class ModelDMaintenanceAdmissionTests(unittest.TestCase):
         subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout",
                         str(self.protected), str(proof_candidate)],
                        check=True, capture_output=True, text=True)
+        self._configure(proof_candidate)
         git(proof_candidate, "checkout", "-B", "main", consumed_sha)
         self._configure(proof_candidate)
         output = self.base / "protected-proof-output"
