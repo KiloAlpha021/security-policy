@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -19,6 +20,9 @@ REF = re.compile(r"[0-9a-f]{40}\Z")
 SEGMENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
 OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\Z")
 IDENTITY = re.compile(r"([0-9a-f]{40})  (.+)\Z")
+HISTORICAL_SYNTHETIC_VERIFIER_SHA256 = (
+    "578810835df8328547df8d52ce0654a179aab22df2636fa9284d8cb4065ed3c6"
+)
 
 
 def git(root: Path, *args: str) -> str:
@@ -280,6 +284,18 @@ def validate_verifier(text: str) -> None:
             [],
         ),
     }
+    runtime_dependency_signatures = {
+        "_authorized_runtime_dependencies": (["profile"], []),
+        "_candidate_runtime_dependencies": (["candidate"], []),
+        "_verify_runtime_dependencies": (["candidate", "authorized_dependencies"], []),
+    }
+    runtime_dependency_helpers = runtime_dependency_signatures.keys() & functions.keys()
+    if runtime_dependency_helpers and runtime_dependency_helpers != runtime_dependency_signatures.keys():
+        raise ValueError("Partial trusted runtime-dependency verification contract")
+    version_two_dependencies = bool(runtime_dependency_helpers)
+    authenticated_historical_synthetic = False
+    if version_two_dependencies:
+        required_signatures.update(runtime_dependency_signatures)
     if not required_signatures.keys() <= functions.keys():
         raise ValueError("Trusted verifier helper contract changed")
     for name, (positional, keyword_only) in required_signatures.items():
@@ -299,6 +315,15 @@ def validate_verifier(text: str) -> None:
             matches = [line for candidate, line in observed if candidate == shape]
             positions.append(matches[0] if matches else -1)
         if -1 in positions or positions != sorted(positions):
+            raise ValueError(message)
+
+    def require_exact_calls(function_name: str, expected: tuple[str, ...], message: str) -> None:
+        observed = tuple(sorted(
+            ast.unparse(node.func)
+            for node in ast.walk(functions[function_name])
+            if isinstance(node, ast.Call)
+        ))
+        if observed != expected:
             raise ValueError(message)
 
     required_guards = (
@@ -328,7 +353,7 @@ def validate_verifier(text: str) -> None:
     if any(isinstance(node, ast.Try) for node in ast.walk(functions["verify"])):
         raise ValueError("Trusted verifier entry control flow changed")
 
-    require_ordered("select_dependency_lock", (
+    dependency_lock_contract = [
         'historical_matches = all(candidate_blob(candidate, name) == expected for name, expected in historical.items() if name in EVOLVABLE_PATHS)',
         'if historical_matches:\n    expected_lock = git(trusted, "rev-parse", "HEAD:requirements-dev.lock")\n    if candidate_blob(candidate, "requirements-dev.lock") != expected_lock:\n        raise ValueError("Candidate dependency lock differs from trusted lock")\n    return HISTORICAL_LOCK',
         'matches = []',
@@ -336,7 +361,53 @@ def validate_verifier(text: str) -> None:
         'if not matches: raise ValueError("No applicable trusted successor profile")',
         'if len(matches) != 1: raise ValueError("Multiple applicable trusted successor profiles")',
         'return safe_relative_path(matches[0]["trusted_lock_path"], label="trusted lock path")',
-    ), "Trusted dependency-lock selection contract changed")
+    ]
+    if version_two_dependencies:
+        dependency_lock_contract[1] = (
+            'if historical_matches:\n'
+            '    expected_lock = git(trusted, "rev-parse", "HEAD:requirements-dev.lock")\n'
+            '    if candidate_blob(candidate, "requirements-dev.lock") != expected_lock:\n'
+            '        raise ValueError("Candidate dependency lock differs from trusted lock")\n'
+            '    _verify_runtime_dependencies(candidate, [])\n'
+            '    return HISTORICAL_LOCK'
+        )
+        dependency_lock_contract.insert(
+            -1,
+            '_verify_runtime_dependencies(candidate, _authorized_runtime_dependencies(matches[0]))',
+        )
+    require_ordered("select_dependency_lock", tuple(dependency_lock_contract),
+                    "Trusted dependency-lock selection contract changed")
+    dependency_lock_calls = (
+        'ValueError', 'ValueError', 'ValueError', 'all', 'all', 'blobs.items',
+        'candidate_blob', 'candidate_blob', 'candidate_blob', 'git', 'historical.items',
+        'len', 'load_profiles', 'matches.append', 'safe_relative_path',
+    )
+    if version_two_dependencies:
+        dependency_lock_calls = (
+            'ValueError', 'ValueError', 'ValueError', '_authorized_runtime_dependencies',
+            '_verify_runtime_dependencies', '_verify_runtime_dependencies', 'all', 'all',
+            'blobs.items', 'candidate_blob', 'candidate_blob', 'candidate_blob', 'git',
+            'historical.items', 'len', 'load_profiles', 'matches.append', 'safe_relative_path',
+        )
+    else:
+        observed_dependency_lock_calls = tuple(sorted(
+            ast.unparse(node.func)
+            for node in ast.walk(functions["select_dependency_lock"])
+            if isinstance(node, ast.Call)
+        ))
+        historical_synthetic_calls = (
+            'ValueError', 'ValueError', 'ValueError', 'all', 'candidate_blob',
+            'candidate_blob', 'git', 'historical.items', 'len', 'load_profiles',
+            'safe_relative_path',
+        )
+        if observed_dependency_lock_calls == historical_synthetic_calls:
+            if hashlib.sha256(text.encode("utf-8")).hexdigest() != \
+                    HISTORICAL_SYNTHETIC_VERIFIER_SHA256:
+                raise ValueError("Untrusted historical synthetic verifier identity")
+            authenticated_historical_synthetic = True
+            dependency_lock_calls = historical_synthetic_calls
+    require_exact_calls("select_dependency_lock", dependency_lock_calls,
+                        "Unapproved trusted dependency-lock operation")
     require_ordered("select_control_profile", (
         'if not changed: return None',
         '_, profiles = load_profiles(trusted)',
@@ -345,7 +416,7 @@ def validate_verifier(text: str) -> None:
         'if len(matches) != 1: raise ValueError("Multiple applicable trusted control successor profiles")',
         'return matches[0]',
     ), "Trusted control-profile selection contract changed")
-    require_ordered("_validate_dependency_profile", (
+    dependency_profile_contract = [
         'if profile["authority_limitations"] != AUTHORITY_LIMITATIONS: raise ValueError("Invalid successor authority limitations")',
         'if not isinstance(evolved, list) or set(evolved) != EVOLVABLE_PATHS: raise ValueError("Invalid evolved dependency surface")',
         'if not isinstance(blobs, dict) or set(blobs) != EVOLVABLE_PATHS: raise ValueError("Invalid successor blob set")',
@@ -355,7 +426,59 @@ def validate_verifier(text: str) -> None:
         'if resolved_lock.parent != profile_root_resolved: raise ValueError("Trusted lock escapes successor profile")',
         'if actual_lock != profile["trusted_lock_blob"]: raise ValueError("Successor lock/profile identity mismatch")',
         'if blobs["requirements-dev.lock"] != profile["trusted_lock_blob"]: raise ValueError("Successor candidate/trusted lock mismatch")',
-    ), "Trusted dependency-profile authority changed")
+    ]
+    if version_two_dependencies:
+        dependency_profile_contract.append('_authorized_runtime_dependencies(profile)')
+    require_ordered("_validate_dependency_profile", tuple(dependency_profile_contract),
+                    "Trusted dependency-profile authority changed")
+    dependency_profile_calls = (
+        "(trusted / lock_path).resolve", 'PurePosixPath', 'SHA.fullmatch',
+        'ValueError', 'ValueError', 'ValueError', 'ValueError', 'ValueError',
+        'ValueError', 'ValueError', 'ValueError', 'ValueError', 'ValueError', 'all',
+        'blobs.values', 'git', 'isinstance', 'isinstance', 'isinstance', 'len', 'len',
+        'metadata_path.parent.resolve', 'read_identities', 'safe_relative_path',
+        'set', 'set', 'set', 'str',
+    )
+    if version_two_dependencies:
+        dependency_profile_calls = tuple(sorted(
+            dependency_profile_calls + ('_authorized_runtime_dependencies',)
+        ))
+    elif authenticated_historical_synthetic:
+        dependency_profile_calls = (
+            "(trusted / lock_path).resolve", 'PurePosixPath',
+            'ValueError', 'ValueError', 'ValueError', 'ValueError', 'ValueError',
+            'ValueError', 'ValueError', 'ValueError', 'git', 'isinstance',
+            'isinstance', 'metadata_path.parent.resolve', 'read_identities',
+            'safe_relative_path', 'set', 'set', 'str',
+        )
+    require_exact_calls("_validate_dependency_profile", dependency_profile_calls,
+                        "Unapproved trusted dependency-profile operation")
+    if version_two_dependencies:
+        require_ordered("_authorized_runtime_dependencies", (
+            'if profile["schema_version"] == 1: return []',
+            'dependencies = profile["authorized_runtime_dependencies"]',
+            'if not isinstance(dependencies, list) or len(dependencies) != len(set(dependencies)) or not all(isinstance(value, str) and EXACT_DEPENDENCY.fullmatch(value) for value in dependencies): raise ValueError("Invalid authorized runtime dependency contract")',
+            'return dependencies',
+        ), "Trusted runtime-dependency authority changed")
+        require_ordered("_candidate_runtime_dependencies", (
+            'try:\n    project = tomllib.loads((candidate / "pyproject.toml").read_text(encoding="utf-8"))["project"]\n    dependencies = project["dependencies"]\nexcept (OSError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:\n    raise ValueError("Malformed candidate runtime dependency contract") from error',
+            'if not isinstance(dependencies, list) or not all(isinstance(value, str) for value in dependencies): raise ValueError("Malformed candidate runtime dependency contract")',
+            'return dependencies',
+        ), "Candidate runtime-dependency parsing contract changed")
+        require_ordered("_verify_runtime_dependencies", (
+            'if _candidate_runtime_dependencies(candidate) != authorized_dependencies: raise ValueError("Candidate runtime dependencies are not trusted")',
+        ), "Trusted runtime-dependency comparison changed")
+        require_exact_calls("_authorized_runtime_dependencies", (
+            'EXACT_DEPENDENCY.fullmatch', 'ValueError', 'all', 'isinstance',
+            'isinstance', 'len', 'len', 'set',
+        ), "Unapproved runtime-dependency authority operation")
+        require_exact_calls("_candidate_runtime_dependencies", (
+            "(candidate / 'pyproject.toml').read_text", 'ValueError', 'ValueError',
+            'all', 'isinstance', 'isinstance', 'tomllib.loads',
+        ), "Unapproved candidate dependency parsing operation")
+        require_exact_calls("_verify_runtime_dependencies", (
+            'ValueError', '_candidate_runtime_dependencies',
+        ), "Unapproved runtime-dependency comparison operation")
     require_ordered("_validate_control_profile", (
         'if profile["profile_type"] != "TRUSTED_CONTROL_SUCCESSOR": raise ValueError("Invalid trusted control profile type")',
         'if profile["policy_id"] != "ATIS_STAGE3_TRUSTED_CONTROL_SUCCESSOR_POLICY_V1": raise ValueError("Invalid trusted control successor policy")',

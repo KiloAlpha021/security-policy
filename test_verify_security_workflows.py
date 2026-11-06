@@ -400,6 +400,18 @@ def duplicate():
         with self.assertRaises(ValueError):
             validate_tests(ineffective_test)
 
+    def test_historical_synthetic_verifier_is_exactly_identity_bound(self) -> None:
+        verifier = (self.candidate / "verify_candidate.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            hashlib.sha256(verifier.encode("utf-8")).hexdigest(),
+            "578810835df8328547df8d52ce0654a179aab22df2636fa9284d8cb4065ed3c6",
+        )
+        validate_verifier(verifier)
+        with self.assertRaisesRegex(
+            ValueError, "Untrusted historical synthetic verifier identity"
+        ):
+            validate_verifier(verifier + "\n# unauthorised fixture mutation\n")
+
     def test_structural_action_references(self) -> None:
         workflow = (self.candidate / ".github/workflows/m1-trusted.yml").read_text()
         sha = "1" * 40
